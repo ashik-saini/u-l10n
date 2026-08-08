@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "code-review-graph": {
+      "command": "/Users/ashiks/Library/Application Support/pipx/venvs/code-review-graph/bin/python",
+      "args": [
+        "-m",
+        "code_review_graph",
+        "serve"
+      ],
+      "cwd": "/Users/ashiks/YouTrip/BE/u-l10n",
+      "type": "stdio"
+    }
+  }
+}
