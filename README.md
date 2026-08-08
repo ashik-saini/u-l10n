@@ -30,8 +30,8 @@ master behind an approval workflow.
 it needs a read-scope token (master plan open item #4). The client and the
 presence-oracle logic are covered by tests against a fake server.
 
-**Not yet implemented:** Phases 5 (portal API), 6 (assets/S3), 10 (OTA) and
-11 (mobile SDK).
+**Not yet implemented:** Phases 5 (portal API), 6 (assets/S3) and 11 (mobile
+SDK — the Flutter client for the OTA endpoint).
 
 ## Quick start
 

@@ -30,6 +30,9 @@ type ReleaseRepository interface {
 	MaterialiseBundle(ctx context.Context, tx *gorm.DB, releaseID int64, locale model.Locale, rows []ExportRow) error
 
 	BundleSHA(ctx context.Context, tx *gorm.DB, releaseID int64, localeID int16) (string, error)
+
+	// ServableBundle returns what an OTA client should receive for a locale.
+	ServableBundle(ctx context.Context, tx *gorm.DB, localeID int16, appVersion string) (ServableBundle, error)
 }
 
 type releaseRepository struct{ base }
@@ -106,4 +109,75 @@ func (r *releaseRepository) BundleSHA(
 		return "", fmt.Errorf("read bundle sha: %w", err)
 	}
 	return sha, nil
+}
+
+// ServableBundle is one locale's bundle from the newest eligible release.
+type ServableBundle struct {
+	ReleaseVersion int64
+	Strings        []byte
+	SHA256         string
+	// KillSwitched reports that the newest release for this locale has been
+	// rolled back and no earlier one is eligible.
+	KillSwitched bool
+}
+
+// servableBundleSQL returns the newest release that is eligible for a client.
+//
+// Eligibility has two parts, both expressed in SQL so no caller can forget one:
+//
+//	rolled_back_at IS NULL     the kill switch
+//	min_app_version <= client  the semver floor
+//
+// The floor is compared as an INTEGER TRIPLE, not as text: '4.9.0' > '4.10.0'
+// lexically, which would withhold a release from exactly the clients it was
+// meant for. NULL means every client is eligible.
+const servableBundleSQL = `
+WITH client AS (
+    SELECT COALESCE(NULLIF($2, ''), '0.0.0') AS v
+)
+SELECT r.version, rb.strings::text, rb.sha256
+  FROM releases r
+  JOIN release_bundles rb ON rb.release_id = r.id
+ WHERE rb.locale_id = $1
+   AND r.rolled_back_at IS NULL
+   AND (
+        r.min_app_version IS NULL
+     OR string_to_array(r.min_app_version, '.')::int[]
+        <= string_to_array((SELECT v FROM client), '.')::int[]
+   )
+ ORDER BY r.version DESC
+ LIMIT 1`
+
+// ServableBundle returns what an OTA client should receive.
+//
+// appVersion may be empty, which is treated as 0.0.0 — the most conservative
+// reading, so a client that omits the header only ever receives releases with
+// no floor at all.
+func (r *releaseRepository) ServableBundle(
+	ctx context.Context, tx *gorm.DB, localeID int16, appVersion string,
+) (ServableBundle, error) {
+	var b ServableBundle
+
+	row := r.db(ctx, tx).Raw(servableBundleSQL, localeID, appVersion).Row()
+	switch err := row.Scan(&b.ReleaseVersion, &b.Strings, &b.SHA256); {
+	case err == nil:
+		return b, nil
+	case isNoRows(err):
+		// Nothing eligible. Distinguish "rolled back" from "never released":
+		// the first tells a client to clear its cache, the second is simply a
+		// service with no releases yet.
+		var anyRolledBack bool
+		row = r.db(ctx, tx).Raw(`
+			SELECT EXISTS (
+			    SELECT 1 FROM releases r
+			      JOIN release_bundles rb ON rb.release_id = r.id
+			     WHERE rb.locale_id = $1 AND r.rolled_back_at IS NOT NULL)`, localeID).Row()
+		if scanErr := row.Scan(&anyRolledBack); scanErr != nil {
+			return b, fmt.Errorf("check rollback state: %w", scanErr)
+		}
+		b.KillSwitched = anyRolledBack
+		return b, ErrNotFound
+	default:
+		return b, fmt.Errorf("read servable bundle: %w", err)
+	}
 }

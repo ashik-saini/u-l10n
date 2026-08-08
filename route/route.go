@@ -38,10 +38,12 @@ var (
 // package. One struct per service, not per endpoint — endpoints live in their
 // own files and hang methods off this type.
 type Handler struct {
-	cnf     *config.Config
-	db      Pinger
-	exports *exportsvc.Service
-	tokens  repository.APITokenRepository
+	cnf      *config.Config
+	db       Pinger
+	exports  *exportsvc.Service
+	tokens   repository.APITokenRepository
+	locales  repository.LocaleRepository
+	releases repository.ReleaseRepository
 }
 
 func ProvideHandler(
@@ -49,12 +51,16 @@ func ProvideHandler(
 	sqlConnector database.SqlConnector,
 	exports *exportsvc.Service,
 	tokens repository.APITokenRepository,
+	locales repository.LocaleRepository,
+	releases repository.ReleaseRepository,
 ) *Handler {
 	return &Handler{
-		cnf:     cnf,
-		db:      sqlConnector.GetDB(),
-		exports: exports,
-		tokens:  tokens,
+		cnf:      cnf,
+		db:       sqlConnector.GetDB(),
+		exports:  exports,
+		tokens:   tokens,
+		locales:  locales,
+		releases: releases,
 	}
 }
 
@@ -91,6 +97,13 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 			r.Use(handler.RequireAPIToken(repository.ScopeReadExport))
 			r.Get("/export", handler.Export)
 		})
+	})
+
+	// OTA sits on its own prefix, OUTSIDE /api/v1 and outside authentication.
+	// The app calls it at launch before login, and the payload already ships
+	// inside the binary — see the handler for the full reasoning.
+	r.Route("/ota/v1", func(r chi.Router) {
+		r.Get("/bundles/{locale}", handler.OTABundle)
 	})
 
 	return r
