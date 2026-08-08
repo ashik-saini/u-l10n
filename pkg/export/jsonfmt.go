@@ -10,8 +10,6 @@ package export
 import (
 	"bytes"
 	"fmt"
-	"strings"
-	"unicode/utf8"
 )
 
 // Entry is one string to write.
@@ -106,22 +104,6 @@ func writeJSONString(b *bytes.Buffer, s string) {
 	}
 }
 
-// ValidUTF8 reports whether every entry is valid UTF-8.
-//
-// The writer copies non-ASCII bytes verbatim, so invalid input would produce
-// an invalid file. Checking here converts that into a caller-visible error.
-func ValidUTF8(entries []Entry) error {
-	for _, e := range entries {
-		if !utf8.ValidString(e.Key) {
-			return fmt.Errorf("key %q is not valid UTF-8", e.Key)
-		}
-		if !utf8.ValidString(e.Value) {
-			return fmt.Errorf("value for key %q is not valid UTF-8", e.Key)
-		}
-	}
-	return nil
-}
-
 // LineEnding selects the line terminator a serializer emits.
 //
 // It is an OPTION rather than a constant because the committed iOS corpus is
@@ -142,15 +124,4 @@ func (le LineEnding) or(def LineEnding) LineEnding {
 		return def
 	}
 	return le
-}
-
-// applyLineEnding rewrites LF terminators to the requested ending. It operates
-// on the terminators the serializer emitted, never on the values, so a real
-// newline inside a value is unaffected — those are always escaped by the time
-// they reach here.
-func applyLineEnding(s string, le LineEnding) string {
-	if le == LF {
-		return s
-	}
-	return strings.ReplaceAll(s, "\n", string(le))
 }
