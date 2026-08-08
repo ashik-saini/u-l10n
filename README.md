@@ -13,10 +13,23 @@ keys across 6 locales, exported to Flutter JSON, Android XML and iOS `.strings`.
 
 ## Status
 
-**Phase 1 — schema.** The service boots, serves health probes against a real
-database, and shuts down gracefully; the full schema exists as Flyway
-migrations with tests proving every constraint rejects bad input. There is no
-business logic yet — parsers arrive in Phase 2, the export engine in Phase 3.
+**Phases 0–3 complete; Phase 7 partial.** The service boots, owns its schema,
+reads and writes all three mobile localization formats, serves authenticated
+exports, seeds from the committed u-mobile tree, and folds branch edits into
+master behind an approval workflow.
+
+| Phase | State | Gate |
+|-------|-------|------|
+| 0 scaffold | done | probes verified against a real database, including DB-down and recovery |
+| 1 schema | done | Flyway from empty; 27 subtests proving constraints *reject* bad input |
+| 2 parsers + seed | done | all 22 committed files at exact counts; 7,516 keys / 35,872 translations, idempotent |
+| 3 serializers + export | done | **R1: 98,320 values round-tripped, zero alterations**; R2 idempotent; export endpoint behind API tokens |
+| 7 branch + merge | **values only** | COW deltas, conflict detection, merge transaction, releases — all verified under `-race` |
+
+**Not yet implemented:** key-metadata conflicts (`branch_keys` exists, but only
+*value* deltas merge — branch renames, platform changes and soft-deletes will
+not, and name-collision detection is absent). Phases 4 (Lokalise importer),
+5 (portal API), 6 (assets/S3), 10 (OTA) and 11 (mobile SDK) are not started.
 
 ## Quick start
 
@@ -36,7 +49,7 @@ curl -s localhost:8080/readyz  | jq   # {"status":"ready","checks":{"database":"
 
 | Command | Does |
 |---------|------|
-| `make test` | unit tests + schema tests (schema tests skip if no database) |
+| `make test` | unit tests + schema tests (provisions its own PostgreSQL via Docker, or skips) |
 | `make db-test` | create the scratch database the schema tests use |
 | `make db-migrate` | apply the migrations with real Flyway, from empty |
 | `make run-local` | start PostgreSQL and run the service |
