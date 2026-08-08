@@ -13,11 +13,11 @@ keys across 6 locales, exported to Flutter JSON, Android XML and iOS `.strings`.
 
 ## Status
 
-**Phases 0–3 and 6 complete; Phase 7 partial.** The service boots, owns its
-schema, reads and writes all three mobile localization formats, serves
-authenticated exports, seeds from the committed u-mobile tree, stores context
-screenshots on S3, and folds branch edits into master behind an approval
-workflow.
+**Phases 0–3 and 5–7 complete.** The service boots, owns its schema, reads and
+writes all three mobile localization formats, serves authenticated exports,
+seeds from the committed u-mobile tree, stores context screenshots on S3, serves
+the portal's full CRUD surface, and folds branch edits into master behind an
+approval workflow.
 
 | Phase | State | Gate |
 |-------|-------|------|
@@ -26,6 +26,7 @@ workflow.
 | 2 parsers + seed | done | all 22 committed files at exact counts; 7,516 keys / 35,872 translations, idempotent |
 | 3 serializers + export | done | **R1: 98,320 values round-tripped, zero alterations**; R2 idempotent; export endpoint behind API tokens |
 | 5a identity | done | **every refusal path tested**: unknown email and disabled account are 403 not 401, unknown roles rank below viewer, the cache never outlives a token |
+| 5b portal API | done | **every refusal path tested against real PostgreSQL**: 409 with both values on a stale `base_version`, 403 below the role minimum, 400 on an unknown parameter, and a `?branch=` read that returns branch values rather than master's |
 | 6 assets | done | presign/confirm/attach against a fake object store; **every refusal path tested**; repository SQL against real PostgreSQL |
 | 7 branch + merge | done | COW deltas, **all three conflict types**, merge transaction, releases — verified under `-race` |
 
@@ -40,8 +41,8 @@ so the S3 half is proven only against a fake — see [Context screenshots](#cont
 **Phase 5a is unexercised against a real Google token.** The verifier is driven
 entirely against a fake tokeninfo endpoint — see [Portal identity](#portal-identity).
 
-**Not yet implemented:** Phase 5b (the portal CRUD endpoints) and 11 (mobile SDK
-— the Flutter client for the OTA endpoint).
+**Not yet implemented:** Phase 11 (mobile SDK — the Flutter client for the OTA
+endpoint).
 
 ## Quick start
 
@@ -241,6 +242,76 @@ is skipped when it is empty. That matches what bo-api does today, but it is a
 real gap: any Google OAuth client can mint an access token for a `you.co` user
 and tokeninfo will validate it, so an unrelated application's token is accepted
 here as proof of intent to use u-l10n. Set it everywhere the portal runs.
+
+## Portal API
+
+Everything under `/api/v1` that a human touches sits behind `RequireIdentity`,
+with a per-route role minimum. Reads are `viewer`, writes are `editor`, and the
+two acts that put copy in front of customers — approving/merging, and
+publishing/rolling back a release — are `approver`.
+
+| Group | Endpoints |
+|-------|-----------|
+| Keys | `GET /keys`, `GET /keys/{id}`, `POST /keys`, `PATCH /keys/{id}`, `DELETE /keys/{id}`, `GET /keys/{id}/history` |
+| Values | `PUT /keys/{id}/translations/{locale}`, `DELETE /keys/{id}/translations/{locale}` |
+| Branches | `GET /branches`, `GET /branches/{name}`, `GET /branches/{name}/changes`, `POST /branches`, `POST /branches/{name}/close`, `POST /branches/{name}/reopen` |
+| Merge requests | `GET /merge-requests`, `GET /merge-requests/{id}`, `GET /merge-requests/{id}/conflicts`, `POST /merge-requests`, `POST .../{approve,request-changes,reject,reopen,close,merge}`, `PUT /merge-requests/{id}/resolutions` |
+| Tags | `GET /tags`, `POST /tags`, `PUT /tags/{id}`, `DELETE /tags/{id}`, `POST /tags/{id}/keys`, `DELETE /tags/{id}/keys`, `PUT /keys/{id}/tags` |
+| Releases | `GET /releases`, `GET /releases/{v}`, `GET /releases/{v}/bundles/{locale}`, `POST /releases`, `POST /releases/{v}/rollback` |
+
+Six details are load-bearing:
+
+- **The three-state rule survives to JSON.** A cell is
+  `{"translated":false}` (no row — untranslated, omitted from the export),
+  `{"translated":true,"value":""}` (a deliberate blank, exported as `""`), or
+  translated. A plain `string` field would render the first two identically and
+  collapse the distinction ~430 en-SG keys and 3,664 ms-MY values depend on.
+  `DELETE` on a translation removes the row; it never writes `""`.
+- **`base_version` is required on master and refused on a branch.** On master it
+  is the optimistic-concurrency anchor, and a mismatch answers **409 carrying
+  both values** so the portal renders theirs/mine without a second read that
+  could return a third value. The guard that actually holds is the version
+  predicate inside the write statement; the comparison before it exists only to
+  produce a good body. On a branch the field is refused outright —
+  `branch_translations` has no version column, and accepting it while ignoring
+  it would leave the portal believing it had concurrency control that does not
+  exist. Branch changes are reconciled against master once, at merge.
+- **`?branch=` resolves through the copy-on-write path everywhere**, including
+  the `untranslated_in` filter, which reuses `resolveSQL`'s exact CASE
+  expression. A read that quietly returned master would show an editor their
+  work had not saved; a filter that did would list work they had already done.
+- **The key browser is four queries per page, whatever its size.** ~6,300 keys ×
+  6 locales arrive as one request: the keys, their values, their tags and their
+  branch metadata overrides, each taking an id array. A query per key would be
+  thousands of round trips for one page load.
+- **Every merge refusal is a 409, and the two resolvable ones carry the
+  offending rows.** A stale approval, unresolved conflicts, a name collision and
+  an unapproved request are ordinary outcomes of people working on the same
+  copy. Name collisions carry no resolution field and are excluded from the
+  unresolved count — `idx_keys_name_active` permits one active key per name, so
+  no choice makes two names one — while still setting `mergeable` false.
+- **Unknown query parameters are refused, not ignored** (as on `/export`), and
+  unknown JSON fields are refused by `DisallowUnknownFields`. A portal that
+  misspells `untranslated_in` must be told, not handed the unfiltered corpus.
+
+`mergeable` on the conflicts response is advisory. The merge re-computes
+everything inside its own transaction under the advisory lock, and that is the
+answer that counts.
+
+### Known gaps in this surface
+
+- **A key cannot be created on a branch.** `branch_keys` can hold one (`key_id`
+  NULL), but the merge's `applyKeyMetaSQL` only UPDATEs rows it can join to an
+  existing master key — so a branch-created key would never reach master and the
+  merge would report success having dropped it. `POST /keys?branch=…` therefore
+  refuses with 400 rather than accepting silently. Renames, platform changes and
+  soft deletes on a branch all work.
+- **Translation edits write history, not audit rows.** `translation_history` and
+  `key_history` carry the before/after a diff needs; `audit_events` records the
+  structural actions (key created/deleted, tag mutations, branch and review
+  transitions, publish, rollback). Adding a second row per cell edit would
+  double the writes on the hottest path for a record the history table already
+  holds.
 
 ## Layout
 
