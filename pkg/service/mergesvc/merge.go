@@ -36,23 +36,42 @@ var (
 
 	// ErrUnresolvedConflicts carries the conflicts still awaiting a human.
 	ErrUnresolvedConflicts = errors.New("unresolved conflicts")
+
+	// ErrNameCollision means the branch and master independently claimed the
+	// same key name. Unlike the other two types this is not resolvable by
+	// choosing a side — one of them has to be renamed first.
+	ErrNameCollision = errors.New("key name collision")
 )
 
 // UnresolvedError reports which conflicts blocked a merge.
 type UnresolvedError struct {
-	Conflicts []repository.Conflict
+	Values []repository.Conflict
+	Meta   []repository.MetaConflict
 }
 
 func (e *UnresolvedError) Error() string {
-	return fmt.Sprintf("%v: %d conflict(s) require a decision", ErrUnresolvedConflicts, len(e.Conflicts))
+	return fmt.Sprintf("%v: %d value and %d metadata conflict(s) require a decision",
+		ErrUnresolvedConflicts, len(e.Values), len(e.Meta))
 }
 func (e *UnresolvedError) Unwrap() error { return ErrUnresolvedConflicts }
+
+// CollisionError reports names claimed by both sides.
+type CollisionError struct {
+	Collisions []repository.NameCollision
+}
+
+func (e *CollisionError) Error() string {
+	return fmt.Sprintf("%v: %d name(s) already held by an active key on master",
+		ErrNameCollision, len(e.Collisions))
+}
+func (e *CollisionError) Unwrap() error { return ErrNameCollision }
 
 // Result describes a completed merge.
 type Result struct {
 	ReleaseID      int64
 	ReleaseVersion int64
 	ValuesApplied  int
+	KeysApplied    int
 	BundlesWritten int
 }
 
@@ -152,17 +171,54 @@ func (s *Service) Merge(ctx context.Context, branchName, actor string) (*Result,
 		if err != nil {
 			return err
 		}
-		var unresolved []repository.Conflict
+		var unresolvedValues []repository.Conflict
 		for _, c := range conflicts {
 			if !c.Resolved() {
-				unresolved = append(unresolved, c)
+				unresolvedValues = append(unresolvedValues, c)
 			}
 		}
-		if len(unresolved) > 0 {
-			return &UnresolvedError{Conflicts: unresolved}
+
+		// Metadata conflicts are a SECOND type, anchored on keys.version rather
+		// than translations.version. A branch that renames a key master also
+		// renamed is just as much a conflict as two edits to one value.
+		metaConflicts, err := s.mrs.MetaConflicts(ctx, tx, mr.ID, branch.ID)
+		if err != nil {
+			return err
+		}
+		var unresolvedMeta []repository.MetaConflict
+		for _, c := range metaConflicts {
+			if !c.Resolved() {
+				unresolvedMeta = append(unresolvedMeta, c)
+			}
 		}
 
-		// STEP 5 — apply the value deltas.
+		if len(unresolvedValues) > 0 || len(unresolvedMeta) > 0 {
+			return &UnresolvedError{Values: unresolvedValues, Meta: unresolvedMeta}
+		}
+
+		// The THIRD type, and the only one that is not a version comparison:
+		// both sides independently claimed a name. Choosing a side cannot fix
+		// it — one of them must be renamed — so it is rejected rather than
+		// offered for resolution. Detecting it here also stops the merge dying
+		// on idx_keys_name_active halfway through applying changes.
+		collisions, err := s.mrs.NameCollisions(ctx, tx, branch.ID)
+		if err != nil {
+			return err
+		}
+		if len(collisions) > 0 {
+			return &CollisionError{Collisions: collisions}
+		}
+
+		// STEP 5 — apply metadata FIRST, then values.
+		//
+		// Order matters: a rename must land before values are written against
+		// the key, and a soft delete must not be silently undone by a value
+		// write that follows it.
+		keysApplied, err := s.mrs.ApplyKeyMeta(ctx, tx, mr.ID, branch.ID)
+		if err != nil {
+			return err
+		}
+
 		applied, err := s.applyDeltas(ctx, tx, mr.ID, branch.ID, actor)
 		if err != nil {
 			return err
@@ -221,6 +277,7 @@ func (s *Service) Merge(ctx context.Context, branchName, actor string) (*Result,
 			ReleaseID:      release.ID,
 			ReleaseVersion: release.Version,
 			ValuesApplied:  applied,
+			KeysApplied:    keysApplied,
 			BundlesWritten: len(locales),
 		}
 		return nil
@@ -231,7 +288,8 @@ func (s *Service) Merge(ctx context.Context, branchName, actor string) (*Result,
 	}
 
 	log.Infow(ctx, "merge complete", "branch", branchName,
-		"release", result.ReleaseVersion, "values", result.ValuesApplied)
+		"release", result.ReleaseVersion,
+		"values", result.ValuesApplied, "keys", result.KeysApplied)
 	return result, nil
 }
 

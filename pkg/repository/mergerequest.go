@@ -83,6 +83,15 @@ type MergeRequestRepository interface {
 	Conflicts(ctx context.Context, tx *gorm.DB, mrID, branchID int64) ([]Conflict, error)
 
 	Resolve(ctx context.Context, tx *gorm.DB, mrID, keyID int64, localeID int16, resolution, actor string) error
+
+	// MetaConflicts computes key-metadata conflicts, anchored on keys.version.
+	MetaConflicts(ctx context.Context, tx *gorm.DB, mrID, branchID int64) ([]MetaConflict, error)
+
+	// NameCollisions finds branch names an active master key already holds.
+	NameCollisions(ctx context.Context, tx *gorm.DB, branchID int64) ([]NameCollision, error)
+
+	// ApplyKeyMeta folds metadata deltas into master.
+	ApplyKeyMeta(ctx context.Context, tx *gorm.DB, mrID, branchID int64) (int, error)
 }
 
 type mergeRequestRepository struct{ base }
@@ -320,4 +329,138 @@ func (r *mergeRequestRepository) Resolve(
 		return fmt.Errorf("store resolution for (%d,%d): %w", keyID, localeID, err)
 	}
 	return nil
+}
+
+// MetaConflict is a key whose METADATA moved on master since the branch first
+// touched it. Anchored on keys.version, not translations.version.
+type MetaConflict struct {
+	KeyID                            int64
+	MineName, TheirsName             string
+	MineStatus, TheirsStatus         string
+	BaseMasterVersion, MasterVersion int
+	Resolution                       string
+}
+
+func (c MetaConflict) Resolved() bool { return c.Resolution != "" }
+
+// NameCollision is the THIRD conflict type, and the only one that is not a
+// version comparison.
+//
+// A branch renames a key to — or creates one called — a name that master
+// independently gained. Both sides are internally consistent; it is the union
+// that is impossible, because idx_keys_name_active permits one active key per
+// name. Merging regardless would fail on the unique index mid-transaction, so
+// it must be detected up front and shown to a human.
+type NameCollision struct {
+	BranchKeyID *int64
+	Name        string
+	MasterKeyID int64
+}
+
+// metaConflictsSQL mirrors the value rule, anchored on keys.version.
+const metaConflictsSQL = `
+SELECT bk.key_id,
+       bk.name, k.name,
+       bk.status, k.status,
+       bk.base_master_version, COALESCE(k.version, 0),
+       COALESCE(mcr.resolution, '')
+  FROM branch_keys bk
+  JOIN keys k ON k.id = bk.key_id
+  LEFT JOIN merge_conflict_resolutions mcr
+    ON mcr.merge_request_id = $2
+   AND mcr.key_id = bk.key_id
+   AND mcr.locale_id IS NULL
+ WHERE bk.branch_id = $1
+   AND bk.key_id IS NOT NULL
+   AND COALESCE(k.version, 0) <> bk.base_master_version
+ ORDER BY k.sort_index`
+
+func (r *mergeRequestRepository) MetaConflicts(
+	ctx context.Context, tx *gorm.DB, mrID, branchID int64,
+) ([]MetaConflict, error) {
+	rows, err := r.db(ctx, tx).Raw(metaConflictsSQL, branchID, mrID).Rows()
+	if err != nil {
+		return nil, fmt.Errorf("compute metadata conflicts: %w", err)
+	}
+	defer rows.Close()
+
+	var out []MetaConflict
+	for rows.Next() {
+		var c MetaConflict
+		if err := rows.Scan(&c.KeyID, &c.MineName, &c.TheirsName,
+			&c.MineStatus, &c.TheirsStatus,
+			&c.BaseMasterVersion, &c.MasterVersion, &c.Resolution); err != nil {
+			return nil, fmt.Errorf("scan metadata conflict: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// nameCollisionsSQL finds branch names that an ACTIVE master key already holds.
+//
+// The self-match is excluded: a branch delta that keeps a key's own name is not
+// colliding with itself. Only a DIFFERENT master key holding the target name is
+// a real collision.
+const nameCollisionsSQL = `
+SELECT bk.key_id, bk.name, k.id
+  FROM branch_keys bk
+  JOIN keys k ON k.name = bk.name AND k.status = 'active'
+ WHERE bk.branch_id = $1
+   AND bk.status = 'active'
+   AND (bk.key_id IS NULL OR bk.key_id <> k.id)
+ ORDER BY bk.name`
+
+func (r *mergeRequestRepository) NameCollisions(
+	ctx context.Context, tx *gorm.DB, branchID int64,
+) ([]NameCollision, error) {
+	rows, err := r.db(ctx, tx).Raw(nameCollisionsSQL, branchID).Rows()
+	if err != nil {
+		return nil, fmt.Errorf("compute name collisions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []NameCollision
+	for rows.Next() {
+		var c NameCollision
+		if err := rows.Scan(&c.BranchKeyID, &c.Name, &c.MasterKeyID); err != nil {
+			return nil, fmt.Errorf("scan name collision: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// applyKeyMetaSQL folds metadata deltas into master.
+//
+// Applied BEFORE value deltas in the merge, because a rename must land before
+// values are written against the key, and a soft delete must not be undone by a
+// value write that follows it.
+const applyKeyMetaSQL = `
+UPDATE keys k
+   SET name         = bk.name,
+       description  = bk.description,
+       platforms    = bk.platforms,
+       android_name = bk.android_name,
+       ios_name     = bk.ios_name,
+       status       = bk.status,
+       version      = k.version + 1,
+       updated_at   = now()
+  FROM branch_keys bk
+  LEFT JOIN merge_conflict_resolutions mcr
+    ON mcr.merge_request_id = $2
+   AND mcr.key_id = bk.key_id
+   AND mcr.locale_id IS NULL
+ WHERE bk.branch_id = $1
+   AND bk.key_id = k.id
+   AND COALESCE(mcr.resolution, 'mine') <> 'master'`
+
+func (r *mergeRequestRepository) ApplyKeyMeta(
+	ctx context.Context, tx *gorm.DB, mrID, branchID int64,
+) (int, error) {
+	res := r.db(ctx, tx).Exec(applyKeyMetaSQL, branchID, mrID)
+	if res.Error != nil {
+		return 0, fmt.Errorf("apply key metadata: %w", res.Error)
+	}
+	return int(res.RowsAffected), nil
 }

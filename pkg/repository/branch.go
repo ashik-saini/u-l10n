@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jinzhu/gorm"
+	"github.com/lib/pq"
 
 	"github.com/yougroupteam/u-common-components/database"
 	"github.com/yougroupteam/u-l10n/pkg/model"
@@ -63,6 +64,12 @@ type BranchRepository interface {
 
 	// ChangedCount reports how many value deltas a branch carries.
 	ChangedCount(ctx context.Context, tx *gorm.DB, branchID int64) (int, error)
+
+	// SetKeyMeta records a rename, platform change or soft delete on a branch.
+	SetKeyMeta(ctx context.Context, tx *gorm.DB, branchID, keyID int64, k model.Key, actor string) error
+
+	// MetaChangedCount reports how many metadata deltas a branch carries.
+	MetaChangedCount(ctx context.Context, tx *gorm.DB, branchID int64) (int, error)
 }
 
 type branchRepository struct{ base }
@@ -263,6 +270,61 @@ func (r *branchRepository) ChangedCount(ctx context.Context, tx *gorm.DB, branch
 		`SELECT count(*) FROM branch_translations WHERE branch_id = ?`, branchID).Row()
 	if err := row.Scan(&n); err != nil {
 		return 0, fmt.Errorf("count branch deltas: %w", err)
+	}
+	return n, nil
+}
+
+// setKeyMetaSQL writes a metadata delta for an EXISTING key.
+//
+// base_master_version is anchored on keys.version, and — exactly as for value
+// deltas — is captured only on the first touch. Refreshing it would let a
+// branch silently adopt master's newer metadata as its base, and a genuine
+// rename/rename race would then look clean.
+const setKeyMetaSQL = `
+INSERT INTO branch_keys
+    (branch_id, key_id, name, description, platforms, android_name, ios_name,
+     status, base_master_version, updated_by)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+        COALESCE((SELECT version FROM keys WHERE id = $2), 0), $9)
+ON CONFLICT (branch_id, key_id) WHERE key_id IS NOT NULL DO UPDATE SET
+    name         = EXCLUDED.name,
+    description  = EXCLUDED.description,
+    platforms    = EXCLUDED.platforms,
+    android_name = EXCLUDED.android_name,
+    ios_name     = EXCLUDED.ios_name,
+    status       = EXCLUDED.status,
+    -- deliberately NOT updated, same reasoning as branch_translations
+    updated_by   = EXCLUDED.updated_by,
+    updated_at   = now()`
+
+// SetKeyMeta records a rename, platform change or soft delete on a branch.
+func (r *branchRepository) SetKeyMeta(
+	ctx context.Context, tx *gorm.DB, branchID, keyID int64, k model.Key, actor string,
+) error {
+	platforms := make([]string, len(k.Platforms))
+	for i, p := range k.Platforms {
+		platforms[i] = string(p)
+	}
+	if k.Status == "" {
+		k.Status = model.KeyStatusActive
+	}
+
+	db := r.db(ctx, tx)
+	err := db.Exec(setKeyMetaSQL, branchID, keyID, k.Name, k.Description,
+		pq.Array(platforms), k.AndroidName, k.IOSName, string(k.Status), actor).Error
+	if err != nil {
+		return fmt.Errorf("set branch key meta for %d: %w", keyID, err)
+	}
+	return r.touch(ctx, db, branchID)
+}
+
+// MetaChangedCount reports how many metadata deltas a branch carries.
+func (r *branchRepository) MetaChangedCount(ctx context.Context, tx *gorm.DB, branchID int64) (int, error) {
+	var n int
+	row := r.db(ctx, tx).Raw(
+		`SELECT count(*) FROM branch_keys WHERE branch_id = ?`, branchID).Row()
+	if err := row.Scan(&n); err != nil {
+		return 0, fmt.Errorf("count branch key deltas: %w", err)
 	}
 	return n, nil
 }

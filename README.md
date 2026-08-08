@@ -24,12 +24,10 @@ master behind an approval workflow.
 | 1 schema | done | Flyway from empty; 27 subtests proving constraints *reject* bad input |
 | 2 parsers + seed | done | all 22 committed files at exact counts; 7,516 keys / 35,872 translations, idempotent |
 | 3 serializers + export | done | **R1: 98,320 values round-tripped, zero alterations**; R2 idempotent; export endpoint behind API tokens |
-| 7 branch + merge | **values only** | COW deltas, conflict detection, merge transaction, releases — all verified under `-race` |
+| 7 branch + merge | done | COW deltas, **all three conflict types**, merge transaction, releases — verified under `-race` |
 
-**Not yet implemented:** key-metadata conflicts (`branch_keys` exists, but only
-*value* deltas merge — branch renames, platform changes and soft-deletes will
-not, and name-collision detection is absent). Phases 4 (Lokalise importer),
-5 (portal API), 6 (assets/S3), 10 (OTA) and 11 (mobile SDK) are not started.
+**Not yet implemented:** Phases 4 (Lokalise importer), 5 (portal API),
+6 (assets/S3), 10 (OTA) and 11 (mobile SDK).
 
 ## Quick start
 
