@@ -27,8 +27,15 @@ type branchResponse struct {
 	LastEditedAt *string `json:"last_edited_at"`
 	MergedAt     *string `json:"merged_at"`
 
-	ValueChanges int `json:"value_changes"`
-	MetaChanges  int `json:"meta_changes"`
+	// Pointers so the two constructors can mean different things by "no count".
+	// The read path reports a real count and must render 0 when a branch
+	// genuinely changes nothing; the write path has not counted at all and must
+	// OMIT the fields rather than assert a false zero. A plain int cannot
+	// express both — its zero value would make "counted zero" and "not counted"
+	// identical on the wire, which is the exact conflation the write path guards
+	// against.
+	ValueChanges *int `json:"value_changes,omitempty"`
+	MetaChanges  *int `json:"meta_changes,omitempty"`
 
 	// MergeRequestID is null when the branch has no LIVE request — which is a
 	// different fact from having had one that was rejected.
@@ -46,8 +53,8 @@ func newBranchResponse(s repository.BranchSummary) branchResponse {
 		CreatedAt:          formatTime(s.CreatedAt),
 		LastEditedAt:       formatTimePtr(s.LastEditedAt),
 		MergedAt:           formatTimePtr(s.MergedAt),
-		ValueChanges:       s.ValueChanges,
-		MetaChanges:        s.MetaChanges,
+		ValueChanges:       &s.ValueChanges,
+		MetaChanges:        &s.MetaChanges,
 		MergeRequestID:     s.MergeRequestID,
 		MergeRequestStatus: s.MergeRequestStatus,
 	}
@@ -58,9 +65,15 @@ func newBranchResponse(s repository.BranchSummary) branchResponse {
 //
 // The counts are omitted rather than reported as zero: "this branch changes
 // nothing" and "nobody counted" are different claims, and a create response
-// asserting the former would be wrong the moment the first edit lands.
+// asserting the former would be wrong the moment the first edit lands. The
+// shared constructor sets the count pointers, so they are cleared back to nil
+// here — that omission is the whole point, and omitempty on the fields makes
+// nil disappear from the wire.
 func newBranchResponseFromBranch(b repository.Branch) branchResponse {
-	return newBranchResponse(repository.BranchSummary{Branch: b})
+	resp := newBranchResponse(repository.BranchSummary{Branch: b})
+	resp.ValueChanges = nil
+	resp.MetaChanges = nil
+	return resp
 }
 
 type branchListResponse struct {
