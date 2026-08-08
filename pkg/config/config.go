@@ -33,6 +33,15 @@ type Config struct {
 	// finish after SIGTERM before forcing the process down. Keep it below
 	// the Kubernetes terminationGracePeriodSeconds.
 	ShutdownTimeout time.Duration `configstruct:"SERVICECONFIG_SHUTDOWN_TIMEOUT" configdefault:"15s"`
+
+	// GoogleOAuthAudience is the OAuth client id the portal signs operators in
+	// with. When set, an access token issued to any other client is refused.
+	//
+	// Optional, and empty by default, because bo-api does not check it either
+	// and requiring a value nobody has configured would lock every operator out
+	// of every environment at once. Setting it closes a real hole — see
+	// pkg/googleauth.Verify — so it should be set everywhere the portal runs.
+	GoogleOAuthAudience string `configstruct:"SERVICECONFIG_GOOGLE_OAUTH_AUDIENCE" configdefault:""`
 }
 
 // ProvideConfig loads and validates the service configuration. It fails fast:

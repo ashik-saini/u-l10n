@@ -25,6 +25,7 @@ workflow.
 | 1 schema | done | Flyway from empty; 27 subtests proving constraints *reject* bad input |
 | 2 parsers + seed | done | all 22 committed files at exact counts; 7,516 keys / 35,872 translations, idempotent |
 | 3 serializers + export | done | **R1: 98,320 values round-tripped, zero alterations**; R2 idempotent; export endpoint behind API tokens |
+| 5a identity | done | **every refusal path tested**: unknown email and disabled account are 403 not 401, unknown roles rank below viewer, the cache never outlives a token |
 | 6 assets | done | presign/confirm/attach against a fake object store; **every refusal path tested**; repository SQL against real PostgreSQL |
 | 7 branch + merge | done | COW deltas, **all three conflict types**, merge transaction, releases — verified under `-race` |
 
@@ -36,8 +37,11 @@ presence-oracle logic are covered by tests against a fake server.
 anywhere in this tree and `storage/v4` hardcodes TLS with no path-style option,
 so the S3 half is proven only against a fake — see [Context screenshots](#context-screenshots).
 
-**Not yet implemented:** Phases 5 (portal API) and 11 (mobile SDK — the Flutter
-client for the OTA endpoint).
+**Phase 5a is unexercised against a real Google token.** The verifier is driven
+entirely against a fake tokeninfo endpoint — see [Portal identity](#portal-identity).
+
+**Not yet implemented:** Phase 5b (the portal CRUD endpoints) and 11 (mobile SDK
+— the Flutter client for the OTA endpoint).
 
 ## Quick start
 
@@ -159,6 +163,85 @@ interface — the same move as `route.Pinger` — and the tests drive the refusa
 paths against a fake. **The S3 calls themselves have never run against a real
 bucket.**
 
+## Portal identity
+
+Two kinds of principal reach this service and they authenticate differently.
+Scripts and CI present `X-Api-Token` (`route.RequireAPIToken`); human operators
+present a Google access token as `Authorization: Bearer …`
+(`route.RequireIdentity`). The two are separate context keys, so no code
+downstream can confuse a script for a person.
+
+Only half of bo-api's `AccessTokenFilter` is ported. bo-api validates the opaque
+token against Google's tokeninfo endpoint *and then* queries the Google Admin
+Directory API to derive `yp_*` group permissions. u-l10n takes the first step
+and stops: roles live in its own `users` table keyed on email, because a
+designer may be an l10n editor and nothing else, and overloading another
+system's authorization model means inheriting its every future change. So there
+is no service account, no domain-wide delegation and no Directory API scope
+here. The `x-yp-role` header the portal also sends is ignored outright — it
+describes YouPortal, and it arrives from the client, which makes it a request
+rather than a fact. **The portal must gate its UI on `GET /api/v1/me`.**
+
+Four details are load-bearing:
+
+- **Authentication failure is 401; authorization failure is 403.** A valid
+  Google token whose email has no row in `users`, or whose row is
+  `status = 'disabled'`, gets 403 — not 401. Conflating them sends a person
+  without an account round the sign-in loop forever. Only the 401 carries
+  `WWW-Authenticate`; a 403 that invites re-authentication is a lie.
+- **Roles are ordered — `viewer < editor < approver < admin` — and unknown
+  roles rank below viewer.** Ordering lets a route state the minimum it needs
+  instead of enumerating every role that qualifies. Ranking the unknown *below*
+  the floor is what makes an unexpected value fail closed: a role added to the
+  database ahead of the code that understands it grants nothing. An unknown
+  *minimum* is satisfied by nobody either, so a typo in a route definition
+  refuses everyone rather than admitting everyone.
+- **Verifications are cached in-process for the token's own remaining TTL,
+  capped at five minutes.** Without a cache every portal request costs a round
+  trip to Google and a six-panel page pays six times. The cap bounds how long a
+  token revoked at Google keeps working here; taking the *minimum* of the two is
+  what stops the cache from quietly extending a credential's life. The map is
+  keyed on the SHA-256 of the token, never the token.
+- **Google being unreachable is a 5xx, not a 401.** The token may be perfectly
+  good, and answering 401 during someone else's outage tells every operator in
+  the building to sign in again.
+
+### Bootstrapping
+
+An empty `users` table contains no admin, so no authenticated request can ever
+create the first one — `PATCH /api/v1/admin/users/{email}/role` requires exactly
+the role nobody holds yet. Something outside the authorization system has to
+start the chain:
+
+```
+u-l10n user grant --email you@you.co --role admin --actor you@you.co
+u-l10n user list
+```
+
+The shell is the right place for it. Running this requires access to the pod and
+its database credentials — strictly more privilege than any role in the table
+can express — so anyone who can run it could already have written the row by
+hand with `psql`. Unlike `psql`, it validates the role and writes an
+`audit_events` row, and it shares its code path with the API so the two cannot
+drift apart on what a valid role is. The alternatives are worse: an admin
+address seeded by a migration is a credential in git nobody remembers to remove,
+and an env-var superuser is a permanent invisible bypass of the whole role model.
+
+### What is not proved
+
+The Google call itself has never run against Google. `pkg/googleauth` is driven
+against a fake tokeninfo server, which is why it declares an interface for the
+verifier at all — the same move as `route.Pinger` and `assetsvc.ObjectStore`.
+The response shape, the `expires_in` semantics and the exact status code Google
+returns for an expired token are taken from bo-api's long-running use of the
+same endpoint, not from an observation made here.
+
+`SERVICECONFIG_GOOGLE_OAUTH_AUDIENCE` is unset by default and the audience check
+is skipped when it is empty. That matches what bo-api does today, but it is a
+real gap: any Google OAuth client can mint an access token for a `you.co` user
+and tokeninfo will validate it, so an unrelated application's token is accepted
+here as proof of intent to use u-l10n. Set it everywhere the portal runs.
+
 ## Layout
 
 ```
@@ -194,6 +277,7 @@ from a ConfigMap via `envFrom`; locally the Makefile supplies them.
 | `SERVICECONFIG_HTTP_PORT` | `8080` | HTTP listen port |
 | `SERVICECONFIG_REQUEST_TIMEOUT` | `60s` | Per-request deadline; cancels in-flight queries |
 | `SERVICECONFIG_SHUTDOWN_TIMEOUT` | `15s` | Drain window on SIGTERM; keep below `terminationGracePeriodSeconds` |
+| `SERVICECONFIG_GOOGLE_OAUTH_AUDIENCE` | *(empty)* | Portal OAuth client id. When set, access tokens issued to any other client are refused — see [Portal identity](#portal-identity) |
 | `DATABASECONFIG_*` | — | Owned by `u-common-components/database` |
 | `STORAGE_CONFIG_AWS_*` | — | Owned by `u-common-components/storage/v4` |
 

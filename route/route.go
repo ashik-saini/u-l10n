@@ -19,9 +19,11 @@ import (
 	ulog "github.com/yougroupteam/u-common-util/log"
 
 	"github.com/yougroupteam/u-l10n/pkg/config"
+	"github.com/yougroupteam/u-l10n/pkg/googleauth"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
 	"github.com/yougroupteam/u-l10n/pkg/service/assetsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/usersvc"
 )
 
 const serviceName = "u-l10n"
@@ -46,6 +48,11 @@ type Handler struct {
 	locales  repository.LocaleRepository
 	releases repository.ReleaseRepository
 	assets   *assetsvc.Service
+	// identities and users are the two halves of a human principal: Google
+	// answers who, the users table answers what they may do. See identity.go.
+	identities TokenVerifier
+	users      repository.UserRepository
+	userSvc    *usersvc.Service
 }
 
 func ProvideHandler(
@@ -56,15 +63,21 @@ func ProvideHandler(
 	locales repository.LocaleRepository,
 	releases repository.ReleaseRepository,
 	assets *assetsvc.Service,
+	identities *googleauth.Verifier,
+	users repository.UserRepository,
+	userSvc *usersvc.Service,
 ) *Handler {
 	return &Handler{
-		cnf:      cnf,
-		db:       sqlConnector.GetDB(),
-		exports:  exports,
-		tokens:   tokens,
-		locales:  locales,
-		releases: releases,
-		assets:   assets,
+		cnf:        cnf,
+		db:         sqlConnector.GetDB(),
+		exports:    exports,
+		tokens:     tokens,
+		locales:    locales,
+		releases:   releases,
+		assets:     assets,
+		identities: identities,
+		users:      users,
+		userSvc:    userSvc,
 	}
 }
 
@@ -112,6 +125,21 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 			r.Get("/assets/{id}/url", handler.AssetURL)
 			r.Put("/keys/{id}/assets", handler.AssetAttach)
 			r.Delete("/keys/{id}/assets/{assetId}", handler.AssetDetach)
+		})
+
+		// Humans authenticate with the portal's Google access token. Viewer is
+		// the floor: being provisioned at all is what /me reports, and the
+		// portal gates its UI on that answer rather than on the x-yp-role
+		// header it also sends — which is ignored here.
+		r.Group(func(r chi.Router) {
+			r.Use(handler.RequireIdentity(repository.RoleViewer))
+			r.Get("/me", handler.Me)
+		})
+
+		// Granting privileges requires holding them.
+		r.Group(func(r chi.Router) {
+			r.Use(handler.RequireIdentity(repository.RoleAdmin))
+			r.Patch("/admin/users/{email}/role", handler.SetUserRole)
 		})
 	})
 

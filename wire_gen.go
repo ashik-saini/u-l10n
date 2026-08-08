@@ -17,12 +17,14 @@ import (
 	"github.com/yougroupteam/u-common-components/secretclient"
 	"github.com/yougroupteam/u-common-components/storage/v4"
 	config2 "github.com/yougroupteam/u-l10n/pkg/config"
+	"github.com/yougroupteam/u-l10n/pkg/googleauth"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
 	"github.com/yougroupteam/u-l10n/pkg/service/assetsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/importsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/seed"
+	"github.com/yougroupteam/u-l10n/pkg/service/usersvc"
 	"github.com/yougroupteam/u-l10n/route"
 )
 
@@ -80,7 +82,10 @@ func injectService(ctx context.Context) (*Service, error) {
 	assetRepository := repository.ProvideAssetRepository(gormConnector)
 	auditRepository := repository.ProvideAuditRepository(gormConnector)
 	assetsvcService := assetsvc.ProvideService(transactional, storageStorage, assetRepository, auditRepository)
-	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository, localeRepository, releaseRepository, assetsvcService)
+	verifier := googleauth.ProvideVerifier(configConfig)
+	userRepository := repository.ProvideUserRepository(gormConnector)
+	usersvcService := usersvc.ProvideService(transactional, userRepository, auditRepository)
+	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository, localeRepository, releaseRepository, assetsvcService, verifier, userRepository, usersvcService)
 	httpHandler := route.ProvideRoutes(apmConfig, configConfig, handler)
 	seedService := seed.ProvideService(transactional, localeRepository, keyRepository, translationRepository)
 	branchRepository := repository.ProvideBranchRepository(gormConnector)
@@ -94,6 +99,7 @@ func injectService(ctx context.Context) (*Service, error) {
 		Tokens:  apiTokenRepository,
 		Merge:   mergesvcService,
 		Import:  importsvcService,
+		Users:   usersvcService,
 	}
 	return mainService, nil
 }

@@ -17,12 +17,14 @@ import (
 	storagev4 "github.com/yougroupteam/u-common-components/storage/v4"
 
 	"github.com/yougroupteam/u-l10n/pkg/config"
+	"github.com/yougroupteam/u-l10n/pkg/googleauth"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
 	"github.com/yougroupteam/u-l10n/pkg/service/assetsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/importsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/seed"
+	"github.com/yougroupteam/u-l10n/pkg/service/usersvc"
 	"github.com/yougroupteam/u-l10n/route"
 )
 
@@ -54,6 +56,8 @@ func injectService(ctx context.Context) (*Service, error) {
 		assetsvc.ProvideService,
 		mergesvc.ProvideService,
 		importsvc.ProvideService,
+		usersvc.ProvideService,
+		googleauth.ProvideVerifier,
 		wire.Struct(new(Service), "*"),
 	)
 	return nil, nil

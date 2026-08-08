@@ -24,6 +24,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/service/importsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/seed"
+	"github.com/yougroupteam/u-l10n/pkg/service/usersvc"
 )
 
 const serviceName = "u-l10n"
@@ -38,6 +39,7 @@ type Service struct {
 	Tokens  repository.APITokenRepository
 	Merge   *mergesvc.Service
 	Import  *importsvc.Service
+	Users   *usersvc.Service
 }
 
 func main() {
@@ -57,6 +59,7 @@ func main() {
 	app.Commands = []cli.Command{
 		seedFromFilesCommand(ctx, service),
 		tokenCommand(ctx, service),
+		userCommand(ctx, service),
 	}
 
 	if err := app.Run(os.Args); err != nil {
@@ -217,6 +220,83 @@ func tokenCommand(ctx context.Context, service *Service) cli.Command {
 						return err
 					}
 					log.Infow(ctx, "token revoked", "name", name, "by", actor)
+					return nil
+				},
+			},
+		},
+	}
+}
+
+// userCommand creates and promotes portal operators from the shell.
+//
+// This exists to solve a bootstrapping problem that has no in-band answer.
+// PATCH /api/v1/admin/users/{email}/role requires the admin role, and roles
+// live in the users table — so on a fresh database nobody is an admin, nobody
+// can be made one through the API, and the portal is permanently locked out of
+// itself. Something outside the authorization system has to start the chain.
+//
+// The shell is the right place for it. Running this command requires access to
+// the deployed pod and its database credentials, which is strictly more
+// privilege than any role in this table can express: anyone who can run it
+// could already have written the row by hand with psql. This just makes the
+// supported way to do it the easy way, and — unlike psql — it validates the
+// role and writes an audit_events row, so the first grant is as traceable as
+// every later one. The alternative designs are worse: a seeded admin address
+// baked into a migration is a credential in git that nobody remembers to
+// remove, and an env-var "superuser" is a permanent, invisible bypass of the
+// entire role model.
+//
+//	u-l10n user grant --email ashik.saini@you.co --role admin --actor ashik.saini@you.co
+func userCommand(ctx context.Context, service *Service) cli.Command {
+	var email, role, status, actor string
+
+	return cli.Command{
+		Name:  "user",
+		Usage: "Manage portal operators; this is the only way to create the first admin",
+		Subcommands: []cli.Command{
+			{
+				Name:  "grant",
+				Usage: "Create an operator or change their role; idempotent",
+				Flags: []cli.Flag{
+					cli.StringFlag{Name: "email", Usage: "the operator's Google Workspace address", Destination: &email},
+					cli.StringFlag{Name: "role", Value: "viewer",
+						Usage: "viewer, editor, approver or admin", Destination: &role},
+					cli.StringFlag{Name: "status", Value: "active",
+						Usage: "active or disabled", Destination: &status},
+					cli.StringFlag{Name: "actor",
+						Usage:       "email of whoever is running this; recorded in the audit trail",
+						Destination: &actor},
+				},
+				Action: func(*cli.Context) error {
+					if email == "" || actor == "" {
+						return errors.New("user grant: --email and --actor are required")
+					}
+					user, err := service.Users.Grant(ctx, email, role, status, actor, "cli")
+					if err != nil {
+						return err
+					}
+					fmt.Printf("%s is now %s (%s)\n", user.Email, user.Role, user.Status)
+					return nil
+				},
+			},
+			{
+				Name:  "list",
+				Usage: "List operators and their roles",
+				Action: func(*cli.Context) error {
+					users, err := service.Users.List(ctx)
+					if err != nil {
+						return err
+					}
+					if len(users) == 0 {
+						// The state this command exists to get you out of, said
+						// plainly rather than as an empty table.
+						fmt.Println("no users yet — nobody can sign in to the portal")
+						fmt.Println("create the first admin with: u-l10n user grant --email <you> --role admin --actor <you>")
+						return nil
+					}
+					for _, u := range users {
+						fmt.Printf("%-40s %-9s %s\n", u.Email, u.Role, u.Status)
+					}
 					return nil
 				},
 			},

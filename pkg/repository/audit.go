@@ -35,6 +35,17 @@ const (
 	ActionAssetView   = "asset.view"
 	ActionAssetAttach = "asset.attach"
 	ActionAssetDetach = "asset.detach"
+
+	// ActionUserRoleChange records a privilege change made through the API.
+	// Who may edit and approve customer-facing copy is exactly the kind of fact
+	// that must be reconstructable months later.
+	ActionUserRoleChange = "user.role.change"
+
+	// ActionUserGrant records a user created or promoted from the shell. The
+	// CLI is the only way to mint the first admin, so it is also the only
+	// privilege change with no authenticated actor behind it — which makes the
+	// audit row more important here, not less.
+	ActionUserGrant = "user.grant"
 )
 
 // AuditRepository appends to the audit trail.
