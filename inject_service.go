@@ -20,6 +20,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/googleauth"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
 	"github.com/yougroupteam/u-l10n/pkg/service/assetsvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/branchsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/importsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
@@ -59,6 +60,7 @@ func injectService(ctx context.Context) (*Service, error) {
 		importsvc.ProvideService,
 		usersvc.ProvideService,
 		keysvc.ProvideService,
+		branchsvc.ProvideService,
 		googleauth.ProvideVerifier,
 		wire.Struct(new(Service), "*"),
 	)

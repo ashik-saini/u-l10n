@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/render"
 
 	"github.com/yougroupteam/u-l10n/pkg/repository"
+	"github.com/yougroupteam/u-l10n/pkg/service/branchsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
 )
 
@@ -188,6 +189,7 @@ func (h *Handler) portalError(w http.ResponseWriter, r *http.Request, op string,
 	switch {
 	// --- 400: the caller sent something wrong -------------------------------
 	case errors.Is(err, keysvc.ErrBadRequest),
+		errors.Is(err, branchsvc.ErrBadRequest),
 		errors.Is(err, keysvc.ErrBranchUnsupported):
 		h.badRequest(w, r, err)
 
@@ -206,11 +208,13 @@ func (h *Handler) portalError(w http.ResponseWriter, r *http.Request, op string,
 		render.JSON(w, r, errorResponse{Error: "version_conflict", Details: err.Error()})
 
 	case errors.Is(err, repository.ErrKeyNameTaken),
-		errors.Is(err, repository.ErrTagNameTaken):
+		errors.Is(err, repository.ErrTagNameTaken),
+		errors.Is(err, repository.ErrBranchNameTaken):
 		render.Status(r, http.StatusConflict)
 		render.JSON(w, r, errorResponse{Error: "name_taken", Details: err.Error()})
 
-	case errors.Is(err, keysvc.ErrBranchNotOpen):
+	case errors.Is(err, keysvc.ErrBranchNotOpen),
+		errors.Is(err, branchsvc.ErrBranchNotOpen):
 		render.Status(r, http.StatusConflict)
 		render.JSON(w, r, errorResponse{Error: "branch_not_open", Details: err.Error()})
 

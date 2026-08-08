@@ -20,6 +20,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/googleauth"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
 	"github.com/yougroupteam/u-l10n/pkg/service/assetsvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/branchsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/importsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
@@ -90,7 +91,8 @@ func injectService(ctx context.Context) (*Service, error) {
 	tagRepository := repository.ProvideTagRepository(gormConnector)
 	mergeRequestRepository := repository.ProvideMergeRequestRepository(gormConnector)
 	keysvcService := keysvc.ProvideService(transactional, keyRepository, translationRepository, localeRepository, branchRepository, tagRepository, mergeRequestRepository, auditRepository)
-	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository, localeRepository, releaseRepository, assetsvcService, verifier, userRepository, usersvcService, keysvcService)
+	branchsvcService := branchsvc.ProvideService(transactional, branchRepository, auditRepository)
+	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository, localeRepository, releaseRepository, assetsvcService, verifier, userRepository, usersvcService, keysvcService, branchsvcService)
 	httpHandler := route.ProvideRoutes(apmConfig, configConfig, handler)
 	seedService := seed.ProvideService(transactional, localeRepository, keyRepository, translationRepository)
 	mergesvcService := mergesvc.ProvideService(transactional, branchRepository, mergeRequestRepository, localeRepository, releaseRepository, exportRowReader)

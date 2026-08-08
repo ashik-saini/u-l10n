@@ -22,6 +22,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/googleauth"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
 	"github.com/yougroupteam/u-l10n/pkg/service/assetsvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/branchsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/usersvc"
@@ -57,6 +58,9 @@ type Handler struct {
 
 	// keySvc backs the portal's key browser and inline editor.
 	keySvc *keysvc.Service
+
+	// branchSvc backs the branch list and the branch diff.
+	branchSvc *branchsvc.Service
 }
 
 func ProvideHandler(
@@ -71,6 +75,7 @@ func ProvideHandler(
 	users repository.UserRepository,
 	userSvc *usersvc.Service,
 	keySvc *keysvc.Service,
+	branchSvc *branchsvc.Service,
 ) *Handler {
 	return &Handler{
 		cnf:        cnf,
@@ -84,6 +89,7 @@ func ProvideHandler(
 		users:      users,
 		userSvc:    userSvc,
 		keySvc:     keySvc,
+		branchSvc:  branchSvc,
 	}
 }
 
@@ -150,6 +156,12 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 			r.Get("/keys", handler.ListKeys)
 			r.Get("/keys/{id}", handler.GetKey)
 			r.Get("/keys/{id}/history", handler.KeyHistory)
+
+			// Branches are read at viewer too: seeing what work is in flight,
+			// and what a proposed change would do, is reading.
+			r.Get("/branches", handler.ListBranches)
+			r.Get("/branches/{name}", handler.GetBranch)
+			r.Get("/branches/{name}/changes", handler.BranchChanges)
 		})
 
 		// Writing the corpus. Editor, and no higher: writing to a BRANCH is the
@@ -162,6 +174,10 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 			r.Delete("/keys/{id}", handler.DeleteKey)
 			r.Put("/keys/{id}/translations/{locale}", handler.PutTranslation)
 			r.Delete("/keys/{id}/translations/{locale}", handler.DeleteTranslation)
+
+			r.Post("/branches", handler.CreateBranch)
+			r.Post("/branches/{name}/close", handler.CloseBranch)
+			r.Post("/branches/{name}/reopen", handler.ReopenBranch)
 		})
 
 		// Granting privileges requires holding them.

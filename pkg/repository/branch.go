@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -83,6 +84,95 @@ type BranchRepository interface {
 	// KeyMetaForKeys returns the branch's METADATA overrides for many keys in
 	// one query, so the key browser can overlay them without a lookup per row.
 	KeyMetaForKeys(ctx context.Context, tx *gorm.DB, branchID int64, keyIDs []int64) (map[int64]model.Key, error)
+
+	// Changes lists everything a branch has altered, each row flagged with
+	// whether master has moved underneath it. This is the branch diff view, and
+	// it uses the SAME version comparison the merge does — a diff that disagreed
+	// with the merge about what conflicts would be a diff nobody could trust.
+	Changes(ctx context.Context, tx *gorm.DB, branchID int64) (BranchChanges, error)
+
+	// Summaries lists branches with their delta counts and their live merge
+	// request, in ONE query.
+	//
+	// The counts and the request state are what the branch list actually shows,
+	// and fetching them per row would be three round trips per branch for a page
+	// that is rendered whole.
+	Summaries(ctx context.Context, tx *gorm.DB, status string) ([]BranchSummary, error)
+}
+
+// BranchSummary is a branch plus everything the branch list displays.
+//
+// A separate type rather than fields on Branch, following TagUsage: the counts
+// are a property of the whole delta set and only Summaries can populate them.
+// Folding them into Branch would mean every Branch returned by ByName carried
+// zeroes that read as "this branch changes nothing".
+type BranchSummary struct {
+	Branch
+
+	ValueChanges int
+	MetaChanges  int
+
+	// MergeRequestID and MergeRequestStatus describe the LIVE request, if any.
+	// Nil means the branch has no request open — which is different from having
+	// one that was rejected.
+	MergeRequestID     *int64
+	MergeRequestStatus string
+}
+
+// BranchValueChange is one value delta, alongside what master now holds.
+type BranchValueChange struct {
+	KeyID      int64
+	KeyName    string
+	LocaleID   int16
+	LocaleCode string
+
+	// Value is the branch's value; meaningful only when Removed is false. The
+	// branch's three states are the same three as master's: a tombstone
+	// (Removed), a deliberate "", and text.
+	Value   string
+	Removed bool
+
+	// MasterValue and MasterFound carry master's side with the same
+	// distinction. MasterFound false means master has no row at all.
+	MasterValue string
+	MasterFound bool
+
+	BaseMasterVersion int
+	MasterVersion     int
+
+	// Conflict is exactly the merge's rule: master moved since this branch
+	// first touched the pair.
+	Conflict bool
+
+	UpdatedBy string
+	UpdatedAt time.Time
+}
+
+// BranchMetaChange is one key-metadata delta.
+type BranchMetaChange struct {
+	// KeyID is nil for a key CREATED on the branch, which has no master row.
+	KeyID *int64
+
+	Name        string
+	Description string
+	Status      string
+
+	// MasterName and MasterStatus are empty when KeyID is nil.
+	MasterName   string
+	MasterStatus string
+
+	BaseMasterVersion int
+	MasterVersion     int
+	Conflict          bool
+
+	UpdatedBy string
+	UpdatedAt time.Time
+}
+
+// BranchChanges is a branch's complete diff against master.
+type BranchChanges struct {
+	Values []BranchValueChange
+	Meta   []BranchMetaChange
 }
 
 type branchRepository struct{ base }
@@ -100,17 +190,34 @@ func scanBranch(row interface{ Scan(...interface{}) error }) (Branch, error) {
 	return b, err
 }
 
+// ErrBranchNameTaken is returned when Create hits branches_name_unique.
+//
+// An exported sentinel, following ErrTagNameTaken: the portal turns it into a
+// 409 with a body a human can act on, rather than a 500 carrying a driver
+// message.
+var ErrBranchNameTaken = errors.New("a branch with that name already exists")
+
+// createBranchSQL uses DO NOTHING so a taken name comes back as a missing row
+// rather than a driver error to pattern-match — the same move as createTagSQL,
+// and race-free in a way a pre-check is not.
+const createBranchSQL = `
+INSERT INTO branches (name, description, created_by)
+VALUES ($1, $2, $3)
+ON CONFLICT (name) DO NOTHING
+RETURNING ` + branchColumns
+
 func (r *branchRepository) Create(ctx context.Context, tx *gorm.DB, name, description, createdBy string) (Branch, error) {
-	row := r.db(ctx, tx).Raw(`
-		INSERT INTO branches (name, description, created_by)
-		VALUES ($1, $2, $3)
-		RETURNING `+branchColumns, name, description, createdBy).Row()
+	row := r.db(ctx, tx).Raw(createBranchSQL, name, description, createdBy).Row()
 
 	b, err := scanBranch(row)
-	if err != nil {
+	switch {
+	case err == nil:
+		return b, nil
+	case isNoRows(err):
+		return b, fmt.Errorf("create branch %q: %w", name, ErrBranchNameTaken)
+	default:
 		return b, fmt.Errorf("create branch %q: %w", name, err)
 	}
-	return b, nil
 }
 
 func (r *branchRepository) ByName(ctx context.Context, tx *gorm.DB, name string) (Branch, error) {
@@ -404,6 +511,143 @@ func (r *branchRepository) KeyMetaForKeys(
 			k.IOSName = &iosName.String
 		}
 		out[k.ID] = k
+	}
+	return out, rows.Err()
+}
+
+// branchValueChangesSQL is the branch diff, value side.
+//
+// The conflict expression is character-for-character conflictsSQL's:
+//
+//	COALESCE(t.version, 0) <> bt.base_master_version
+//
+// It is repeated rather than shared because the two statements select different
+// row sets — the diff shows everything, the conflict query shows only the
+// conflicting rows — but if one of them is ever changed, the other must change
+// with it. A diff that disagreed with the merge about what conflicts is a diff
+// nobody could act on.
+const branchValueChangesSQL = `
+SELECT bt.key_id, k.name, bt.locale_id, l.code,
+       COALESCE(bt.value, '')                       AS value,
+       bt.is_removed,
+       COALESCE(t.value, '')                        AS master_value,
+       (t.key_id IS NOT NULL)                       AS master_found,
+       bt.base_master_version,
+       COALESCE(t.version, 0)                       AS master_version,
+       (COALESCE(t.version, 0) <> bt.base_master_version) AS conflict,
+       bt.updated_by, bt.updated_at
+  FROM branch_translations bt
+  JOIN keys    k ON k.id = bt.key_id
+  JOIN locales l ON l.id = bt.locale_id
+  LEFT JOIN translations t
+    ON t.key_id = bt.key_id AND t.locale_id = bt.locale_id
+ WHERE bt.branch_id = $1
+ ORDER BY k.sort_index, l.sort_order`
+
+// branchMetaChangesSQL is the branch diff, metadata side.
+//
+// LEFT JOIN, not JOIN: branch_keys.key_id is NULL for a key created on the
+// branch, and an inner join would silently hide exactly the rows a reviewer
+// most needs to see.
+const branchMetaChangesSQL = `
+SELECT bk.key_id, bk.name, bk.description, bk.status,
+       COALESCE(k.name, '')   AS master_name,
+       COALESCE(k.status, '') AS master_status,
+       bk.base_master_version,
+       COALESCE(k.version, 0) AS master_version,
+       (bk.key_id IS NOT NULL AND COALESCE(k.version, 0) <> bk.base_master_version) AS conflict,
+       bk.updated_by, bk.updated_at
+  FROM branch_keys bk
+  LEFT JOIN keys k ON k.id = bk.key_id
+ WHERE bk.branch_id = $1
+ ORDER BY bk.name`
+
+func (r *branchRepository) Changes(ctx context.Context, tx *gorm.DB, branchID int64) (BranchChanges, error) {
+	var out BranchChanges
+
+	rows, err := r.db(ctx, tx).Raw(branchValueChangesSQL, branchID).Rows()
+	if err != nil {
+		return out, fmt.Errorf("read branch %d value changes: %w", branchID, err)
+	}
+	for rows.Next() {
+		var c BranchValueChange
+		if err := rows.Scan(&c.KeyID, &c.KeyName, &c.LocaleID, &c.LocaleCode,
+			&c.Value, &c.Removed, &c.MasterValue, &c.MasterFound,
+			&c.BaseMasterVersion, &c.MasterVersion, &c.Conflict,
+			&c.UpdatedBy, &c.UpdatedAt); err != nil {
+			rows.Close()
+			return out, fmt.Errorf("scan branch value change: %w", err)
+		}
+		if c.Removed {
+			// A tombstone carries no value; the column is NULL and the COALESCE
+			// above turned it into '', which would read as a deliberate blank.
+			c.Value = ""
+		}
+		out.Values = append(out.Values, c)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return out, fmt.Errorf("read branch %d value changes: %w", branchID, err)
+	}
+	rows.Close()
+
+	metaRows, err := r.db(ctx, tx).Raw(branchMetaChangesSQL, branchID).Rows()
+	if err != nil {
+		return out, fmt.Errorf("read branch %d metadata changes: %w", branchID, err)
+	}
+	defer metaRows.Close()
+
+	for metaRows.Next() {
+		var c BranchMetaChange
+		if err := metaRows.Scan(&c.KeyID, &c.Name, &c.Description, &c.Status,
+			&c.MasterName, &c.MasterStatus, &c.BaseMasterVersion,
+			&c.MasterVersion, &c.Conflict, &c.UpdatedBy, &c.UpdatedAt); err != nil {
+			return out, fmt.Errorf("scan branch metadata change: %w", err)
+		}
+		out.Meta = append(out.Meta, c)
+	}
+	return out, metaRows.Err()
+}
+
+// branchSummariesSQL folds three per-branch questions into one statement.
+//
+// The subqueries are correlated scalar selects rather than joins with GROUP BY,
+// because a branch with no deltas must still appear — an inner join would hide
+// exactly the branch somebody just created and is looking for.
+//
+// The merge-request subquery repeats ByBranch's "live" predicate: terminal
+// states are excluded so a branch whose request was rejected reads as having
+// none, which is what lets a fresh request be opened against it.
+const branchSummariesSQL = `
+SELECT b.id, b.name, b.description, b.status, b.created_by, b.created_at,
+       b.last_edited_at, b.merged_at,
+       (SELECT count(*) FROM branch_translations bt WHERE bt.branch_id = b.id) AS value_changes,
+       (SELECT count(*) FROM branch_keys bk        WHERE bk.branch_id = b.id) AS meta_changes,
+       mr.id, COALESCE(mr.status, '')
+  FROM branches b
+  LEFT JOIN merge_requests mr
+    ON mr.branch_id = b.id
+   AND mr.status NOT IN ('merged', 'closed', 'rejected')
+ WHERE ($1 = '' OR b.status = $1)
+ ORDER BY b.created_at DESC`
+
+func (r *branchRepository) Summaries(ctx context.Context, tx *gorm.DB, status string) ([]BranchSummary, error) {
+	rows, err := r.db(ctx, tx).Raw(branchSummariesSQL, status).Rows()
+	if err != nil {
+		return nil, fmt.Errorf("list branch summaries: %w", err)
+	}
+	defer rows.Close()
+
+	var out []BranchSummary
+	for rows.Next() {
+		var s BranchSummary
+		if err := rows.Scan(&s.ID, &s.Name, &s.Description, &s.Status,
+			&s.CreatedBy, &s.CreatedAt, &s.LastEditedAt, &s.MergedAt,
+			&s.ValueChanges, &s.MetaChanges,
+			&s.MergeRequestID, &s.MergeRequestStatus); err != nil {
+			return nil, fmt.Errorf("scan branch summary: %w", err)
+		}
+		out = append(out, s)
 	}
 	return out, rows.Err()
 }
