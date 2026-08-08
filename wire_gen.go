@@ -9,12 +9,16 @@ package main
 import (
 	"context"
 	"github.com/google/wire"
+	config3 "github.com/yougroupteam/s-common-components/config"
+	secretclient2 "github.com/yougroupteam/s-common-components/secretclient"
 	"github.com/yougroupteam/u-common-components/apm"
 	"github.com/yougroupteam/u-common-components/config"
 	"github.com/yougroupteam/u-common-components/database"
 	"github.com/yougroupteam/u-common-components/secretclient"
+	"github.com/yougroupteam/u-common-components/storage/v4"
 	config2 "github.com/yougroupteam/u-l10n/pkg/config"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
+	"github.com/yougroupteam/u-l10n/pkg/service/assetsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/importsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
@@ -58,9 +62,26 @@ func injectService(ctx context.Context) (*Service, error) {
 	service := exportsvc.ProvideService(localeRepository, keyRepository, translationRepository, exportRowReader)
 	apiTokenRepository := repository.ProvideAPITokenRepository(gormConnector)
 	releaseRepository := repository.ProvideReleaseRepository(gormConnector)
-	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository, localeRepository, releaseRepository)
-	httpHandler := route.ProvideRoutes(apmConfig, configConfig, handler)
 	transactional := database.ProvideTransactional(gormConnector)
+	configDecodeOption := config3.ProvideDecodeOption(ctx)
+	configConfigStore := config3.ProvideConfigStoreImpl(ctx, configDecodeOption)
+	secretclientSecretClient, err := secretclient2.ProvideSecretClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	awsConfig, err := storage.ProvideAWSConfig(ctx, configConfigStore, secretclientSecretClient)
+	if err != nil {
+		return nil, err
+	}
+	storageStorage, err := storage.ProvideStorage(ctx, awsConfig)
+	if err != nil {
+		return nil, err
+	}
+	assetRepository := repository.ProvideAssetRepository(gormConnector)
+	auditRepository := repository.ProvideAuditRepository(gormConnector)
+	assetsvcService := assetsvc.ProvideService(transactional, storageStorage, assetRepository, auditRepository)
+	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository, localeRepository, releaseRepository, assetsvcService)
+	httpHandler := route.ProvideRoutes(apmConfig, configConfig, handler)
 	seedService := seed.ProvideService(transactional, localeRepository, keyRepository, translationRepository)
 	branchRepository := repository.ProvideBranchRepository(gormConnector)
 	mergeRequestRepository := repository.ProvideMergeRequestRepository(gormConnector)
@@ -81,4 +102,4 @@ func injectService(ctx context.Context) (*Service, error) {
 
 // commonWireSet holds the shared infrastructure providers. Feature packages
 // get their own sets so this one stays the boring, stable part of the graph.
-var commonWireSet = wire.NewSet(config.WireSet, apm.WireSet, secretclient.WireSet, database.WireSet, database.ProvideTransactional, config2.ProvideConfig, repository.WireSet)
+var commonWireSet = wire.NewSet(config.WireSet, apm.WireSet, secretclient.WireSet, database.WireSet, database.ProvideTransactional, config2.ProvideConfig, repository.WireSet, config3.WireSet, secretclient2.WireSet, storage.WireSet)

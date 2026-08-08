@@ -13,10 +13,11 @@ keys across 6 locales, exported to Flutter JSON, Android XML and iOS `.strings`.
 
 ## Status
 
-**Phases 0–3 complete; Phase 7 partial.** The service boots, owns its schema,
-reads and writes all three mobile localization formats, serves authenticated
-exports, seeds from the committed u-mobile tree, and folds branch edits into
-master behind an approval workflow.
+**Phases 0–3 and 6 complete; Phase 7 partial.** The service boots, owns its
+schema, reads and writes all three mobile localization formats, serves
+authenticated exports, seeds from the committed u-mobile tree, stores context
+screenshots on S3, and folds branch edits into master behind an approval
+workflow.
 
 | Phase | State | Gate |
 |-------|-------|------|
@@ -24,14 +25,19 @@ master behind an approval workflow.
 | 1 schema | done | Flyway from empty; 27 subtests proving constraints *reject* bad input |
 | 2 parsers + seed | done | all 22 committed files at exact counts; 7,516 keys / 35,872 translations, idempotent |
 | 3 serializers + export | done | **R1: 98,320 values round-tripped, zero alterations**; R2 idempotent; export endpoint behind API tokens |
+| 6 assets | done | presign/confirm/attach against a fake object store; **every refusal path tested**; repository SQL against real PostgreSQL |
 | 7 branch + merge | done | COW deltas, **all three conflict types**, merge transaction, releases — verified under `-race` |
 
 **Phase 4 (Lokalise importer)** is built but unexercised against the real API —
 it needs a read-scope token (master plan open item #4). The client and the
 presence-oracle logic are covered by tests against a fake server.
 
-**Not yet implemented:** Phases 5 (portal API), 6 (assets/S3) and 11 (mobile
-SDK — the Flutter client for the OTA endpoint).
+**Phase 6 is unexercised against a real bucket.** There is no local S3 or MinIO
+anywhere in this tree and `storage/v4` hardcodes TLS with no path-style option,
+so the S3 half is proven only against a fake — see [Context screenshots](#context-screenshots).
+
+**Not yet implemented:** Phases 5 (portal API) and 11 (mobile SDK — the Flutter
+client for the OTA endpoint).
 
 ## Quick start
 
@@ -55,6 +61,7 @@ curl -s localhost:8080/readyz  | jq   # {"status":"ready","checks":{"database":"
 | `make db-test` | create the scratch database the schema tests use |
 | `make db-migrate` | apply the migrations with real Flyway, from empty |
 | `make run-local` | start PostgreSQL and run the service |
+| `make s3-cred-local` | write the placeholder S3 credential file `storage/v4` refuses to start without |
 
 ## Health probes
 
@@ -101,6 +108,57 @@ The seeded locale directory names come from `u-mobile/scripts/l10n/run.sh` and
 are pinned by a test. Note en-SG's Android directory is bare `values`, not
 `values-en-rSG`.
 
+## Context screenshots
+
+Screenshots that tell a translator what a string looks like in the app. They
+never reach an export and never enter an OTA bundle.
+
+Upload is a three-step handshake, and the middle step does not touch this
+service:
+
+| Step | Call | What it does |
+|------|------|--------------|
+| 1 | `POST /api/v1/assets/presign` | validates the declaration, returns a signed POST form — or the existing asset, with no upload URL, if those exact bytes are already stored |
+| 2 | browser → S3 | the bytes go straight to the bucket |
+| 3 | `POST /api/v1/assets/confirm` | HEADs the object, checks it against the declaration, and only then inserts the row |
+
+Then `PUT /api/v1/keys/{id}/assets` and `DELETE /api/v1/keys/{id}/assets/{assetId}`
+attach and detach, and `GET /api/v1/assets/{id}/url` issues a short-lived
+presigned GET. Every one of them requires a `read_write` token — including the
+GET, because these images carry customer PII and a token issued to pull
+translations has no business reading them.
+
+Four details are load-bearing:
+
+- **The upload is a POST policy, not a presigned PUT.** `SignURL`'s PUT branch
+  ignores `Options.ContentType` and attaches no conditions at all, so a browser
+  could upload anything of any size to the key we signed and every validation
+  would be decorative. Only the POST branch signs conditions S3 itself enforces.
+  Note that branch derives the content type from the *filename argument's
+  extension*, not from `Options.ContentType`, which it ignores too — so the
+  filename it is given is derived from the validated content type, and the
+  caller's own filename travels separately as metadata.
+- **Confirm never trusts the client.** The declaration is bound into the signed
+  policy as `x-amz-meta-declared-*`, and confirm reads it back off the object
+  and compares it against the object's real size and content type. The policy
+  cannot pin the size — `storage/v4` sets no content-length-range — so that
+  comparison is the only thing standing between a 4KB declaration and a 50MB
+  upload.
+- **Every view and every attach writes an `audit_events` row**, and for a view
+  the row is written *before* the URL is signed: a failure to record who looked
+  fails the request. That is deliberately unlike the best-effort `last_used_at`
+  on API tokens.
+- **`image/webp` is rejected at presign** with a 400 that says why. The schema
+  permits it, but `storage/v4`'s content-type table does not know the extension
+  and signing fails outright, which would surface as a 500.
+
+There is no local S3 or MinIO anywhere in this tree and `storage/v4` hardcodes
+TLS with no path-style option, so the object store cannot be pointed at a
+double. The service therefore declares its own two-method `ObjectStore`
+interface — the same move as `route.Pinger` — and the tests drive the refusal
+paths against a fake. **The S3 calls themselves have never run against a real
+bucket.**
+
 ## Layout
 
 ```
@@ -137,9 +195,17 @@ from a ConfigMap via `envFrom`; locally the Makefile supplies them.
 | `SERVICECONFIG_REQUEST_TIMEOUT` | `60s` | Per-request deadline; cancels in-flight queries |
 | `SERVICECONFIG_SHUTDOWN_TIMEOUT` | `15s` | Drain window on SIGTERM; keep below `terminationGracePeriodSeconds` |
 | `DATABASECONFIG_*` | — | Owned by `u-common-components/database` |
+| `STORAGE_CONFIG_AWS_*` | — | Owned by `u-common-components/storage/v4` |
 
 Invalid configuration fails at startup rather than at first request — a service
 that boots with bad config only defers the outage.
+
+`storage/v4` takes that further than the rest: it requires a bucket name *and*
+reads its credentials from a file, and returns an error from either if they are
+missing — so since Phase 6 the process will not boot without them, even though
+nothing local ever calls S3. `make run-local` generates a placeholder credential
+file (`make s3-cred-local`) to get past that check. It is gitignored and it is
+not a credential.
 
 ## Code generation
 

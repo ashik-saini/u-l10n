@@ -20,6 +20,7 @@ import (
 
 	"github.com/yougroupteam/u-l10n/pkg/config"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
+	"github.com/yougroupteam/u-l10n/pkg/service/assetsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 )
 
@@ -44,6 +45,7 @@ type Handler struct {
 	tokens   repository.APITokenRepository
 	locales  repository.LocaleRepository
 	releases repository.ReleaseRepository
+	assets   *assetsvc.Service
 }
 
 func ProvideHandler(
@@ -53,6 +55,7 @@ func ProvideHandler(
 	tokens repository.APITokenRepository,
 	locales repository.LocaleRepository,
 	releases repository.ReleaseRepository,
+	assets *assetsvc.Service,
 ) *Handler {
 	return &Handler{
 		cnf:      cnf,
@@ -61,6 +64,7 @@ func ProvideHandler(
 		tokens:   tokens,
 		locales:  locales,
 		releases: releases,
+		assets:   assets,
 	}
 }
 
@@ -96,6 +100,18 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 		r.Group(func(r chi.Router) {
 			r.Use(handler.RequireAPIToken(repository.ScopeReadExport))
 			r.Get("/export", handler.Export)
+		})
+
+		// Context screenshots. read_write for every one of them, including the
+		// presigned GET: these images carry customer PII, and a token issued
+		// only to pull translations has no business reading them.
+		r.Group(func(r chi.Router) {
+			r.Use(handler.RequireAPIToken(repository.ScopeReadWrite))
+			r.Post("/assets/presign", handler.AssetPresign)
+			r.Post("/assets/confirm", handler.AssetConfirm)
+			r.Get("/assets/{id}/url", handler.AssetURL)
+			r.Put("/keys/{id}/assets", handler.AssetAttach)
+			r.Delete("/keys/{id}/assets/{assetId}", handler.AssetDetach)
 		})
 	})
 

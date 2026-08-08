@@ -1,5 +1,5 @@
 .PHONY: test test-report-dep test-report gen-wire pre-commit install clean \
-        db-local db-local-stop db-test db-migrate run-local
+        db-local db-local-stop db-test db-migrate run-local s3-cred-local
 
 # Local development defaults. Override on the command line, e.g.
 #   make run-local DATABASECONFIG_DATABASENAME=u_l10n_scratch
@@ -15,6 +15,14 @@ DATABASECONFIG_DATABASENAME ?= u_l10n_local
 TEST_DATABASE_NAME    ?= u_l10n_test
 MIGRATE_DATABASE_NAME ?= u_l10n_migrate_test
 
+# storage/v4 validates its bucket name and reads its credentials from a FILE at
+# startup, and returns an error if either is missing — so the process will not
+# boot at all without them, even though nothing local ever calls S3. There is no
+# local S3 or MinIO in this tree and storage/v4 hardcodes TLS with no path-style
+# option, so these values exist only to get past that check. They are not
+# credentials and cannot reach any bucket.
+LOCAL_S3_CRED_FILE ?= .local/s3_storage.yaml
+
 LOCAL_ENV = \
 	SERVICECONFIG_ENV=local \
 	DATABASECONFIG_TYPE=$(DATABASECONFIG_TYPE) \
@@ -22,7 +30,9 @@ LOCAL_ENV = \
 	DATABASECONFIG_PORT=$(DATABASECONFIG_PORT) \
 	DATABASECONFIG_USER=$(DATABASECONFIG_USER) \
 	DATABASECONFIG_PASSWORD=$(DATABASECONFIG_PASSWORD) \
-	DATABASECONFIG_DATABASENAME=$(DATABASECONFIG_DATABASENAME)
+	DATABASECONFIG_DATABASENAME=$(DATABASECONFIG_DATABASENAME) \
+	STORAGE_CONFIG_AWS_BUCKET_NAME=u-l10n-local \
+	STORAGE_CONFIG_AWS_TOKEN_CRED_PATH=$(LOCAL_S3_CRED_FILE)
 
 test:
 	go test -v -cover ./...
@@ -93,10 +103,17 @@ db-migrate: db-test
 		-user=$(DATABASECONFIG_USER) -password=$(DATABASECONFIG_PASSWORD) \
 		-locations=filesystem:.db migrate
 
-run-local: db-local
+# Writes the placeholder S3 credential file storage/v4 insists on reading. The
+# path is gitignored; regenerating it is idempotent and costs nothing.
+s3-cred-local:
+	@mkdir -p $(dir $(LOCAL_S3_CRED_FILE))
+	@printf 'STORAGE_CONFIG_AWS_ACCESS_KEY_ID: local-no-such-key\nSTORAGE_CONFIG_AWS_SECRET_ACCESS_KEY: local-no-such-secret\n' \
+		> $(LOCAL_S3_CRED_FILE)
+
+run-local: db-local s3-cred-local
 	$(LOCAL_ENV) go run .
 
 # Loads the committed u-mobile tree. Add DRY_RUN=--dry-run to rehearse.
 U_MOBILE_PATH ?= ../../FE/u-mobile
-seed-local: db-local
+seed-local: db-local s3-cred-local
 	$(LOCAL_ENV) go run . seed-from-files --root $(U_MOBILE_PATH) --actor $(USER)@you.co $(DRY_RUN)
