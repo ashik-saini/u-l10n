@@ -18,6 +18,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mrsvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/releasesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/tagsvc"
 )
 
@@ -195,6 +196,7 @@ func (h *Handler) portalError(w http.ResponseWriter, r *http.Request, op string,
 		errors.Is(err, branchsvc.ErrBadRequest),
 		errors.Is(err, mrsvc.ErrBadRequest),
 		errors.Is(err, tagsvc.ErrBadRequest),
+		errors.Is(err, releasesvc.ErrBadRequest),
 		errors.Is(err, keysvc.ErrBranchUnsupported):
 		h.badRequest(w, r, err)
 
@@ -247,6 +249,10 @@ func (h *Handler) portalError(w http.ResponseWriter, r *http.Request, op string,
 	case errors.Is(err, mergesvc.ErrUnresolvedConflicts):
 		render.Status(r, http.StatusConflict)
 		render.JSON(w, r, errorResponse{Error: "unresolved_conflicts", Details: err.Error()})
+
+	case errors.Is(err, repository.ErrAlreadyRolledBack):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, errorResponse{Error: "already_rolled_back", Details: err.Error()})
 
 	case errors.Is(err, mergesvc.ErrNameCollision):
 		render.Status(r, http.StatusConflict)

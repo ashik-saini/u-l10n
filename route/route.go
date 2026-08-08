@@ -26,6 +26,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mrsvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/releasesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/tagsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/usersvc"
 )
@@ -69,6 +70,10 @@ type Handler struct {
 
 	// tagSvc backs the tag manager, and audits every tag mutation.
 	tagSvc *tagsvc.Service
+
+	// releaseSvc backs the release history, the manual publish and the OTA
+	// kill switch.
+	releaseSvc *releasesvc.Service
 }
 
 func ProvideHandler(
@@ -86,6 +91,7 @@ func ProvideHandler(
 	branchSvc *branchsvc.Service,
 	mrSvc *mrsvc.Service,
 	tagSvc *tagsvc.Service,
+	releaseSvc *releasesvc.Service,
 ) *Handler {
 	return &Handler{
 		cnf:        cnf,
@@ -102,6 +108,7 @@ func ProvideHandler(
 		branchSvc:  branchSvc,
 		mrSvc:      mrSvc,
 		tagSvc:     tagSvc,
+		releaseSvc: releaseSvc,
 	}
 }
 
@@ -180,6 +187,12 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 			r.Get("/merge-requests/{id}/conflicts", handler.MergeRequestConflicts)
 
 			r.Get("/tags", handler.ListTags)
+
+			// Knowing what shipped is reading. Changing what ships is not — see
+			// the approver group.
+			r.Get("/releases", handler.ListReleases)
+			r.Get("/releases/{version}", handler.GetRelease)
+			r.Get("/releases/{version}/bundles/{locale}", handler.ReleaseBundle)
 		})
 
 		// Writing the corpus. Editor, and no higher: writing to a BRANCH is the
@@ -225,6 +238,12 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 			r.Post("/merge-requests/{id}/request-changes", handler.RequestMergeRequestChanges)
 			r.Post("/merge-requests/{id}/reject", handler.RejectMergeRequest)
 			r.Post("/merge-requests/{id}/merge", handler.MergeMergeRequest)
+
+			// A manual publish ships master with no diff reviewed, and a
+			// rollback withdraws shipped copy from every client. Both belong to
+			// the role that exists for exactly that judgement.
+			r.Post("/releases", handler.PublishRelease)
+			r.Post("/releases/{version}/rollback", handler.RollbackRelease)
 		})
 
 		// Granting privileges requires holding them.
