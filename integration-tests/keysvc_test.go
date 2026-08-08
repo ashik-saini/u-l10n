@@ -2,6 +2,7 @@ package integrationtests
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -492,23 +493,113 @@ func TestKeyLifecycleOnMaster(t *testing.T) {
 	})
 }
 
-// TestCreateKeyOnABranchIsRefused.
+// TestCreateKeyOnABranchIsADraftPlusADelta.
 //
-// branch_keys can hold a key created on a branch, but the merge's
-// applyKeyMetaSQL only UPDATEs rows it can join to an existing master key — so
-// such a key would never reach master and the merge would report success having
-// dropped it. Refusing is the honest answer until the merge learns to insert.
-func TestCreateKeyOnABranchIsRefused(t *testing.T) {
+// The shape of the whole fix. A key created on a branch is a REAL keys row from
+// the moment it is created — held at status 'draft' — plus an ordinary
+// branch_keys delta saying 'active'. That is what makes it fillable
+// (branch_translations.key_id is NOT NULL REFERENCES keys) while keeping it out
+// of every export until a merge promotes it.
+func TestCreateKeyOnABranchIsADraftPlusADelta(t *testing.T) {
 	ctx := context.Background()
 	svc := newKeySvc(t)
 	branch := createBranch(t, uniqueName(t, "br"))
 
-	_, err := svc.CreateKey(ctx, branch.Name, keysvc.CreateKeyRequest{
-		Name: uniqueName(t, "on_branch"), Platforms: []model.Platform{model.PlatformFlutter},
+	name := uniqueName(t, "on_branch")
+	created, err := svc.CreateKey(ctx, branch.Name, keysvc.CreateKeyRequest{
+		Name: name, Platforms: []model.Platform{model.PlatformFlutter},
 	}, testActor, "req-1")
+	require.NoError(t, err)
+	require.NotZero(t, created.ID)
 
-	require.Error(t, err)
-	assert.ErrorIs(t, err, keysvc.ErrBranchUnsupported)
+	// Master holds a draft. Anything else and the key would be exported before
+	// anybody approved it.
+	var masterStatus string
+	require.NoError(t, testDB.QueryRow(
+		`SELECT status FROM keys WHERE id = $1`, created.ID).Scan(&masterStatus))
+	assert.Equal(t, "draft", masterStatus,
+		"a key created on a branch must not be active on master before the merge")
+
+	// The delta carries the key's id — never NULL — and the instruction the
+	// merge will carry out.
+	var (
+		deltaKeyID sql.NullInt64
+		deltaState string
+		baseVer    int
+	)
+	require.NoError(t, testDB.QueryRow(`
+		SELECT key_id, status, base_master_version
+		  FROM branch_keys WHERE branch_id = $1 AND name = $2`,
+		branch.ID, name).Scan(&deltaKeyID, &deltaState, &baseVer))
+	require.True(t, deltaKeyID.Valid, "branch_keys.key_id must name the draft row")
+	assert.Equal(t, created.ID, deltaKeyID.Int64)
+	assert.Equal(t, "active", deltaState, "the delta is the promotion the merge applies")
+	assert.Equal(t, 1, baseVer, "anchored on the draft's own keys.version")
+
+	// The point of the draft: values can be attached, because the foreign key
+	// now has something to point at.
+	_, err = svc.SetTranslation(ctx, keysvc.SetTranslationRequest{
+		KeyID: created.ID, LocaleCode: "en-SG", Branch: branch.Name, Value: "brand new copy",
+	}, testActor, "req-1")
+	require.NoError(t, err)
+
+	t.Run("invisible on master, visible on its own branch", func(t *testing.T) {
+		onMaster, err := svc.Browse(ctx, keysvc.BrowseRequest{Search: name})
+		require.NoError(t, err)
+		assert.Empty(t, onMaster.Keys, "a draft is not part of master's corpus")
+
+		onBranch, err := svc.Browse(ctx, keysvc.BrowseRequest{Branch: branch.Name, Search: name})
+		require.NoError(t, err)
+		require.Len(t, onBranch.Keys, 1,
+			"the branch's own browser must show the key the branch just created")
+		assert.Equal(t, model.KeyStatusActive, onBranch.Keys[0].Key.Status,
+			"the branch overlay reports the status the branch intends")
+	})
+
+	t.Run("the branch diff shows it as an introduction", func(t *testing.T) {
+		_, changes, err := newBranchSvc(t).Changes(ctx, branch.Name)
+		require.NoError(t, err)
+
+		var found bool
+		for _, m := range changes.Meta {
+			if m.KeyID != created.ID {
+				continue
+			}
+			found = true
+			assert.Equal(t, "draft", m.MasterStatus,
+				"master_status 'draft' is how a reviewer tells a new key from a rename")
+			assert.Equal(t, "active", m.Status)
+			assert.False(t, m.Conflict)
+		}
+		assert.True(t, found, "the diff must carry the created key")
+	})
+
+	t.Run("the name is still checked against active master keys", func(t *testing.T) {
+		taken := uniqueName(t, "already_live")
+		createTestKey(t, svc, taken)
+
+		_, err := svc.CreateKey(ctx, branch.Name, keysvc.CreateKeyRequest{
+			Name: taken, Platforms: []model.Platform{model.PlatformFlutter},
+		}, testActor, "req-1")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, repository.ErrKeyNameTaken)
+	})
+
+	t.Run("a closed branch cannot gain keys", func(t *testing.T) {
+		branches := newBranchSvc(t)
+		_, err := branches.Close(ctx, branch.Name, testActor, "req-1")
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_, reopenErr := branches.Reopen(ctx, branch.Name, testActor, "req-1")
+			require.NoError(t, reopenErr)
+		})
+
+		_, err = svc.CreateKey(ctx, branch.Name, keysvc.CreateKeyRequest{
+			Name: uniqueName(t, "too_late"), Platforms: []model.Platform{model.PlatformFlutter},
+		}, testActor, "req-1")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, keysvc.ErrBranchNotOpen)
+	})
 }
 
 // TestBranchKeyMetadataOverlaysTheBrowser: a rename on a branch must be visible

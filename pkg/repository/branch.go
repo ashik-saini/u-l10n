@@ -150,14 +150,18 @@ type BranchValueChange struct {
 
 // BranchMetaChange is one key-metadata delta.
 type BranchMetaChange struct {
-	// KeyID is nil for a key CREATED on the branch, which has no master row.
-	KeyID *int64
+	// KeyID always names a real key. A key CREATED on this branch has one too:
+	// it is a `keys` row from the moment it is created, held at status 'draft'
+	// until the merge promotes it.
+	KeyID int64
 
 	Name        string
 	Description string
 	Status      string
 
-	// MasterName and MasterStatus are empty when KeyID is nil.
+	// MasterName and MasterStatus are master's current values. For a key
+	// created on this branch MasterStatus is 'draft', which is what marks the
+	// row as an introduction rather than an edit.
 	MasterName   string
 	MasterStatus string
 
@@ -394,7 +398,13 @@ func (r *branchRepository) ChangedCount(ctx context.Context, tx *gorm.DB, branch
 	return n, nil
 }
 
-// setKeyMetaSQL writes a metadata delta for an EXISTING key.
+// setKeyMetaSQL writes a metadata delta for a key.
+//
+// "A key", not "an existing master key": since V1.07 a key created on a branch
+// also has a real `keys` row from the moment it is created — a draft one — so
+// this single statement serves both a rename of a master key and the delta that
+// will promote a branch-created draft. The ON CONFLICT target needs no
+// predicate now that key_id is NOT NULL and the index is no longer partial.
 //
 // base_master_version is anchored on keys.version, and — exactly as for value
 // deltas — is captured only on the first touch. Refreshing it would let a
@@ -406,7 +416,7 @@ INSERT INTO branch_keys
      status, base_master_version, updated_by)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
         COALESCE((SELECT version FROM keys WHERE id = $2), 0), $9)
-ON CONFLICT (branch_id, key_id) WHERE key_id IS NOT NULL DO UPDATE SET
+ON CONFLICT (branch_id, key_id) DO UPDATE SET
     name         = EXCLUDED.name,
     description  = EXCLUDED.description,
     platforms    = EXCLUDED.platforms,
@@ -546,19 +556,21 @@ SELECT bt.key_id, k.name, bt.locale_id, l.code,
 
 // branchMetaChangesSQL is the branch diff, metadata side.
 //
-// LEFT JOIN, not JOIN: branch_keys.key_id is NULL for a key created on the
-// branch, and an inner join would silently hide exactly the rows a reviewer
-// most needs to see.
+// A plain JOIN since V1.07: every branch_keys row names a real key, including
+// one created on this branch. A key the branch created shows up here with
+// master_status = 'draft' — which is precisely how a reviewer tells "this
+// branch introduces a new key" from "this branch renames an existing one",
+// without the diff needing a flag of its own.
 const branchMetaChangesSQL = `
 SELECT bk.key_id, bk.name, bk.description, bk.status,
-       COALESCE(k.name, '')   AS master_name,
-       COALESCE(k.status, '') AS master_status,
+       k.name   AS master_name,
+       k.status AS master_status,
        bk.base_master_version,
-       COALESCE(k.version, 0) AS master_version,
-       (bk.key_id IS NOT NULL AND COALESCE(k.version, 0) <> bk.base_master_version) AS conflict,
+       k.version AS master_version,
+       (k.version <> bk.base_master_version) AS conflict,
        bk.updated_by, bk.updated_at
   FROM branch_keys bk
-  LEFT JOIN keys k ON k.id = bk.key_id
+  JOIN keys k ON k.id = bk.key_id
  WHERE bk.branch_id = $1
  ORDER BY bk.name`
 

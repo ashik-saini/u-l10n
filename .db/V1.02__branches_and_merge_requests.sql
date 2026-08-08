@@ -63,7 +63,11 @@ CREATE INDEX IF NOT EXISTS idx_branch_translations_key_locale
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS branch_keys (
     branch_id           BIGINT NOT NULL REFERENCES branches (id) ON DELETE CASCADE,
-    -- NULL for a key created on this branch that does not yet exist on master.
+    -- Nullable as originally written, to mean "a key created on this branch
+    -- that does not yet exist on master". V1.07 makes it NOT NULL: that state
+    -- could never carry a value (branch_translations.key_id is NOT NULL
+    -- REFERENCES keys) and the merge silently dropped it. See V1.07 for the
+    -- model that replaced it.
     key_id              BIGINT REFERENCES keys (id) ON DELETE CASCADE,
     name                TEXT   NOT NULL,
     description         TEXT   NOT NULL DEFAULT '',
@@ -84,8 +88,8 @@ CREATE TABLE IF NOT EXISTS branch_keys (
     )
 );
 
--- One delta per existing key per branch. Partial, because key_id is NULL for
--- keys created on the branch and NULLs do not collide in a plain unique index.
+-- One delta per key per branch. Partial only because key_id was nullable here;
+-- V1.07 replaces this with a plain unique index.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_branch_keys_branch_key
     ON branch_keys (branch_id, key_id) WHERE key_id IS NOT NULL;
 

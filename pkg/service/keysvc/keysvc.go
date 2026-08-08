@@ -63,12 +63,6 @@ var (
 	// to a merged branch would edit the permanent record of what a merge
 	// actually applied.
 	ErrBranchNotOpen = errors.New("branch is not open for editing")
-
-	// ErrBranchUnsupported marks the operations that exist on master but not on
-	// a branch. It is a distinct sentinel rather than a plain bad request
-	// because it describes a gap in the merge layer, not a mistake by the
-	// caller — see CreateKey.
-	ErrBranchUnsupported = errors.New("operation is not available on a branch")
 )
 
 // ConflictError carries BOTH sides of a lost optimistic-concurrency race.
@@ -390,24 +384,32 @@ type CreateKeyRequest struct {
 	IOSName     *string
 }
 
-// CreateKey adds a key to master.
+// CreateKey adds a key, on master or on a branch.
 //
-// MASTER ONLY, and that is a gap rather than a decision. branch_keys can hold a
-// key created on a branch (key_id NULL), but the merge's applyKeyMetaSQL only
-// UPDATEs rows it can join to an existing master key — so a key created on a
-// branch would never be inserted into master, and the merge would report success
-// having silently dropped it. Refusing here is the honest response until the
-// merge learns to insert.
+// ON A BRANCH the key is created in `keys` immediately with status = 'draft',
+// plus an ordinary branch_keys delta carrying that key's id and status =
+// 'active'. It is NOT withheld from master until merge, and that is the whole
+// design rather than a shortcut:
+//
+//   - branch_translations.key_id is NOT NULL REFERENCES keys (id). Without a
+//     real row the key could not carry a single translation, which makes a
+//     "key that exists only on the branch" a key nobody can ever fill in.
+//   - A draft reaches nobody. Every export reads `keys` WHERE status = 'active'
+//     and every release bundle — the OTA payload included — is materialised
+//     from exactly those rows, so the key is invisible outside the branch until
+//     the merge promotes it.
+//   - The merge then needs no new code path: applyKeyMetaSQL already assigns
+//     status = bk.status, so draft becomes active alongside every other
+//     metadata delta, under the same conflict and collision checks.
+//
+// The name check below is a courtesy that fails fast. The authority is
+// NameCollisions inside the merge transaction, which is re-computed under the
+// advisory lock — master can gain the name at any point after this returns, and
+// only the merge is in a position to say so.
 func (s *Service) CreateKey(
 	ctx context.Context, branchName string, req CreateKeyRequest, actor, requestID string,
 ) (model.Key, error) {
 	var created model.Key
-
-	if branchName != "" {
-		return created, fmt.Errorf(
-			"%w: creating a key on a branch is not supported — the merge cannot yet insert branch-created keys into master",
-			ErrBranchUnsupported)
-	}
 
 	name, err := validateName(req.Name)
 	if err != nil {
@@ -422,27 +424,73 @@ func (s *Service) CreateKey(
 	}
 
 	err = s.tx.WithTransaction(ctx, func(tx *gorm.DB) error {
+		branch, err := s.resolveOpenBranch(ctx, tx, branchName)
+		if err != nil {
+			return err
+		}
+
+		status := model.KeyStatusActive
+		if branch != nil {
+			status = model.KeyStatusDraft
+
+			// createKeySQL's ON CONFLICT target is the PARTIAL index over active
+			// names, and a draft is not active — so nothing in the statement
+			// would refuse a draft duplicating a live key's name. Ask directly.
+			taken, err := s.keys.IDsByName(ctx, tx, []string{name})
+			if err != nil {
+				return err
+			}
+			if _, exists := taken[name]; exists {
+				return fmt.Errorf("create key %q on branch %q: %w",
+					name, branch.Name, repository.ErrKeyNameTaken)
+			}
+		}
+
 		k, err := s.keys.Create(ctx, tx, model.Key{
 			Name:        name,
 			Description: strings.TrimSpace(req.Description),
 			Platforms:   platforms,
 			AndroidName: req.AndroidName,
 			IOSName:     req.IOSName,
-			Status:      model.KeyStatusActive,
+			Status:      status,
 		})
 		if err != nil {
 			return err
 		}
 		created = k
 
-		if err := s.keys.RecordHistory(ctx, tx, k, model.SourceUI, nil, actor); err != nil {
+		if branch != nil {
+			// The delta says 'active': it is the instruction the merge carries
+			// out. Two branches may each hold a draft of the same name — the
+			// partial index does not stop them — and whichever merges second is
+			// refused by NameCollisions rather than dying on the index.
+			onBranch := k
+			onBranch.Status = model.KeyStatusActive
+			if err := s.branches.SetKeyMeta(ctx, tx, branch.ID, k.ID, onBranch, actor); err != nil {
+				return err
+			}
+			if err := s.afterBranchWrite(ctx, tx, branch.ID); err != nil {
+				return err
+			}
+			created = onBranch
+		}
+
+		var historyBranch *int64
+		if branch != nil {
+			historyBranch = &branch.ID
+		}
+		if err := s.keys.RecordHistory(ctx, tx, created, model.SourceUI, historyBranch, actor); err != nil {
 			return err
 		}
 		return s.audit.Record(ctx, tx, repository.AuditEvent{
-			Actor:     actor,
-			Action:    repository.ActionKeyCreate,
-			Target:    fmt.Sprintf("key:%d", k.ID),
-			Metadata:  map[string]any{"name": k.Name, "platforms": platformStrings(k.Platforms)},
+			Actor:  actor,
+			Action: repository.ActionKeyCreate,
+			Target: fmt.Sprintf("key:%d", k.ID),
+			Metadata: map[string]any{
+				"name":      k.Name,
+				"platforms": platformStrings(k.Platforms),
+				"branch":    branchName,
+			},
 			RequestID: requestID,
 		})
 	})
@@ -450,7 +498,8 @@ func (s *Service) CreateKey(
 		return model.Key{}, err
 	}
 
-	log.Infow(ctx, "key created", "key_id", created.ID, "name", created.Name, "actor", actor)
+	log.Infow(ctx, "key created", "key_id", created.ID, "name", created.Name,
+		"branch", branchName, "actor", actor)
 	return created, nil
 }
 

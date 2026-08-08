@@ -155,10 +155,9 @@ func TestMergeRefusalsAreAllConflictsWithSomethingToActOn(t *testing.T) {
 	})
 
 	t.Run("name collisions carry the names", func(t *testing.T) {
-		branchKeyID := int64(4)
 		rec := runMergeError(t, &mergesvc.CollisionError{
 			Collisions: []repository.NameCollision{
-				{Name: "login_button", BranchKeyID: &branchKeyID, MasterKeyID: 9},
+				{Name: "login_button", BranchKeyID: 4, MasterKeyID: 9},
 			},
 		})
 

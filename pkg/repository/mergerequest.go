@@ -519,8 +519,13 @@ func (c MetaConflict) Resolved() bool { return c.Resolution != "" }
 // that is impossible, because idx_keys_name_active permits one active key per
 // name. Merging regardless would fail on the unique index mid-transaction, so
 // it must be detected up front and shown to a human.
+//
+// BranchKeyID is a plain id, not a pointer: since V1.07 every branch_keys row
+// names a real key. For a key CREATED on the branch it is that key's draft row,
+// which the merge promotes to active — and which is why the detection below
+// cannot simply compare names and must exclude the branch's own key.
 type NameCollision struct {
-	BranchKeyID *int64
+	BranchKeyID int64
 	Name        string
 	MasterKeyID int64
 }
@@ -539,7 +544,6 @@ SELECT bk.key_id,
    AND mcr.key_id = bk.key_id
    AND mcr.locale_id IS NULL
  WHERE bk.branch_id = $1
-   AND bk.key_id IS NOT NULL
    AND COALESCE(k.version, 0) <> bk.base_master_version
  ORDER BY k.sort_index`
 
@@ -570,13 +574,21 @@ func (r *mergeRequestRepository) MetaConflicts(
 // The self-match is excluded: a branch delta that keeps a key's own name is not
 // colliding with itself. Only a DIFFERENT master key holding the target name is
 // a real collision.
+//
+// This is also what catches a key CREATED on a branch whose name master gained
+// independently, or which a second branch created and merged first. The
+// branch's own draft row cannot match, because the join requires
+// k.status = 'active' and a draft is not; the moment another branch's draft is
+// promoted to active by ITS merge, this query starts reporting the collision
+// and the second merge refuses loudly instead of dying on idx_keys_name_active
+// halfway through applying changes.
 const nameCollisionsSQL = `
 SELECT bk.key_id, bk.name, k.id
   FROM branch_keys bk
   JOIN keys k ON k.name = bk.name AND k.status = 'active'
  WHERE bk.branch_id = $1
    AND bk.status = 'active'
-   AND (bk.key_id IS NULL OR bk.key_id <> k.id)
+   AND bk.key_id <> k.id
  ORDER BY bk.name`
 
 func (r *mergeRequestRepository) NameCollisions(
@@ -604,6 +616,13 @@ func (r *mergeRequestRepository) NameCollisions(
 // Applied BEFORE value deltas in the merge, because a rename must land before
 // values are written against the key, and a soft delete must not be undone by a
 // value write that follows it.
+//
+// This one UPDATE is also how a key CREATED on a branch reaches master. Such a
+// key already has a `keys` row — inserted at creation with status = 'draft', so
+// it is excluded from every export and every OTA bundle until it lands — and a
+// branch_keys delta carrying status = 'active'. `status = bk.status` promotes
+// it. There is no INSERT branch here and deliberately so: one path by which a
+// key becomes visible on master is one path to get wrong.
 const applyKeyMetaSQL = `
 UPDATE keys k
    SET name         = bk.name,

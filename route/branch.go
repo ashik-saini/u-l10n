@@ -96,8 +96,10 @@ type valueChangeResponse struct {
 }
 
 type metaChangeResponse struct {
-	// KeyID is null for a key created on the branch, which has no master row.
-	KeyID *int64 `json:"key_id"`
+	// KeyID always names a real key. A key created on this branch has one too:
+	// it exists as a draft until the merge promotes it, which is what
+	// master_status = "draft" on this row reports.
+	KeyID int64 `json:"key_id"`
 
 	Name        string `json:"name"`
 	Description string `json:"description"`

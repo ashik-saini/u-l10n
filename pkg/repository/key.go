@@ -35,8 +35,10 @@ type KeyFilter struct {
 	// BranchID selects the copy-on-write view. Zero means master — and because
 	// branches.id is a BIGSERIAL starting at 1, zero simply matches no delta
 	// row, so master and branch reads take ONE code path rather than two that
-	// drift apart. Only UntranslatedIn actually consults it here; the values
-	// themselves are resolved by TranslationRepository.ResolveMany.
+	// drift apart. Two things here consult it — the status predicate, so a key
+	// the branch created is visible in the branch's own view while still a draft
+	// on master, and UntranslatedIn. The values themselves are resolved by
+	// TranslationRepository.ResolveMany.
 	BranchID int64
 
 	// Platform restricts to keys that ship on one platform.
@@ -366,8 +368,25 @@ func (r *keyRepository) List(ctx context.Context, tx *gorm.DB, f KeyFilter) (Key
 		args  []interface{}
 	)
 
-	where.WriteString(` WHERE k.status = ANY(?::text[])`)
+	// The status predicate is widened by the BRANCH's opinion, not only
+	// master's. A key created on a branch is a draft on master until the merge
+	// promotes it, so a plain `status = 'active'` filter would hide, from the
+	// branch's own browser, exactly the key the editor just created — while the
+	// branch diff showed it. The two views must agree about what the branch
+	// contains.
+	//
+	// bk.status = 'active' rather than "any delta": a branch that soft-deletes a
+	// key says so in its delta, and that key is still on master and still
+	// matches the status list on its own.
+	where.WriteString(` WHERE (k.status = ANY(?::text[])`)
 	args = append(args, pq.Array(statuses))
+	if f.BranchID > 0 {
+		where.WriteString(` OR EXISTS (
+            SELECT 1 FROM branch_keys bk
+             WHERE bk.branch_id = ? AND bk.key_id = k.id AND bk.status = 'active')`)
+		args = append(args, f.BranchID)
+	}
+	where.WriteString(`)`)
 
 	if f.Platform != "" {
 		where.WriteString(` AND ? = ANY(k.platforms)`)

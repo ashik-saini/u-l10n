@@ -434,6 +434,156 @@ func TestASuccessfulMergeAppliesAndCutsARelease(t *testing.T) {
 	})
 }
 
+// TestMergeLandsAKeyCreatedOnABranch is the regression test for the silent
+// drop, end to end through the real merge transaction.
+//
+// The rule it pins down: a merge involving a branch-created key must either
+// land that key on master or refuse loudly. Reporting success while the key
+// never arrives is the one outcome that is unacceptable, because nothing
+// downstream can detect it — the merge cuts a release, the release materialises
+// bundles, and every consumer afterwards reads a corpus that is quietly missing
+// a key somebody wrote and somebody else approved.
+//
+// Against the pre-fix code this fails at the first line: creating a key on a
+// branch was refused outright, precisely because applyKeyMetaSQL would have
+// skipped a NULL-key_id delta and dropped it.
+func TestMergeLandsAKeyCreatedOnABranch(t *testing.T) {
+	ctx := context.Background()
+	keys := newKeySvc(t)
+	branches := newBranchSvc(t)
+	mrs := newMRSvc(t)
+	exportRows := repository.ProvideExportRowReader(testGORM(t))
+	enSG := localeID(t, "en-SG")
+
+	branch, err := branches.Create(ctx, uniqueName(t, "new_key"), "", testActor, "req-1")
+	require.NoError(t, err)
+
+	name := uniqueName(t, "created_on_branch")
+	created, err := keys.CreateKey(ctx, branch.Name, keysvc.CreateKeyRequest{
+		Name:      name,
+		Platforms: []model.Platform{model.PlatformFlutter},
+	}, testActor, "req-1")
+	require.NoError(t, err)
+
+	_, err = keys.SetTranslation(ctx, keysvc.SetTranslationRequest{
+		KeyID: created.ID, LocaleCode: "en-SG", Branch: branch.Name, Value: "brand new copy",
+	}, testActor, "req-1")
+	require.NoError(t, err)
+
+	// Before the merge the key reaches nobody. This is the claim the draft model
+	// rests on, and it is checked against the SAME reader the merge uses to
+	// materialise bundles — so it covers the export endpoint and the OTA
+	// payload at once.
+	inExport := func() bool {
+		rows, err := exportRows.ForExport(ctx, nil, enSG, model.PlatformFlutter)
+		require.NoError(t, err)
+		for _, row := range rows {
+			if row.Key == name {
+				return true
+			}
+		}
+		return false
+	}
+	assert.False(t, inExport(), "a draft must not reach the export or any OTA bundle")
+
+	mr, err := mrs.Create(ctx, branch.Name, "a new string", testActor, "req-1")
+	require.NoError(t, err)
+
+	conflicts, err := mrs.Conflicts(ctx, mr.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 0, conflicts.Unresolved, "a new key conflicts with nothing")
+	assert.Empty(t, conflicts.Collisions, "and it must not collide with its own draft row")
+	assert.True(t, conflicts.Mergeable())
+
+	_, err = mrs.Review(ctx, mr.ID, mrsvc.ActionApprove, "", "approver@you.co", "req-1")
+	require.NoError(t, err)
+
+	result, err := mergeAndQuarantine(t, mrs, mr.ID, "approver@you.co")
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.KeysApplied, "the promotion is a metadata delta like any other")
+
+	// THE ASSERTION. The key is on master, active, carrying its value.
+	var status string
+	require.NoError(t, testDB.QueryRow(
+		`SELECT status FROM keys WHERE id = $1`, created.ID).Scan(&status))
+	assert.Equal(t, "active", status,
+		"the merge reported success, so the key must actually be on master")
+
+	master, err := keys.Get(ctx, created.ID, "", []string{"en-SG"})
+	require.NoError(t, err)
+	cell := master.Keys[0].Values[master.Locales[0].ID]
+	assert.True(t, cell.Found, "the value the author wrote must have landed with the key")
+	assert.Equal(t, "brand new copy", cell.Value)
+
+	assert.True(t, inExport(), "and it is part of the corpus from this release onward")
+
+	// The release cut by this merge carries it too, which is what the OTA
+	// endpoint serves — read-only over these precomputed rows.
+	var bundle string
+	require.NoError(t, testDB.QueryRow(`
+		SELECT rb.strings::text
+		  FROM release_bundles rb
+		  JOIN releases r ON r.id = rb.release_id
+		 WHERE r.version = $1 AND rb.locale_id = $2`,
+		result.ReleaseVersion, enSG).Scan(&bundle))
+	assert.Contains(t, bundle, name, "the bundle materialised in the same transaction must hold it")
+}
+
+// TestMergeRefusesABranchCreatedKeyWhoseNameMasterTook is the other half of the
+// rule: when the key cannot land, the merge must say so rather than skip it.
+//
+// Two branches each create a key called the same thing. Both drafts coexist —
+// idx_keys_name_active is partial and does not see drafts — and the first merge
+// promotes one of them to active. The second merge must now refuse, loudly and
+// before applying anything, rather than dying on the unique index halfway
+// through or quietly dropping the key.
+func TestMergeRefusesABranchCreatedKeyWhoseNameMasterTook(t *testing.T) {
+	ctx := context.Background()
+	keys := newKeySvc(t)
+	branches := newBranchSvc(t)
+	mrs := newMRSvc(t)
+
+	name := uniqueName(t, "contested")
+
+	merge := func(branch repository.Branch) (*mergesvc.Result, error) {
+		mr, err := mrs.Create(ctx, branch.Name, "claim the name", testActor, "req-1")
+		require.NoError(t, err)
+		_, err = mrs.Review(ctx, mr.ID, mrsvc.ActionApprove, "", "approver@you.co", "req-1")
+		require.NoError(t, err)
+		return mergeAndQuarantine(t, mrs, mr.ID, "approver@you.co")
+	}
+
+	var created []repository.Branch
+	for i := 0; i < 2; i++ {
+		branch, err := branches.Create(ctx, uniqueName(t, "claim"), "", testActor, "req-1")
+		require.NoError(t, err)
+		_, err = keys.CreateKey(ctx, branch.Name, keysvc.CreateKeyRequest{
+			Name: name, Platforms: []model.Platform{model.PlatformFlutter},
+		}, testActor, "req-1")
+		require.NoError(t, err, "two drafts may share a name; only one may become active")
+		created = append(created, branch)
+	}
+
+	_, err := merge(created[0])
+	require.NoError(t, err, "the first claim wins")
+
+	_, err = merge(created[1])
+	require.Error(t, err, "the second must NOT report success")
+	assert.ErrorIs(t, err, mergesvc.ErrNameCollision)
+
+	var collision *mergesvc.CollisionError
+	require.ErrorAs(t, err, &collision)
+	require.Len(t, collision.Collisions, 1)
+	assert.Equal(t, name, collision.Collisions[0].Name,
+		"the reviewer is told which name, so one of them can be renamed")
+
+	// And nothing was half-applied: exactly one active key holds the name.
+	var active int
+	require.NoError(t, testDB.QueryRow(
+		`SELECT count(*) FROM keys WHERE name = $1 AND status = 'active'`, name).Scan(&active))
+	assert.Equal(t, 1, active)
+}
+
 // TestMergeAppliesTombstonesAsDeletions.
 //
 // A branch that removes a translation must DELETE master's row, not blank it.

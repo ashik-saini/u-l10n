@@ -196,8 +196,7 @@ func (h *Handler) portalError(w http.ResponseWriter, r *http.Request, op string,
 		errors.Is(err, branchsvc.ErrBadRequest),
 		errors.Is(err, mrsvc.ErrBadRequest),
 		errors.Is(err, tagsvc.ErrBadRequest),
-		errors.Is(err, releasesvc.ErrBadRequest),
-		errors.Is(err, keysvc.ErrBranchUnsupported):
+		errors.Is(err, releasesvc.ErrBadRequest):
 		h.badRequest(w, r, err)
 
 	// --- 404: the thing addressed does not exist ----------------------------

@@ -327,11 +327,12 @@ func (h *Handler) GetKey(w http.ResponseWriter, r *http.Request) {
 
 // CreateKey adds a key.
 //
-//	POST /api/v1/keys
+//	POST /api/v1/keys?branch=copy-fixes
 //	{"name":"wallet_top_up_cta","description":"...","platforms":["flutter"]}
 //
-// Editor. Master only — see keysvc.CreateKey for why a branch cannot yet hold a
-// created key.
+// Editor. With ?branch= the key is created as a draft on master plus a branch
+// delta that the merge promotes — see keysvc.CreateKey. Until then it is
+// invisible to every export and every OTA bundle.
 func (h *Handler) CreateKey(w http.ResponseWriter, r *http.Request) {
 	if err := rejectUnknownParams(r, "branch"); err != nil {
 		h.badRequest(w, r, err)

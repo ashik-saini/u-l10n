@@ -116,9 +116,10 @@ type metaConflictResponse struct {
 // nothing.
 type nameCollisionResponse struct {
 	Name string `json:"name"`
-	// BranchKeyID is null for a key created on the branch.
-	BranchKeyID *int64 `json:"branch_key_id"`
-	MasterKeyID int64  `json:"master_key_id"`
+	// BranchKeyID is the key the BRANCH is claiming the name for — an existing
+	// key it renamed, or the draft row of a key it created. Never null.
+	BranchKeyID int64 `json:"branch_key_id"`
+	MasterKeyID int64 `json:"master_key_id"`
 }
 
 type conflictsResponse struct {

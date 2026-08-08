@@ -298,8 +298,6 @@ func TestPortalErrorStatusCodes(t *testing.T) {
 	}{
 		{"unknown locale", fmt.Errorf("%w: unknown locale", keysvc.ErrBadRequest),
 			http.StatusBadRequest, "bad_request"},
-		{"key create on a branch", fmt.Errorf("%w: not supported", keysvc.ErrBranchUnsupported),
-			http.StatusBadRequest, "bad_request"},
 		{"missing key", fmt.Errorf("key 9: %w", repository.ErrNotFound),
 			http.StatusNotFound, "not_found"},
 		{"lost race", fmt.Errorf("x: %w", repository.ErrOptimisticLock),

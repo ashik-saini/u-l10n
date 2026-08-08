@@ -94,7 +94,7 @@ never executed**: Flyway Community cannot run `undo`, and no script in the
 deploy pipeline invokes it. Flyway ignores them outright. Treat migrations as
 forward-only and write them so they never need reversing.
 
-Three details in the schema are load-bearing and easy to "simplify" by
+Four details in the schema are load-bearing and easy to "simplify" by
 accident:
 
 - **A (key, locale) pair has three states, not two.** No row = untranslated and
@@ -108,6 +108,14 @@ accident:
 - **`branch_translations.base_master_version`** records what master's version
   was when a branch *first* touched a pair, and is never updated afterwards. It
   reduces the entire value-conflict rule to one comparison.
+- **`branch_keys.key_id` is `NOT NULL`** (V1.07), so a key created on a branch
+  is a real `keys` row from the moment it exists — held at `status = 'draft'`
+  until the merge promotes it. It was nullable originally, meaning "created on
+  this branch, not on master". Nothing could fill that state
+  (`branch_translations.key_id` is `NOT NULL REFERENCES keys`, so the key could
+  carry no values) and `applyKeyMetaSQL` joins `bk.key_id = k.id`, so the row
+  matched nothing, was skipped, and the merge reported success having dropped
+  the key. Re-nullifying the column restores that silent loss.
 
 The seeded locale directory names come from `u-mobile/scripts/l10n/run.sh` and
 are pinned by a test. Note en-SG's Android directory is bare `values`, not
@@ -259,7 +267,7 @@ publishing/rolling back a release — are `approver`.
 | Tags | `GET /tags`, `POST /tags`, `PUT /tags/{id}`, `DELETE /tags/{id}`, `POST /tags/{id}/keys`, `DELETE /tags/{id}/keys`, `PUT /keys/{id}/tags` |
 | Releases | `GET /releases`, `GET /releases/{v}`, `GET /releases/{v}/bundles/{locale}`, `POST /releases`, `POST /releases/{v}/rollback` |
 
-Six details are load-bearing:
+Seven details are load-bearing:
 
 - **The three-state rule survives to JSON.** A cell is
   `{"translated":false}` (no row — untranslated, omitted from the export),
@@ -290,6 +298,17 @@ Six details are load-bearing:
   copy. Name collisions carry no resolution field and are excluded from the
   unresolved count — `idx_keys_name_active` permits one active key per name, so
   no choice makes two names one — while still setting `mergeable` false.
+- **`POST /keys?branch=…` creates a draft, not a hidden key.** The key is
+  written to `keys` immediately with `status = 'draft'` plus a `branch_keys`
+  delta saying `active`, and the merge promotes it through the same metadata
+  path that applies every rename. It has to be a real row: a branch value is
+  `NOT NULL REFERENCES keys (id)`, so a key that existed only on the branch
+  could never be translated. A draft reaches nobody — every export and every
+  release bundle, OTA included, reads `keys WHERE status = 'active'` — but it
+  *is* visible to `GET /keys?branch=…`, so the branch's browser and its diff
+  agree about what the branch contains. Two branches may hold a draft of the
+  same name; whichever merges second is refused with a name collision, because
+  a draft does not occupy `idx_keys_name_active`.
 - **Unknown query parameters are refused, not ignored** (as on `/export`), and
   unknown JSON fields are refused by `DisallowUnknownFields`. A portal that
   misspells `untranslated_in` must be told, not handed the unfiltered corpus.
@@ -300,12 +319,6 @@ answer that counts.
 
 ### Known gaps in this surface
 
-- **A key cannot be created on a branch.** `branch_keys` can hold one (`key_id`
-  NULL), but the merge's `applyKeyMetaSQL` only UPDATEs rows it can join to an
-  existing master key — so a branch-created key would never reach master and the
-  merge would report success having dropped it. `POST /keys?branch=…` therefore
-  refuses with 400 rather than accepting silently. Renames, platform changes and
-  soft deletes on a branch all work.
 - **Translation edits write history, not audit rows.** `translation_history` and
   `key_history` carry the before/after a diff needs; `audit_events` records the
   structural actions (key created/deleted, tag mutations, branch and review

@@ -20,10 +20,54 @@ func setKeyMeta(t *testing.T, branchID, keyID int64, name, status string) {
 		    (branch_id, key_id, name, platforms, status, base_master_version, updated_by)
 		VALUES ($1, $2, $3, ARRAY['flutter']::TEXT[], $4,
 		        COALESCE((SELECT version FROM keys WHERE id = $2), 0), 'test@you.co')
-		ON CONFLICT (branch_id, key_id) WHERE key_id IS NOT NULL DO UPDATE SET
+		ON CONFLICT (branch_id, key_id) DO UPDATE SET
 		    name = EXCLUDED.name, status = EXCLUDED.status, updated_at = now()`,
 		branchID, keyID, name, status)
 	require.NoError(t, err)
+}
+
+// TestBranchKeysRefusesAKeylessDelta is the schema half of the silent-drop fix,
+// and the test that discriminates the old model from the new one.
+//
+// branch_keys.key_id used to be nullable, to express "a key created on this
+// branch that does not exist on master". Nothing could ever fill that state —
+// branch_translations.key_id is NOT NULL REFERENCES keys (id), so such a key
+// could carry no values — and applyKeyMetaSQL joins bk.key_id = k.id, so the
+// row matched nothing, was skipped, and THE MERGE REPORTED SUCCESS HAVING
+// DROPPED THE KEY. Silent, successful-looking data loss.
+//
+// Against the old schema this INSERT is accepted. It must now be refused: a key
+// created on a branch is a real (draft) keys row from the moment it exists, so
+// there is no longer any state for the merge to skip.
+func TestBranchKeysRefusesAKeylessDelta(t *testing.T) {
+	branchID := newBranch(t, "keyless-delta")
+
+	_, err := testDB.Exec(`
+		INSERT INTO branch_keys
+		    (branch_id, key_id, name, platforms, status, base_master_version, updated_by)
+		VALUES ($1, NULL, 'keyless_delta', ARRAY['flutter']::TEXT[], 'active', 0, 'test@you.co')`,
+		branchID)
+	requireRejected(t, err, "a branch_keys delta naming no key")
+}
+
+// TestBranchTranslationsCannotOutrunTheirKey states the constraint that shapes
+// the whole fix, in the schema's own words.
+//
+// It is the reason materialising branch-created keys at merge time would have
+// completed a path nobody could use: without a keys row there can be no value,
+// so a keyless delta could only ever have merged an EMPTY key.
+func TestBranchTranslationsCannotOutrunTheirKey(t *testing.T) {
+	branchID := newBranch(t, "value-without-key")
+	enSG := localeID(t, "en-SG")
+
+	var maxKeyID int64
+	require.NoError(t, testDB.QueryRow(`SELECT COALESCE(max(id), 0) + 1 FROM keys`).Scan(&maxKeyID))
+
+	_, err := testDB.Exec(`
+		INSERT INTO branch_translations
+		    (branch_id, key_id, locale_id, value, base_master_version, updated_by)
+		VALUES ($1, $2, $3, 'orphan', 0, 'test@you.co')`, branchID, maxKeyID, enSG)
+	requireRejected(t, err, "a branch value against a key that does not exist")
 }
 
 func metaConflictCount(t *testing.T, branchID int64) int {
