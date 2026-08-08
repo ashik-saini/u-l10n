@@ -13,6 +13,7 @@
 package integrationtests
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -20,8 +21,12 @@ import (
 	"sort"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	_ "github.com/lib/pq"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 const (
@@ -34,9 +39,14 @@ const (
 var testDB *sql.DB
 
 func TestMain(m *testing.M) {
-	dsn := os.Getenv(envDatabaseURL)
-	if dsn == "" {
-		dsn = defaultDatabaseURL
+	ctx := context.Background()
+
+	dsn, cleanup, err := provisionDatabase(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"integration-tests: skipping, no database available (%v)\n"+
+				"  provide one with: make db-test, or set %s, or start Docker\n", err, envDatabaseURL)
+		os.Exit(0)
 	}
 
 	db, err := sql.Open("postgres", dsn)
@@ -44,21 +54,84 @@ func TestMain(m *testing.M) {
 		err = db.Ping()
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr,
-			"integration-tests: skipping, no database at %s (%v)\n"+
-				"  start one with: make db-test\n", dsn, err)
-		os.Exit(0)
+		fmt.Fprintf(os.Stderr, "integration-tests: cannot reach %s: %v\n", dsn, err)
+		cleanup()
+		os.Exit(1)
 	}
 
 	if err := applyMigrations(db); err != nil {
 		fmt.Fprintf(os.Stderr, "integration-tests: %v\n", err)
+		_ = db.Close()
+		cleanup()
 		os.Exit(1)
 	}
 
 	testDB = db
 	code := m.Run()
+
 	_ = db.Close()
+	cleanup()
 	os.Exit(code)
+}
+
+// provisionDatabase resolves a PostgreSQL to test against, in priority order:
+//
+//  1. TEST_DATABASE_URL, when set — an explicit override always wins, so a
+//     developer or CI can point at an existing server.
+//  2. A testcontainers-managed container, when a Docker daemon is reachable.
+//     This is the hermetic path: a throwaway server per run, nothing shared
+//     between runs, nothing left behind.
+//  3. The local development database, if one happens to be listening.
+//
+// Falling back rather than requiring Docker keeps `go test ./...` working on a
+// machine without it — the suite skips instead of failing, which is the correct
+// behaviour for a dependency the test author cannot install for you.
+func provisionDatabase(ctx context.Context) (dsn string, cleanup func(), err error) {
+	noop := func() {}
+
+	if explicit := os.Getenv(envDatabaseURL); explicit != "" {
+		return explicit, noop, nil
+	}
+
+	// postgres:15.3-alpine matches u-reward's integration tests, so a failure
+	// here is a failure of our SQL rather than of a version difference.
+	container, err := postgres.Run(ctx, "postgres:15.3-alpine",
+		postgres.WithDatabase("u_l10n_test"),
+		postgres.WithUsername("postgres"),
+		postgres.WithPassword("postgres"),
+		testcontainers.WithWaitStrategy(
+			// Twice: Postgres logs readiness once during its own init and again
+			// when it opens for real connections. Waiting for the first would
+			// race the server's restart.
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(90*time.Second)),
+	)
+	if err == nil {
+		dsn, dsnErr := container.ConnectionString(ctx, "sslmode=disable")
+		if dsnErr == nil {
+			return dsn, func() {
+				if err := testcontainers.TerminateContainer(container); err != nil {
+					fmt.Fprintf(os.Stderr, "integration-tests: terminate container: %v\n", err)
+				}
+			}, nil
+		}
+		_ = testcontainers.TerminateContainer(container)
+		return "", noop, dsnErr
+	}
+	containerErr := err
+
+	// No Docker. Fall back to a local server if one is listening.
+	if probe, probeErr := sql.Open("postgres", defaultDatabaseURL); probeErr == nil {
+		if probe.Ping() == nil {
+			_ = probe.Close()
+			return defaultDatabaseURL, noop, nil
+		}
+		_ = probe.Close()
+	}
+
+	return "", noop, fmt.Errorf("no container (%v) and no local database at %s",
+		containerErr, defaultDatabaseURL)
 }
 
 // applyMigrations drops the public schema and replays every V*.sql in version

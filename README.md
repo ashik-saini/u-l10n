@@ -160,8 +160,8 @@ Deliberately deferred, not forgotten:
   first review thousands of files of noise.
 - **No `.container/`, `.buildkite/`, `.kubernetes/`.** These are largely
   `do-tools`-generated and will be wrong until infra provisions the service.
-- **Schema tests use a local PostgreSQL, not testcontainers.** `testcontainers`
-  needs a Docker daemon, which is not yet installed on the development machine.
-  The tests connect to `TEST_DATABASE_URL` (default `u_l10n_test`) and skip
-  cleanly when nothing is reachable, so `go test ./...` stays green either way.
-  Moving to testcontainers is a change of connection setup only.
+- **Schema tests provision their own PostgreSQL.** The suite resolves a database
+  in priority order: `TEST_DATABASE_URL` if set, otherwise a testcontainers-managed
+  `postgres:15.3-alpine` when Docker is reachable, otherwise a local server if one
+  is listening. With none of those it skips rather than fails, so `go test ./...`
+  stays green on a machine without Docker.
