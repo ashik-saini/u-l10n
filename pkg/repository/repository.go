@@ -34,6 +34,7 @@ var WireSet = wire.NewSet(
 	ProvideLocaleRepository,
 	ProvideKeyRepository,
 	ProvideTranslationRepository,
+	ProvideExportRowReader,
 )
 
 // base carries the connection plumbing shared by every repository.

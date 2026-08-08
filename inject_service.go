@@ -15,6 +15,7 @@ import (
 
 	"github.com/yougroupteam/u-l10n/pkg/config"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
+	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/seed"
 	"github.com/yougroupteam/u-l10n/route"
 )
@@ -36,6 +37,7 @@ func injectService(ctx context.Context) (*Service, error) {
 		commonWireSet,
 		route.WireSet,
 		seed.ProvideService,
+		exportsvc.ProvideService,
 		wire.Struct(new(Service), "*"),
 	)
 	return nil, nil

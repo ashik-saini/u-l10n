@@ -15,6 +15,7 @@ import (
 	"github.com/yougroupteam/u-common-components/secretclient"
 	config2 "github.com/yougroupteam/u-l10n/pkg/config"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
+	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/seed"
 	"github.com/yougroupteam/u-l10n/route"
 )
@@ -44,21 +45,23 @@ func injectService(ctx context.Context) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	handler := route.ProvideHandler(configConfig, sqlConnector)
-	httpHandler := route.ProvideRoutes(apmConfig, configConfig, handler)
 	gormConnector, err := database.ProvideGORMConnector(ctx, databaseConfig, apmConfig, sqlConnector)
 	if err != nil {
 		return nil, err
 	}
-	transactional := database.ProvideTransactional(gormConnector)
 	localeRepository := repository.ProvideLocaleRepository(gormConnector)
 	keyRepository := repository.ProvideKeyRepository(gormConnector)
 	translationRepository := repository.ProvideTranslationRepository(gormConnector)
-	service := seed.ProvideService(transactional, localeRepository, keyRepository, translationRepository)
+	exportRowReader := repository.ProvideExportRowReader(gormConnector)
+	service := exportsvc.ProvideService(localeRepository, keyRepository, translationRepository, exportRowReader)
+	handler := route.ProvideHandler(configConfig, sqlConnector, service)
+	httpHandler := route.ProvideRoutes(apmConfig, configConfig, handler)
+	transactional := database.ProvideTransactional(gormConnector)
+	seedService := seed.ProvideService(transactional, localeRepository, keyRepository, translationRepository)
 	mainService := &Service{
 		Config:  configConfig,
 		Handler: httpHandler,
-		Seed:    service,
+		Seed:    seedService,
 	}
 	return mainService, nil
 }
