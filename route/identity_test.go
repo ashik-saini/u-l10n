@@ -134,6 +134,9 @@ func TestRequireIdentityRefusals(t *testing.T) {
 		// wantChallenge asserts the presence of WWW-Authenticate. It must appear
 		// on 401 and never on 403: a 403 that invites re-authentication is a lie.
 		wantChallenge bool
+		// wantRetryAfter asserts the Retry-After header. Only the 503 answers
+		// carry it: they are the one refusal where trying again later helps.
+		wantRetryAfter string
 	}{
 		{
 			name: "no header at all", minRole: repository.RoleViewer,
@@ -167,11 +170,14 @@ func TestRequireIdentityRefusals(t *testing.T) {
 		{
 			// Google unreachable. NOT a 401 — the token may be perfectly good,
 			// and 401 would send the whole building to re-authenticate during
-			// someone else's outage.
+			// someone else's outage. And NOT a 500 — the fault is a dependency,
+			// not this service, so it is 503 with a Retry-After the portal can
+			// back off on.
 			name: "identity provider is down", minRole: repository.RoleViewer,
 			authHeader: "Bearer " + goodToken,
 			verifier:   &stubVerifier{err: errors.New("dial tcp: i/o timeout")},
-			wantStatus: http.StatusInternalServerError, wantError: "internal_error",
+			wantStatus: http.StatusServiceUnavailable, wantError: "identity_provider_unavailable",
+			wantRetryAfter: "5",
 		},
 		{
 			// THE case. Valid Google token, no row in users.
@@ -262,6 +268,9 @@ func TestRequireIdentityRefusals(t *testing.T) {
 				assert.Empty(t, challenge,
 					"only a 401 may invite the caller to authenticate again")
 			}
+
+			assert.Equal(t, tc.wantRetryAfter, rec.Header().Get("Retry-After"),
+				"Retry-After belongs on 503 and nowhere else")
 		})
 	}
 }

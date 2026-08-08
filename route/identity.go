@@ -80,9 +80,14 @@ func (h *Handler) RequireIdentity(minRole string) func(http.Handler) http.Handle
 				// Google unreachable or answering 5xx. NOT a 401: the token may
 				// be perfectly good, and answering 401 during someone else's
 				// outage tells every operator in the building to sign in again.
+				// And NOT a 500: the fault is a dependency, not this service,
+				// so 503 is the honest status — and the retryable one, letting
+				// the portal back off and retry rather than treating it as a
+				// server bug.
 				log.Errore(ctx, "access token verification failed", err)
-				render.Status(r, http.StatusInternalServerError)
-				render.JSON(w, r, errorResponse{Error: "internal_error"})
+				w.Header().Set("Retry-After", "5")
+				render.Status(r, http.StatusServiceUnavailable)
+				render.JSON(w, r, errorResponse{Error: "identity_provider_unavailable"})
 				return
 			}
 
