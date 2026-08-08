@@ -24,6 +24,8 @@ package assetsvc
 
 import (
 	"context"
+	cryptosha "crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -47,12 +49,16 @@ var log = ulog.GetLogger("u-l10n")
 // Declared here rather than depending on storage.Storage for the same reason
 // route.Pinger exists: there is no local S3 or MinIO anywhere in this tree, and
 // storage/v4 hardcodes TLS with no path-style option, so the real client cannot
-// be pointed at a test double of a bucket. A two-method interface can be, and
+// be pointed at a test double of a bucket. A three-method interface can be, and
 // the refusal paths below are the ones that most need testing.
 type ObjectStore interface {
 	Attributes(ctx context.Context, bucketName, fileName string) (storage.ObjectAttributes, error)
 	SignURL(ctx context.Context, bucketName, method, filename, key string, opts storage.Options) (
 		urlStr string, form map[string]string, err error)
+	// Read fetches the whole object. Used by Confirm to verify the bytes hash
+	// to the name they were stored under; bounded in practice by the size
+	// checks that run before any Read is issued.
+	Read(ctx context.Context, bucketName, fileName string) ([]byte, error)
 }
 
 // Limits mirroring the CHECK constraints in .db/V1.04__assets.sql.
@@ -331,6 +337,31 @@ func (s *Service) Confirm(ctx context.Context, sha256 string, actor, requestID s
 			ErrUploadMismatch, declaredType)
 	}
 
+	// The bytes must hash to the name they claim. Everything above checked the
+	// object against its DECLARATION; nothing yet has checked it against its
+	// ADDRESS, and the address is the whole design — "the name IS the content"
+	// is what lets dedupe return an existing row instead of an upload.
+	//
+	// Without this read, a client whose hash is wrong — buggy or malicious —
+	// creates a row whose sha256 does not match its bytes, and dedupe then
+	// PROPAGATES the corruption: every future upload of the genuine bytes is
+	// told "already stored" and attaches the wrong image, permanently and
+	// silently. One bounded GET per new asset is the entire price of making
+	// that impossible, and it runs last so the cheap refusals above never pay
+	// it.
+	body, err := s.store.Read(ctx, "", key)
+	if err != nil {
+		// Reading what HEAD just saw failing is an infrastructure fault, not a
+		// caller error.
+		return asset, fmt.Errorf("read uploaded object for verification: %w", err)
+	}
+	if actual := hashHex(body); actual != sum {
+		log.Infow(ctx, "confirm rejected: content does not hash to its name",
+			"claimed", sum, "actual", actual, "actor", actor)
+		return asset, fmt.Errorf("%w: object hashes to %s, not the claimed %s",
+			ErrUploadMismatch, actual, sum)
+	}
+
 	// Width and height stay NULL. Decoding the image to fill them would mean
 	// pulling 10MB of customer PII through this process for two integers no
 	// part of the system reads.
@@ -466,6 +497,14 @@ func (s *Service) Detach(ctx context.Context, keyID, assetID int64, actor, reque
 // be guessed or searched for before the object could be HEADed, and it encodes
 // nothing the object's own Content-Type header and assets.content_type do not
 // already hold.
+// hashHex returns the lowercase hex SHA-256 of b — the same canonical form
+// assets_sha256_format_check enforces, so a comparison against a stored sum
+// can never miss on encoding.
+func hashHex(b []byte) string {
+	sum := cryptosha.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
 func s3Key(sha256 string) string {
 	return fmt.Sprintf("screenshots/%s/%s/%s", sha256[0:2], sha256[2:4], sha256)
 }

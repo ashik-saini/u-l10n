@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/jinzhu/gorm"
@@ -26,7 +27,14 @@ import (
 // cannot be pointed anywhere; the fake below stands in for the bucket, the same
 // way a test double stands in for route.Pinger.
 
-const testSHA = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+// testBody is the fixture object; testSHA is derived from it so the
+// content-addressed invariant Confirm now enforces — bytes must hash to their
+// name — holds for every happy-path test without each one arranging it.
+var (
+	testBody = []byte("genuine screenshot bytes for the assetsvc tests")
+	testSHA  = hashHex(testBody)
+	testKey  = "screenshots/" + testSHA[0:2] + "/" + testSHA[2:4] + "/" + testSHA
+)
 
 // --- fakes -----------------------------------------------------------------
 
@@ -41,6 +49,7 @@ type storeCall struct {
 type fakeStore struct {
 	signCalls []storeCall
 	statCalls []string
+	readCalls []string
 
 	signURL    string
 	signFields map[string]string
@@ -48,6 +57,14 @@ type fakeStore struct {
 
 	attrs    storage.ObjectAttributes
 	attrsErr error
+
+	readBody []byte
+	readErr  error
+}
+
+func (f *fakeStore) Read(_ context.Context, _, fileName string) ([]byte, error) {
+	f.readCalls = append(f.readCalls, fileName)
+	return f.readBody, f.readErr
 }
 
 func (f *fakeStore) SignURL(
@@ -169,7 +186,7 @@ type harness struct {
 
 func newHarness() *harness {
 	h := &harness{
-		store:  &fakeStore{},
+		store:  &fakeStore{readBody: testBody},
 		assets: newFakeAssets(),
 		audit:  &fakeAudit{},
 		tx:     &fakeTx{},
@@ -276,7 +293,7 @@ func TestPresignRejectsWebp(t *testing.T) {
 // the declaration to what S3 will accept.
 func TestPresignUsesPostPolicyAndBindsTheDeclaration(t *testing.T) {
 	h := newHarness()
-	h.store.signFields = map[string]string{"key": "screenshots/aa/bb/" + testSHA}
+	h.store.signFields = map[string]string{"key": testKey}
 
 	result, err := h.svc.Presign(context.Background(), PresignRequest{
 		Filename: "Ecran — cart.png", ContentType: "image/png", Bytes: 4096, SHA256: testSHA,
@@ -290,7 +307,7 @@ func TestPresignUsesPostPolicyAndBindsTheDeclaration(t *testing.T) {
 	call := h.store.signCalls[0]
 
 	assert.Equal(t, http.MethodPost, call.method, "presigned PUT cannot constrain the upload")
-	assert.Equal(t, "screenshots/aa/bb/"+testSHA, call.key)
+	assert.Equal(t, testKey, call.key)
 
 	// storage/v4 reads the policy's Content-Type from THIS argument's
 	// extension, not from Options.ContentType, which it ignores.
@@ -468,12 +485,16 @@ func TestConfirmCreatesTheRowAndAuditsIt(t *testing.T) {
 	assert.Equal(t, "cart.png", asset.Filename)
 	assert.Equal(t, "image/png", asset.ContentType)
 	assert.Equal(t, 4096, asset.Bytes)
-	assert.Equal(t, "screenshots/aa/bb/"+testSHA, asset.S3Key)
+	assert.Equal(t, testKey, asset.S3Key)
 	assert.Equal(t, "token:ci", asset.UploadedBy)
 
 	// The row is inserted from the OBJECT's attributes, never from a second
 	// client declaration.
-	assert.Equal(t, []string{"screenshots/aa/bb/" + testSHA}, h.store.statCalls)
+	assert.Equal(t, []string{testKey}, h.store.statCalls)
+
+	// And the bytes were read back and hashed: confirm verifies the object
+	// against its ADDRESS, not only against its declaration.
+	assert.Equal(t, []string{testKey}, h.store.readCalls)
 
 	require.Len(t, h.audit.events, 1)
 	assert.Equal(t, repository.ActionAssetCreate, h.audit.events[0].Action)
@@ -495,6 +516,61 @@ func TestConfirmIsIdempotent(t *testing.T) {
 	assert.Empty(t, h.assets.created)
 }
 
+// TestConfirmRejectsBytesThatDoNotHashToTheirName is finding F1 from the
+// agent-commit review, and the reason ObjectStore has a Read method at all.
+//
+// Everything else in Confirm checks the object against its DECLARATION. This
+// checks it against its ADDRESS. Without it, a client whose hash is wrong —
+// buggy or malicious — creates a row whose sha256 is not the sha256 of its
+// bytes, and dedupe then propagates the corruption: every future upload of the
+// genuine bytes is told "already stored" and attaches the wrong image,
+// permanently and silently.
+func TestConfirmRejectsBytesThatDoNotHashToTheirName(t *testing.T) {
+	h := newHarness()
+	h.store.attrs = declaredAttrs(4096, "image/png", 4096, "image/png", "cart.png")
+	// The right size, the right type, the wrong bytes.
+	h.store.readBody = []byte("something else entirely, padded to look plausible")
+
+	_, err := h.svc.Confirm(context.Background(), testSHA, "token:ci", "req-1")
+
+	require.ErrorIs(t, err, ErrUploadMismatch)
+	assert.Empty(t, h.assets.created, "a corrupt object must never become a row")
+	assert.Empty(t, h.audit.events)
+	assert.Zero(t, h.tx.calls, "no transaction may even be opened")
+}
+
+// TestConfirmTreatsAFailedVerificationReadAsAnOutage: the object was just
+// HEADed successfully, so a failing GET is infrastructure, not the caller.
+// Classifying it as a mismatch would tell the client to re-upload bytes that
+// are probably fine.
+func TestConfirmTreatsAFailedVerificationReadAsAnOutage(t *testing.T) {
+	h := newHarness()
+	h.store.attrs = declaredAttrs(4096, "image/png", 4096, "image/png", "cart.png")
+	h.store.readErr = errors.New("connection reset by S3")
+
+	_, err := h.svc.Confirm(context.Background(), testSHA, "token:ci", "req-1")
+
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrUploadMismatch)
+	assert.NotErrorIs(t, err, ErrUploadNotFound)
+	assert.NotErrorIs(t, err, ErrBadRequest)
+	assert.Empty(t, h.assets.created)
+}
+
+// TestConfirmDoesNotReadBeforeTheCheapChecksPass: the 10MB read is the most
+// expensive step and runs LAST. An object already refused on size must not be
+// fetched at all.
+func TestConfirmDoesNotReadBeforeTheCheapChecksPass(t *testing.T) {
+	h := newHarness()
+	h.store.attrs = declaredAttrs(4096, "image/png", 8192, "image/png", "cart.png")
+
+	_, err := h.svc.Confirm(context.Background(), testSHA, "token:ci", "req-1")
+
+	require.ErrorIs(t, err, ErrUploadMismatch)
+	assert.Empty(t, h.store.readCalls,
+		"a size mismatch must refuse before paying for the object body")
+}
+
 // --- presigned GET ---------------------------------------------------------
 
 // TestSignedURLRefusesToIssueWhenTheAuditWriteFails is the reason the audit
@@ -503,7 +579,7 @@ func TestConfirmIsIdempotent(t *testing.T) {
 // looked at this".
 func TestSignedURLRefusesToIssueWhenTheAuditWriteFails(t *testing.T) {
 	h := newHarness()
-	h.assets.byID[5] = repository.Asset{ID: 5, SHA256: testSHA, S3Key: "screenshots/aa/bb/" + testSHA}
+	h.assets.byID[5] = repository.Asset{ID: 5, SHA256: testSHA, S3Key: testKey}
 	h.audit.err = errors.New("audit table unavailable")
 
 	url, err := h.svc.SignedURL(context.Background(), 5, "token:ci", "req-1")
@@ -515,7 +591,7 @@ func TestSignedURLRefusesToIssueWhenTheAuditWriteFails(t *testing.T) {
 
 func TestSignedURLAuditsTheView(t *testing.T) {
 	h := newHarness()
-	h.assets.byID[5] = repository.Asset{ID: 5, SHA256: testSHA, S3Key: "screenshots/aa/bb/" + testSHA}
+	h.assets.byID[5] = repository.Asset{ID: 5, SHA256: testSHA, S3Key: testKey}
 	h.store.signURL = "https://bucket.example/get?sig=secret"
 
 	url, err := h.svc.SignedURL(context.Background(), 5, "token:ci", "req-1")
@@ -627,7 +703,7 @@ func TestDetachOfAnAbsentLink(t *testing.T) {
 // --- pure helpers ----------------------------------------------------------
 
 func TestNormaliseSHA256(t *testing.T) {
-	upper := "AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899"
+	upper := strings.ToUpper(testSHA)
 	got, err := normaliseSHA256("  " + upper + "  ")
 	require.NoError(t, err)
 	// Uppercase must fold to the canonical form, or the same bytes produce two
@@ -643,7 +719,7 @@ func TestNormaliseSHA256(t *testing.T) {
 func TestS3KeyFansOutOnPrefix(t *testing.T) {
 	// S3 partitions on key prefix; a flat namespace concentrates every write
 	// on one partition.
-	assert.Equal(t, "screenshots/aa/bb/"+testSHA, s3Key(testSHA))
+	assert.Equal(t, testKey, s3Key(testSHA))
 }
 
 func TestSanitiseFilename(t *testing.T) {

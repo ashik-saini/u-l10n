@@ -156,7 +156,11 @@ Four details are load-bearing:
   and compares it against the object's real size and content type. The policy
   cannot pin the size — `storage/v4` sets no content-length-range — so that
   comparison is the only thing standing between a 4KB declaration and a 50MB
-  upload.
+  upload. Confirm then reads the object back and verifies the bytes hash to
+  the claimed sha256: content addressing is the design ("the name IS the
+  content"), and without that read a wrong client hash — buggy or malicious —
+  would poison dedupe permanently, attaching the wrong image to every future
+  upload of the genuine bytes.
 - **Every view and every attach writes an `audit_events` row**, and for a view
   the row is written *before* the URL is signed: a failure to record who looked
   fails the request. That is deliberately unlike the best-effort `last_used_at`
