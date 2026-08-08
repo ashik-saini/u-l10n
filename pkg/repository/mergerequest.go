@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -92,6 +93,60 @@ type MergeRequestRepository interface {
 
 	// ApplyKeyMeta folds metadata deltas into master.
 	ApplyKeyMeta(ctx context.Context, tx *gorm.DB, mrID, branchID int64) (int, error)
+
+	// ByID reads one request in any state, including the terminal ones. The
+	// portal has to be able to show a rejected request; ByBranch deliberately
+	// cannot.
+	ByID(ctx context.Context, tx *gorm.DB, mrID int64) (MergeRequest, error)
+
+	// List returns requests with their branch name, newest first. An empty
+	// status means every state.
+	List(ctx context.Context, tx *gorm.DB, status string) ([]MergeRequestListing, error)
+
+	// Events reads the request's workflow timeline, oldest first — it reads as
+	// a narrative, and a narrative told backwards is one nobody follows.
+	Events(ctx context.Context, tx *gorm.DB, mrID int64) ([]MergeRequestEvent, error)
+
+	// ResolveMeta stores a decision for a key-METADATA conflict, which has no
+	// locale dimension.
+	//
+	// A separate method rather than a nullable locale on Resolve: the unique
+	// index keys on COALESCE(locale_id, -1), so the two cases target different
+	// conflict rows, and a single method taking a *int16 would let a caller
+	// silently record a metadata decision against locale id 0.
+	ResolveMeta(ctx context.Context, tx *gorm.DB, mrID, keyID int64, resolution, actor string) error
+}
+
+// ErrLiveMergeRequestExists is returned when a transition would produce a
+// second live request for one branch.
+//
+// idx_merge_requests_one_live_per_branch is partial over the non-terminal
+// states, so reopening a rejected request while another is open violates it.
+// That is a 409 a human must resolve, not a 500.
+var ErrLiveMergeRequestExists = errors.New("this branch already has a live merge request")
+
+// MergeRequestListing is a request plus the branch it belongs to.
+//
+// The branch NAME rather than only its id, because every merge endpoint keys on
+// the name and a list that forced a lookup per row to render a link would be one
+// round trip per row.
+type MergeRequestListing struct {
+	MergeRequest
+	BranchName   string
+	BranchStatus string
+}
+
+// MergeRequestEvent is one entry in the workflow timeline.
+type MergeRequestEvent struct {
+	ID    int64
+	Event string
+	// Comment carries a reviewer's reason. Empty is normal — an approval needs
+	// none — so it is not a pointer.
+	Comment string
+	// Actor is 'system' for automatic transitions, such as an approval
+	// invalidated by a later branch edit.
+	Actor     string
+	CreatedAt time.Time
 }
 
 type mergeRequestRepository struct{ base }
@@ -121,7 +176,13 @@ func (r *mergeRequestRepository) Create(
 	m, err := scanMR(row)
 	if err != nil {
 		// The partial unique index permits only one LIVE request per branch,
-		// so a duplicate here means one is already open.
+		// so a duplicate here means one is already open. Classified rather than
+		// passed through: two people opening a request for the same branch is a
+		// race a human resolves, not a fault an engineer investigates.
+		if isUniqueViolation(err) {
+			return m, fmt.Errorf("create merge request for branch %d: %w",
+				branchID, ErrLiveMergeRequestExists)
+		}
 		return m, fmt.Errorf("create merge request for branch %d: %w", branchID, err)
 	}
 
@@ -211,9 +272,116 @@ func (r *mergeRequestRepository) SetStatus(
 
 	if err := db.Exec(
 		`UPDATE merge_requests SET status = $1 WHERE id = $2`, status, mrID).Error; err != nil {
+		// Moving OUT of a terminal state can collide with
+		// idx_merge_requests_one_live_per_branch, which permits one live request
+		// per branch. That is a state a human must resolve, so it is classified
+		// here rather than escaping as a driver error and becoming a 500.
+		if isUniqueViolation(err) {
+			return fmt.Errorf("reopen merge request %d: %w", mrID, ErrLiveMergeRequestExists)
+		}
 		return fmt.Errorf("set merge request %d status: %w", mrID, err)
 	}
 	return r.event(ctx, db, mrID, statusEvent(status), actor, comment)
+}
+
+func (r *mergeRequestRepository) ByID(ctx context.Context, tx *gorm.DB, mrID int64) (MergeRequest, error) {
+	row := r.db(ctx, tx).Raw(
+		`SELECT `+mrColumns+` FROM merge_requests WHERE id = $1`, mrID).Row()
+
+	m, err := scanMR(row)
+	switch {
+	case err == nil:
+		return m, nil
+	case isNoRows(err):
+		return m, fmt.Errorf("merge request %d: %w", mrID, ErrNotFound)
+	default:
+		return m, fmt.Errorf("read merge request %d: %w", mrID, err)
+	}
+}
+
+const listMergeRequestsSQL = `
+SELECT mr.id, mr.branch_id, mr.title, mr.status, mr.created_by, mr.created_at,
+       mr.approved_by, mr.approved_at, mr.merged_at,
+       b.name, b.status
+  FROM merge_requests mr
+  JOIN branches b ON b.id = mr.branch_id
+ WHERE ($1 = '' OR mr.status = $1)
+ ORDER BY mr.created_at DESC, mr.id DESC`
+
+func (r *mergeRequestRepository) List(
+	ctx context.Context, tx *gorm.DB, status string,
+) ([]MergeRequestListing, error) {
+	rows, err := r.db(ctx, tx).Raw(listMergeRequestsSQL, status).Rows()
+	if err != nil {
+		return nil, fmt.Errorf("list merge requests: %w", err)
+	}
+	defer rows.Close()
+
+	var out []MergeRequestListing
+	for rows.Next() {
+		var l MergeRequestListing
+		if err := rows.Scan(&l.ID, &l.BranchID, &l.Title, &l.Status, &l.CreatedBy,
+			&l.CreatedAt, &l.ApprovedBy, &l.ApprovedAt, &l.MergedAt,
+			&l.BranchName, &l.BranchStatus); err != nil {
+			return nil, fmt.Errorf("scan merge request: %w", err)
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+func (r *mergeRequestRepository) Events(
+	ctx context.Context, tx *gorm.DB, mrID int64,
+) ([]MergeRequestEvent, error) {
+	rows, err := r.db(ctx, tx).Raw(`
+		SELECT id, event, comment, actor, created_at
+		  FROM merge_request_events
+		 WHERE merge_request_id = $1
+		 ORDER BY created_at, id`, mrID).Rows()
+	if err != nil {
+		return nil, fmt.Errorf("read merge request %d events: %w", mrID, err)
+	}
+	defer rows.Close()
+
+	var out []MergeRequestEvent
+	for rows.Next() {
+		var e MergeRequestEvent
+		if err := rows.Scan(&e.ID, &e.Event, &e.Comment, &e.Actor, &e.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan merge request event: %w", err)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// resolveMetaSQL stores a decision for a metadata conflict.
+//
+// locale_id is NULL, and the conflict target must therefore match the unique
+// index's COALESCE(locale_id, -1) expression exactly — a plain (merge_request_id,
+// key_id, locale_id) target would not collide with an existing NULL row and the
+// same conflict could accumulate contradictory decisions.
+const resolveMetaSQL = `
+INSERT INTO merge_conflict_resolutions
+    (merge_request_id, key_id, locale_id, resolution, resolved_by)
+VALUES ($1, $2, NULL, $3, $4)
+ON CONFLICT (merge_request_id, key_id, COALESCE(locale_id, -1)) DO UPDATE SET
+    resolution  = EXCLUDED.resolution,
+    resolved_by = EXCLUDED.resolved_by,
+    resolved_at = now()`
+
+func (r *mergeRequestRepository) ResolveMeta(
+	ctx context.Context, tx *gorm.DB, mrID, keyID int64, resolution, actor string,
+) error {
+	switch resolution {
+	case "mine", "master":
+	default:
+		return fmt.Errorf("invalid resolution %q: want mine or master", resolution)
+	}
+
+	if err := r.db(ctx, tx).Exec(resolveMetaSQL, mrID, keyID, resolution, actor).Error; err != nil {
+		return fmt.Errorf("store metadata resolution for key %d: %w", keyID, err)
+	}
+	return nil
 }
 
 func statusEvent(status string) string {

@@ -25,6 +25,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/service/importsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/mrsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/seed"
 	"github.com/yougroupteam/u-l10n/pkg/service/usersvc"
 	"github.com/yougroupteam/u-l10n/route"
@@ -92,10 +93,11 @@ func injectService(ctx context.Context) (*Service, error) {
 	mergeRequestRepository := repository.ProvideMergeRequestRepository(gormConnector)
 	keysvcService := keysvc.ProvideService(transactional, keyRepository, translationRepository, localeRepository, branchRepository, tagRepository, mergeRequestRepository, auditRepository)
 	branchsvcService := branchsvc.ProvideService(transactional, branchRepository, auditRepository)
-	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository, localeRepository, releaseRepository, assetsvcService, verifier, userRepository, usersvcService, keysvcService, branchsvcService)
+	mergesvcService := mergesvc.ProvideService(transactional, branchRepository, mergeRequestRepository, localeRepository, releaseRepository, exportRowReader)
+	mrsvcService := mrsvc.ProvideService(transactional, branchRepository, mergeRequestRepository, localeRepository, mergesvcService, auditRepository)
+	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository, localeRepository, releaseRepository, assetsvcService, verifier, userRepository, usersvcService, keysvcService, branchsvcService, mrsvcService)
 	httpHandler := route.ProvideRoutes(apmConfig, configConfig, handler)
 	seedService := seed.ProvideService(transactional, localeRepository, keyRepository, translationRepository)
-	mergesvcService := mergesvc.ProvideService(transactional, branchRepository, mergeRequestRepository, localeRepository, releaseRepository, exportRowReader)
 	importsvcService := importsvc.ProvideService(transactional, localeRepository, keyRepository, translationRepository)
 	mainService := &Service{
 		Config:  configConfig,

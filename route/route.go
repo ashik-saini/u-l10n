@@ -25,6 +25,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/service/branchsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/mrsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/usersvc"
 )
 
@@ -61,6 +62,9 @@ type Handler struct {
 
 	// branchSvc backs the branch list and the branch diff.
 	branchSvc *branchsvc.Service
+
+	// mrSvc backs the review workflow; the merge itself belongs to mergesvc.
+	mrSvc *mrsvc.Service
 }
 
 func ProvideHandler(
@@ -76,6 +80,7 @@ func ProvideHandler(
 	userSvc *usersvc.Service,
 	keySvc *keysvc.Service,
 	branchSvc *branchsvc.Service,
+	mrSvc *mrsvc.Service,
 ) *Handler {
 	return &Handler{
 		cnf:        cnf,
@@ -90,6 +95,7 @@ func ProvideHandler(
 		userSvc:    userSvc,
 		keySvc:     keySvc,
 		branchSvc:  branchSvc,
+		mrSvc:      mrSvc,
 	}
 }
 
@@ -162,6 +168,10 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 			r.Get("/branches", handler.ListBranches)
 			r.Get("/branches/{name}", handler.GetBranch)
 			r.Get("/branches/{name}/changes", handler.BranchChanges)
+
+			r.Get("/merge-requests", handler.ListMergeRequests)
+			r.Get("/merge-requests/{id}", handler.GetMergeRequest)
+			r.Get("/merge-requests/{id}/conflicts", handler.MergeRequestConflicts)
 		})
 
 		// Writing the corpus. Editor, and no higher: writing to a BRANCH is the
@@ -178,6 +188,25 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 			r.Post("/branches", handler.CreateBranch)
 			r.Post("/branches/{name}/close", handler.CloseBranch)
 			r.Post("/branches/{name}/reopen", handler.ReopenBranch)
+
+			// Asking for review, withdrawing the request, and recording which
+			// side of a conflict wins are all authoring acts. Deciding whether
+			// the result ships is not — see the approver group below.
+			r.Post("/merge-requests", handler.CreateMergeRequest)
+			r.Post("/merge-requests/{id}/reopen", handler.ReopenMergeRequest)
+			r.Post("/merge-requests/{id}/close", handler.CloseMergeRequest)
+			r.Put("/merge-requests/{id}/resolutions", handler.PutMergeRequestResolutions)
+		})
+
+		// Approving and merging. This is the boundary where copy stops being a
+		// proposal and starts being what customers read, so it needs the role
+		// that exists for exactly that judgement.
+		r.Group(func(r chi.Router) {
+			r.Use(handler.RequireIdentity(repository.RoleApprover))
+			r.Post("/merge-requests/{id}/approve", handler.ApproveMergeRequest)
+			r.Post("/merge-requests/{id}/request-changes", handler.RequestMergeRequestChanges)
+			r.Post("/merge-requests/{id}/reject", handler.RejectMergeRequest)
+			r.Post("/merge-requests/{id}/merge", handler.MergeMergeRequest)
 		})
 
 		// Granting privileges requires holding them.

@@ -16,6 +16,8 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/repository"
 	"github.com/yougroupteam/u-l10n/pkg/service/branchsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/mrsvc"
 )
 
 // maxPortalBodyBytes bounds the JSON bodies on the portal routes.
@@ -190,6 +192,7 @@ func (h *Handler) portalError(w http.ResponseWriter, r *http.Request, op string,
 	// --- 400: the caller sent something wrong -------------------------------
 	case errors.Is(err, keysvc.ErrBadRequest),
 		errors.Is(err, branchsvc.ErrBadRequest),
+		errors.Is(err, mrsvc.ErrBadRequest),
 		errors.Is(err, keysvc.ErrBranchUnsupported):
 		h.badRequest(w, r, err)
 
@@ -217,6 +220,35 @@ func (h *Handler) portalError(w http.ResponseWriter, r *http.Request, op string,
 		errors.Is(err, branchsvc.ErrBranchNotOpen):
 		render.Status(r, http.StatusConflict)
 		render.JSON(w, r, errorResponse{Error: "branch_not_open", Details: err.Error()})
+
+	case errors.Is(err, mrsvc.ErrNotLive):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, errorResponse{Error: "merge_request_not_live", Details: err.Error()})
+
+	case errors.Is(err, repository.ErrLiveMergeRequestExists):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, errorResponse{Error: "live_merge_request_exists", Details: err.Error()})
+
+	// The four merge refusals. Every one is an expected outcome a human must
+	// act on, and answering 500 for any of them would page an engineer because
+	// two translators edited the same string. MergeMergeRequest answers the
+	// first two itself, with the offending rows in the body; these entries make
+	// sure no other path can turn them into a 500.
+	case errors.Is(err, mergesvc.ErrStaleApproval):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, errorResponse{Error: "stale_approval", Details: err.Error()})
+
+	case errors.Is(err, mergesvc.ErrNotApproved):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, errorResponse{Error: "not_approved", Details: err.Error()})
+
+	case errors.Is(err, mergesvc.ErrUnresolvedConflicts):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, errorResponse{Error: "unresolved_conflicts", Details: err.Error()})
+
+	case errors.Is(err, mergesvc.ErrNameCollision):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, errorResponse{Error: "name_collision", Details: err.Error()})
 
 	default:
 		log.Errore(r.Context(), op+" failed", err)
