@@ -61,6 +61,7 @@ const (
 	// can rely on. key_tags has no history table, so without these rows the fact
 	// that a key was ever marked approved is unrecoverable.
 	ActionTagCreate   = "tag.create"
+	ActionTagUpdate   = "tag.update"
 	ActionTagDelete   = "tag.delete"
 	ActionTagSetOnKey = "tag.set_on_key"
 	ActionTagAssign   = "tag.assign"

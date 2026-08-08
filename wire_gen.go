@@ -27,6 +27,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mrsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/seed"
+	"github.com/yougroupteam/u-l10n/pkg/service/tagsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/usersvc"
 	"github.com/yougroupteam/u-l10n/route"
 )
@@ -95,7 +96,8 @@ func injectService(ctx context.Context) (*Service, error) {
 	branchsvcService := branchsvc.ProvideService(transactional, branchRepository, auditRepository)
 	mergesvcService := mergesvc.ProvideService(transactional, branchRepository, mergeRequestRepository, localeRepository, releaseRepository, exportRowReader)
 	mrsvcService := mrsvc.ProvideService(transactional, branchRepository, mergeRequestRepository, localeRepository, mergesvcService, auditRepository)
-	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository, localeRepository, releaseRepository, assetsvcService, verifier, userRepository, usersvcService, keysvcService, branchsvcService, mrsvcService)
+	tagsvcService := tagsvc.ProvideService(transactional, tagRepository, auditRepository)
+	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository, localeRepository, releaseRepository, assetsvcService, verifier, userRepository, usersvcService, keysvcService, branchsvcService, mrsvcService, tagsvcService)
 	httpHandler := route.ProvideRoutes(apmConfig, configConfig, handler)
 	seedService := seed.ProvideService(transactional, localeRepository, keyRepository, translationRepository)
 	importsvcService := importsvc.ProvideService(transactional, localeRepository, keyRepository, translationRepository)

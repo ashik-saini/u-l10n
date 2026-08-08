@@ -71,6 +71,22 @@ type TagRepository interface {
 	// there is none.
 	ByName(ctx context.Context, tx *gorm.DB, name string) (Tag, error)
 
+	// ByID resolves a tag by its surrogate key. The portal addresses tags by id
+	// because a rename must not break a bookmarked filter.
+	ByID(ctx context.Context, tx *gorm.DB, id int16) (Tag, error)
+
+	// Update renames or recolours a tag, returning ErrTagNameTaken when the new
+	// name belongs to another tag and ErrNotFound when there is no such row.
+	Update(ctx context.Context, tx *gorm.DB, id int16, name, colour string) (Tag, error)
+
+	// KeyIDsWithTag lists the keys carrying a tag.
+	//
+	// It exists for Delete's audit row. key_tags has no history table and
+	// tag_id cascades, so deleting a tag destroys the record that any key ever
+	// carried it — reading the ids first inside the same transaction is the only
+	// thing that makes the deletion reconstructable.
+	KeyIDsWithTag(ctx context.Context, tx *gorm.DB, id int16) ([]int64, error)
+
 	// Delete removes a tag, returning ErrNotFound when there was no such row.
 	//
 	// DESTRUCTIVE SIDE EFFECT: key_tags.tag_id is ON DELETE CASCADE, so
@@ -184,6 +200,69 @@ func (r *tagRepository) ByName(ctx context.Context, tx *gorm.DB, name string) (T
 	default:
 		return t, fmt.Errorf("tag %q: %w", name, err)
 	}
+}
+
+func (r *tagRepository) ByID(ctx context.Context, tx *gorm.DB, id int16) (Tag, error) {
+	var t Tag
+	row := r.db(ctx, tx).Raw(
+		`SELECT `+selectTagColumns+` FROM tags WHERE id = $1`, id).Row()
+
+	switch err := row.Scan(&t.ID, &t.Name, &t.Colour, &t.CreatedAt); {
+	case err == nil:
+		return t, nil
+	case isNoRows(err):
+		return t, fmt.Errorf("tag %d: %w", id, ErrNotFound)
+	default:
+		return t, fmt.Errorf("tag %d: %w", id, err)
+	}
+}
+
+const updateTagSQL = `
+UPDATE tags SET name = $2, colour = $3
+ WHERE id = $1
+RETURNING ` + selectTagColumns
+
+func (r *tagRepository) Update(
+	ctx context.Context, tx *gorm.DB, id int16, name, colour string,
+) (Tag, error) {
+	var t Tag
+	row := r.db(ctx, tx).Raw(updateTagSQL, id, name, colour).Row()
+
+	switch err := row.Scan(&t.ID, &t.Name, &t.Colour, &t.CreatedAt); {
+	case err == nil:
+		return t, nil
+
+	case isUniqueViolation(err):
+		// tags_name_unique. The constraint is the authority — a pre-check would
+		// be a decoration, since another tag can take the name between the check
+		// and the write.
+		return t, fmt.Errorf("rename tag %d to %q: %w", id, name, ErrTagNameTaken)
+
+	case isNoRows(err):
+		return t, fmt.Errorf("tag %d: %w", id, ErrNotFound)
+
+	default:
+		return t, fmt.Errorf("update tag %d: %w", id, err)
+	}
+}
+
+func (r *tagRepository) KeyIDsWithTag(ctx context.Context, tx *gorm.DB, id int16) ([]int64, error) {
+	rows, err := r.db(ctx, tx).Raw(
+		`SELECT key_id FROM key_tags WHERE tag_id = $1 ORDER BY key_id`, id).Rows()
+	if err != nil {
+		return nil, fmt.Errorf("read keys carrying tag %d: %w", id, err)
+	}
+	defer rows.Close()
+
+	var out []int64
+	for rows.Next() {
+		var keyID int64
+		if err := rows.Scan(&keyID); err != nil {
+			return nil, fmt.Errorf("scan tagged key: %w", err)
+		}
+		out = append(out, keyID)
+	}
+	return out, rows.Err()
 }
 
 func (r *tagRepository) Delete(ctx context.Context, tx *gorm.DB, id int16) error {

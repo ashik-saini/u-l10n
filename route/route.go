@@ -26,6 +26,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mrsvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/tagsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/usersvc"
 )
 
@@ -65,6 +66,9 @@ type Handler struct {
 
 	// mrSvc backs the review workflow; the merge itself belongs to mergesvc.
 	mrSvc *mrsvc.Service
+
+	// tagSvc backs the tag manager, and audits every tag mutation.
+	tagSvc *tagsvc.Service
 }
 
 func ProvideHandler(
@@ -81,6 +85,7 @@ func ProvideHandler(
 	keySvc *keysvc.Service,
 	branchSvc *branchsvc.Service,
 	mrSvc *mrsvc.Service,
+	tagSvc *tagsvc.Service,
 ) *Handler {
 	return &Handler{
 		cnf:        cnf,
@@ -96,6 +101,7 @@ func ProvideHandler(
 		keySvc:     keySvc,
 		branchSvc:  branchSvc,
 		mrSvc:      mrSvc,
+		tagSvc:     tagSvc,
 	}
 }
 
@@ -172,6 +178,8 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 			r.Get("/merge-requests", handler.ListMergeRequests)
 			r.Get("/merge-requests/{id}", handler.GetMergeRequest)
 			r.Get("/merge-requests/{id}/conflicts", handler.MergeRequestConflicts)
+
+			r.Get("/tags", handler.ListTags)
 		})
 
 		// Writing the corpus. Editor, and no higher: writing to a BRANCH is the
@@ -196,6 +204,16 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 			r.Post("/merge-requests/{id}/reopen", handler.ReopenMergeRequest)
 			r.Post("/merge-requests/{id}/close", handler.CloseMergeRequest)
 			r.Put("/merge-requests/{id}/resolutions", handler.PutMergeRequestResolutions)
+
+			// Tags are workflow metadata, not translatable content: they are
+			// global per key rather than branch-scoped, so these routes take no
+			// ?branch= and never enter a merge.
+			r.Post("/tags", handler.CreateTag)
+			r.Put("/tags/{id}", handler.UpdateTag)
+			r.Delete("/tags/{id}", handler.DeleteTag)
+			r.Post("/tags/{id}/keys", handler.AssignTag)
+			r.Delete("/tags/{id}/keys", handler.UnassignTag)
+			r.Put("/keys/{id}/tags", handler.PutKeyTags)
 		})
 
 		// Approving and merging. This is the boundary where copy stops being a
