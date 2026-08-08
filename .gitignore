@@ -1,0 +1,17 @@
+# Binaries
+/u-l10n
+/bin/
+
+# Test and coverage output
+/reports/
+*.out
+*.test
+
+# Local environment overrides — never commit real credentials
+.env
+.env.local
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
