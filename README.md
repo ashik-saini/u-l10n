@@ -26,8 +26,12 @@ master behind an approval workflow.
 | 3 serializers + export | done | **R1: 98,320 values round-tripped, zero alterations**; R2 idempotent; export endpoint behind API tokens |
 | 7 branch + merge | done | COW deltas, **all three conflict types**, merge transaction, releases — verified under `-race` |
 
-**Not yet implemented:** Phases 4 (Lokalise importer), 5 (portal API),
-6 (assets/S3), 10 (OTA) and 11 (mobile SDK).
+**Phase 4 (Lokalise importer)** is built but unexercised against the real API —
+it needs a read-scope token (master plan open item #4). The client and the
+presence-oracle logic are covered by tests against a fake server.
+
+**Not yet implemented:** Phases 5 (portal API), 6 (assets/S3), 10 (OTA) and
+11 (mobile SDK).
 
 ## Quick start
 

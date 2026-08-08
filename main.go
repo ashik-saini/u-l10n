@@ -21,6 +21,7 @@ import (
 
 	"github.com/yougroupteam/u-l10n/pkg/config"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
+	"github.com/yougroupteam/u-l10n/pkg/service/importsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/seed"
 )
@@ -36,6 +37,7 @@ type Service struct {
 	Seed    *seed.Service
 	Tokens  repository.APITokenRepository
 	Merge   *mergesvc.Service
+	Import  *importsvc.Service
 }
 
 func main() {

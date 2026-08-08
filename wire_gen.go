@@ -16,6 +16,7 @@ import (
 	config2 "github.com/yougroupteam/u-l10n/pkg/config"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/importsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/seed"
 	"github.com/yougroupteam/u-l10n/route"
@@ -64,12 +65,14 @@ func injectService(ctx context.Context) (*Service, error) {
 	mergeRequestRepository := repository.ProvideMergeRequestRepository(gormConnector)
 	releaseRepository := repository.ProvideReleaseRepository(gormConnector)
 	mergesvcService := mergesvc.ProvideService(transactional, branchRepository, mergeRequestRepository, localeRepository, releaseRepository, exportRowReader)
+	importsvcService := importsvc.ProvideService(transactional, localeRepository, keyRepository, translationRepository)
 	mainService := &Service{
 		Config:  configConfig,
 		Handler: httpHandler,
 		Seed:    seedService,
 		Tokens:  apiTokenRepository,
 		Merge:   mergesvcService,
+		Import:  importsvcService,
 	}
 	return mainService, nil
 }

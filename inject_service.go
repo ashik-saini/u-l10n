@@ -16,6 +16,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/config"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/importsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/seed"
 	"github.com/yougroupteam/u-l10n/route"
@@ -40,6 +41,7 @@ func injectService(ctx context.Context) (*Service, error) {
 		seed.ProvideService,
 		exportsvc.ProvideService,
 		mergesvc.ProvideService,
+		importsvc.ProvideService,
 		wire.Struct(new(Service), "*"),
 	)
 	return nil, nil
