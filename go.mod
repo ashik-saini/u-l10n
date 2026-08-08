@@ -109,7 +109,7 @@ require (
 	golang.org/x/telemetry v0.0.0-20260625142307-59b4966ccb57 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	golang.org/x/tools v0.47.0 // indirect
-	google.golang.org/grpc v1.67.0 // indirect
+	google.golang.org/grpc v1.71.1 // indirect
 	gopkg.in/ini.v1 v1.51.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

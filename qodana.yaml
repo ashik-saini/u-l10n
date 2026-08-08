@@ -26,4 +26,21 @@ exclude:
   - name: SqlCurrentSchemaInspection  # schema unknown without a datasource
   - name: SqlUnused                   # cannot judge usage without the schema
 
+  # Prose inspections. Useful in docs, but they flag domain vocabulary
+  # (Lokalise, sha256, unnest, en-SG, printf verbs) as misspellings and every
+  # comment fragment as a grammar note — ~410 findings, all noise here. Leave
+  # them off in CI; a human still reads prose in review.
+  - name: SpellCheckingInspection
+  - name: GrazieInspection
+  - name: GrazieStyle
+
+  # Everything under .code-review-graph/ is a GENERATED artifact — the
+  # code-review-graph tool's own HTML/JS/CSS graph visualisation. It is
+  # gitignored and not ours to lint; analysing it produced ~300 findings
+  # (JSUnresolvedReference, ES6ConvertVarToLetConst, CssUnusedSymbol) that say
+  # nothing about this service. Excluded by path across all inspections.
+  - name: All
+    paths:
+      - .code-review-graph
+
 linter: jetbrains/qodana-go:2026.2

@@ -206,8 +206,13 @@ func (c *Client) get(ctx context.Context, path string, into interface{}) error {
 
 		switch {
 		case resp.StatusCode == http.StatusOK:
-			defer resp.Body.Close()
-			if err := json.NewDecoder(resp.Body).Decode(into); err != nil {
+			// Closed explicitly, not deferred: this is inside the retry loop,
+			// and a deferred Close would not fire until the whole function
+			// returns — stacking one per attempt. The other branches already
+			// close before they continue, so the body is closed on every path.
+			err := json.NewDecoder(resp.Body).Decode(into)
+			_ = resp.Body.Close()
+			if err != nil {
 				return fmt.Errorf("decode %s: %w", path, err)
 			}
 			return nil
