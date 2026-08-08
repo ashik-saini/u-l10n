@@ -40,6 +40,7 @@ var WireSet = wire.NewSet(
 	ProvideExportRowReader,
 	ProvideAPITokenRepository,
 	ProvideBranchRepository,
+	ProvideMergeRequestRepository,
 )
 
 // base carries the connection plumbing shared by every repository.
