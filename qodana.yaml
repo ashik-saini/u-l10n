@@ -1,0 +1,29 @@
+#-------------------------------------------------------------------------------#
+#               Qodana analysis is configured by qodana.yaml file               #
+#             https://www.jetbrains.com/help/qodana/qodana-yaml.html            #
+#-------------------------------------------------------------------------------#
+version: "1.0"
+
+profile:
+  name: qodana.starter
+
+# Disabled inspections, with the reason each is noise here rather than signal.
+#
+# The SQL family analyses the SQL embedded in Go string literals against a live
+# database connection. This service has no datasource configured for the IDE —
+# and could not usefully have one, since the schema only exists after Flyway
+# runs — so the analyser cannot resolve our own tables, columns or functions,
+# and its Postgres dialect parser cannot follow parameter casts like
+# `$1::text[]` or set-returning functions like `unnest(...)`. The result is
+# ~460 false positives across pkg/repository, every one a correct query the
+# analyser simply cannot see the schema for. Correctness of the SQL is proven
+# instead by the integration tests, which run every statement against a real
+# PostgreSQL (see integration-tests/ and `make db-migrate`).
+exclude:
+  - name: SqlNoDataSourceInspection   # "No data source configured" — by design
+  - name: SqlResolve                  # unresolved table/column/function/symbol
+  - name: SqlDialectInspection        # dialect parser choking on $1::text[], unnest()
+  - name: SqlCurrentSchemaInspection  # schema unknown without a datasource
+  - name: SqlUnused                   # cannot judge usage without the schema
+
+linter: jetbrains/qodana-go:2026.2

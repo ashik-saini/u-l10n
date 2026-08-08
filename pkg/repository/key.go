@@ -239,12 +239,12 @@ func (r *keyRepository) IDsByName(ctx context.Context, tx *gorm.DB, names []stri
 }
 
 func (r *keyRepository) MaxSortIndex(ctx context.Context, tx *gorm.DB) (int64, error) {
-	var max sql.NullInt64
+	var highest sql.NullInt64
 	row := r.db(ctx, tx).Raw(`SELECT max(sort_index) FROM keys`).Row()
-	if err := row.Scan(&max); err != nil {
+	if err := row.Scan(&highest); err != nil {
 		return 0, fmt.Errorf("max sort_index: %w", err)
 	}
-	return max.Int64, nil
+	return highest.Int64, nil
 }
 
 func (r *keyRepository) CountActive(ctx context.Context, tx *gorm.DB) (int, error) {
