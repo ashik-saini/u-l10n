@@ -1,4 +1,5 @@
-.PHONY: test test-report-dep test-report gen-wire pre-commit install clean db-local db-local-stop run-local
+.PHONY: test test-report-dep test-report gen-wire pre-commit install clean \
+        db-local db-local-stop db-test db-migrate run-local
 
 # Local development defaults. Override on the command line, e.g.
 #   make run-local DATABASECONFIG_DATABASENAME=u_l10n_scratch
@@ -8,6 +9,11 @@ DATABASECONFIG_PORT         ?= 5432
 DATABASECONFIG_USER         ?= $(USER)
 DATABASECONFIG_PASSWORD     ?= postgres
 DATABASECONFIG_DATABASENAME ?= u_l10n_local
+
+# Scratch databases. db-test is wiped by every schema-test run; db-migrate
+# drops and recreates its own to prove a from-empty migration.
+TEST_DATABASE_NAME    ?= u_l10n_test
+MIGRATE_DATABASE_NAME ?= u_l10n_migrate_test
 
 LOCAL_ENV = \
 	SERVICECONFIG_ENV=local \
@@ -62,6 +68,29 @@ db-local:
 
 db-local-stop:
 	@brew services stop postgresql@14
+
+# Scratch database for the schema tests. They DROP and recreate the public
+# schema on every run, so never point TEST_DATABASE_URL at anything you value.
+db-test:
+	@brew services start postgresql@14 >/dev/null 2>&1 || true
+	@until pg_isready -q -h $(DATABASECONFIG_HOST) -p $(DATABASECONFIG_PORT); do sleep 1; done
+	@psql -h $(DATABASECONFIG_HOST) -p $(DATABASECONFIG_PORT) -lqt \
+		| cut -d \| -f 1 | grep -qw $(TEST_DATABASE_NAME) \
+		|| createdb -h $(DATABASECONFIG_HOST) -p $(DATABASECONFIG_PORT) $(TEST_DATABASE_NAME)
+	@echo "test database ready: $(TEST_DATABASE_NAME)"
+
+# Applies the migrations with the real Flyway, the way the deploy pipeline
+# does, against a throwaway database. The schema tests replay the same files
+# through database/sql; this target is what proves Flyway itself is happy with
+# the filename convention and ordering.
+#
+#   brew install flyway
+db-migrate: db-test
+	@dropdb --if-exists $(MIGRATE_DATABASE_NAME)
+	@createdb $(MIGRATE_DATABASE_NAME)
+	flyway -url=jdbc:postgresql://$(DATABASECONFIG_HOST):$(DATABASECONFIG_PORT)/$(MIGRATE_DATABASE_NAME) \
+		-user=$(DATABASECONFIG_USER) -password=$(DATABASECONFIG_PASSWORD) \
+		-locations=filesystem:.db migrate
 
 run-local: db-local
 	$(LOCAL_ENV) go run .

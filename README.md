@@ -13,9 +13,10 @@ keys across 6 locales, exported to Flutter JSON, Android XML and iOS `.strings`.
 
 ## Status
 
-**Phase 0 — service scaffold.** The service boots, serves health probes against
-a real database, and shuts down gracefully. There is no schema and no business
-logic yet; those arrive in Phase 1 (migrations) and Phase 2 (parsers).
+**Phase 1 — schema.** The service boots, serves health probes against a real
+database, and shuts down gracefully; the full schema exists as Flyway
+migrations with tests proving every constraint rejects bad input. There is no
+business logic yet — parsers arrive in Phase 2, the export engine in Phase 3.
 
 ## Quick start
 
@@ -33,7 +34,12 @@ curl -s localhost:8080/healthz | jq   # {"status":"ok","service":"u-l10n"}
 curl -s localhost:8080/readyz  | jq   # {"status":"ready","checks":{"database":"ok"}}
 ```
 
-Run the tests with `make test`.
+| Command | Does |
+|---------|------|
+| `make test` | unit tests + schema tests (schema tests skip if no database) |
+| `make db-test` | create the scratch database the schema tests use |
+| `make db-migrate` | apply the migrations with real Flyway, from empty |
+| `make run-local` | start PostgreSQL and run the service |
 
 ## Health probes
 
@@ -50,6 +56,36 @@ in the fleet simultaneously — turning a recoverable dependency outage into a
 self-inflicted one. Readiness is the correct place for dependency checks: stop
 sending work, let it recover, restart nothing.
 
+## Database
+
+Migrations are Flyway, in `.db/`, named `V1.NN__description.sql`. Minor
+versions are **zero-padded** so lexical and Flyway version ordering agree —
+without it `V1.9` would sort after `V1.10`.
+
+`U1.NN__*.sql` undo files exist for parity with the other services but **are
+never executed**: Flyway Community cannot run `undo`, and no script in the
+deploy pipeline invokes it. Flyway ignores them outright. Treat migrations as
+forward-only and write them so they never need reversing.
+
+Three details in the schema are load-bearing and easy to "simplify" by
+accident:
+
+- **A (key, locale) pair has three states, not two.** No row = untranslated and
+  omitted from the export; `value = ''` = deliberately blank and exported as
+  `""`; anything else = translated. Collapsing absent into empty adds ~430
+  spurious keys to en-SG; collapsing empty into absent deletes 3,664
+  intentional blanks from ms-MY. The repository layer must therefore never
+  return a bare `string` — presence and content are separate facts.
+- **`keys.name` is unique only among `status = 'active'`** (a partial index).
+  Without the predicate, soft-deleting a key would reserve its name forever.
+- **`branch_translations.base_master_version`** records what master's version
+  was when a branch *first* touched a pair, and is never updated afterwards. It
+  reduces the entire value-conflict rule to one comparison.
+
+The seeded locale directory names come from `u-mobile/scripts/l10n/run.sh` and
+are pinned by a test. Note en-SG's Android directory is bare `values`, not
+`values-en-rSG`.
+
 ## Layout
 
 ```
@@ -57,6 +93,8 @@ main.go              urfave/cli entrypoint, HTTP server, graceful shutdown
 inject_service.go    Wire provider graph  →  wire_gen.go (generated)
 route/               chi handlers — one file + one _test.go per endpoint
 pkg/config/          service configuration (env vars via configstruct tags)
+.db/                 Flyway migrations
+integration-tests/   schema tests against a real PostgreSQL
 ```
 
 Layer discipline — when unsure where code belongs, match one of these sentences:
@@ -122,5 +160,8 @@ Deliberately deferred, not forgotten:
   first review thousands of files of noise.
 - **No `.container/`, `.buildkite/`, `.kubernetes/`.** These are largely
   `do-tools`-generated and will be wrong until infra provisions the service.
-- **No integration tests.** `testcontainers` needs a Docker daemon, which is not
-  yet installed on the development machine. Unit tests cover Phase 0.
+- **Schema tests use a local PostgreSQL, not testcontainers.** `testcontainers`
+  needs a Docker daemon, which is not yet installed on the development machine.
+  The tests connect to `TEST_DATABASE_URL` (default `u_l10n_test`) and skip
+  cleanly when nothing is reachable, so `go test ./...` stays green either way.
+  Moving to testcontainers is a change of connection setup only.
