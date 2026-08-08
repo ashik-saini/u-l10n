@@ -2,9 +2,7 @@ package route
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strconv"
 
@@ -269,24 +267,16 @@ func newAssetResponse(a repository.Asset) *assetResponse {
 	}
 }
 
-// decodeJSON reads a bounded, strict JSON body.
+// decodeJSON reads a bounded, strict JSON body on the asset routes.
 //
 // DisallowUnknownFields for the same reason parseExportRequest rejects unknown
 // query parameters: a client that misspells "content_type" must be told, not
 // silently handed a zero value and a confusing validation error two layers
-// down.
+// down. See decodeJSONLimit in portal.go — the asset limit is deliberately
+// tighter than the portal's, because these bodies carry declarations rather
+// than copy.
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxAssetBodyBytes))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
-		return err
-	}
-	// Exactly one JSON value. Trailing content means the client sent something
-	// other than what it thinks it sent.
-	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
-		return errors.New("body must contain exactly one JSON object")
-	}
-	return nil
+	return decodeJSONLimit(w, r, dst, maxAssetBodyBytes)
 }
 
 func pathID(r *http.Request, param string) (int64, error) {

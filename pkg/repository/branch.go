@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -70,6 +71,18 @@ type BranchRepository interface {
 
 	// MetaChangedCount reports how many metadata deltas a branch carries.
 	MetaChangedCount(ctx context.Context, tx *gorm.DB, branchID int64) (int, error)
+
+	// SetStatus opens or closes a branch.
+	//
+	// It refuses to move a MERGED branch: a merged branch's deltas are a
+	// permanent read-only record of what a merge request actually changed, and
+	// reopening one would invite edits to history. Returns ErrNotFound when no
+	// row moved.
+	SetStatus(ctx context.Context, tx *gorm.DB, branchID int64, status string) error
+
+	// KeyMetaForKeys returns the branch's METADATA overrides for many keys in
+	// one query, so the key browser can overlay them without a lookup per row.
+	KeyMetaForKeys(ctx context.Context, tx *gorm.DB, branchID int64, keyIDs []int64) (map[int64]model.Key, error)
 }
 
 type branchRepository struct{ base }
@@ -327,4 +340,70 @@ func (r *branchRepository) MetaChangedCount(ctx context.Context, tx *gorm.DB, br
 		return 0, fmt.Errorf("count branch key deltas: %w", err)
 	}
 	return n, nil
+}
+
+func (r *branchRepository) SetStatus(ctx context.Context, tx *gorm.DB, branchID int64, status string) error {
+	// status <> 'merged' in the predicate, not a check in a service: a merged
+	// branch's deltas are the permanent record of what a merge actually applied,
+	// and reopening one would invite edits to history. Enforcing it in the
+	// statement means no caller can forget.
+	res := r.db(ctx, tx).Exec(
+		`UPDATE branches SET status = $2 WHERE id = $1 AND status <> 'merged'`,
+		branchID, status)
+	if res.Error != nil {
+		return fmt.Errorf("set branch %d status to %q: %w", branchID, status, res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("branch %d is missing or already merged: %w", branchID, ErrNotFound)
+	}
+	return nil
+}
+
+const keyMetaForKeysSQL = `
+SELECT key_id, name, description, platforms, android_name, ios_name, status
+  FROM branch_keys
+ WHERE branch_id = $1 AND key_id = ANY($2::bigint[])`
+
+func (r *branchRepository) KeyMetaForKeys(
+	ctx context.Context, tx *gorm.DB, branchID int64, keyIDs []int64,
+) (map[int64]model.Key, error) {
+	out := make(map[int64]model.Key, len(keyIDs))
+	if len(keyIDs) == 0 || branchID == 0 {
+		// Master has no deltas by definition, and an empty page should cost no
+		// query at all.
+		return out, nil
+	}
+
+	rows, err := r.db(ctx, tx).Raw(keyMetaForKeysSQL, branchID, pq.Array(keyIDs)).Rows()
+	if err != nil {
+		return nil, fmt.Errorf("read branch key metadata: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			k           model.Key
+			platforms   []string
+			status      string
+			androidName sql.NullString
+			iosName     sql.NullString
+		)
+		if err := rows.Scan(&k.ID, &k.Name, &k.Description, pq.Array(&platforms),
+			&androidName, &iosName, &status); err != nil {
+			return nil, fmt.Errorf("scan branch key metadata: %w", err)
+		}
+		k.Status = model.KeyStatus(status)
+		k.Platforms = make([]model.Platform, len(platforms))
+		for i, p := range platforms {
+			k.Platforms[i] = model.Platform(p)
+		}
+		if androidName.Valid {
+			k.AndroidName = &androidName.String
+		}
+		if iosName.Valid {
+			k.IOSName = &iosName.String
+		}
+		out[k.ID] = k
+	}
+	return out, rows.Err()
 }

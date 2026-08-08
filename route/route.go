@@ -23,6 +23,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/repository"
 	"github.com/yougroupteam/u-l10n/pkg/service/assetsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/usersvc"
 )
 
@@ -53,6 +54,9 @@ type Handler struct {
 	identities TokenVerifier
 	users      repository.UserRepository
 	userSvc    *usersvc.Service
+
+	// keySvc backs the portal's key browser and inline editor.
+	keySvc *keysvc.Service
 }
 
 func ProvideHandler(
@@ -66,6 +70,7 @@ func ProvideHandler(
 	identities *googleauth.Verifier,
 	users repository.UserRepository,
 	userSvc *usersvc.Service,
+	keySvc *keysvc.Service,
 ) *Handler {
 	return &Handler{
 		cnf:        cnf,
@@ -78,6 +83,7 @@ func ProvideHandler(
 		identities: identities,
 		users:      users,
 		userSvc:    userSvc,
+		keySvc:     keySvc,
 	}
 }
 
@@ -134,6 +140,28 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 		r.Group(func(r chi.Router) {
 			r.Use(handler.RequireIdentity(repository.RoleViewer))
 			r.Get("/me", handler.Me)
+		})
+
+		// Reading the corpus. Viewer, because seeing the copy that ships in the
+		// app is the least a provisioned operator can do, and a translator who
+		// cannot read the existing strings cannot write consistent ones.
+		r.Group(func(r chi.Router) {
+			r.Use(handler.RequireIdentity(repository.RoleViewer))
+			r.Get("/keys", handler.ListKeys)
+			r.Get("/keys/{id}", handler.GetKey)
+			r.Get("/keys/{id}/history", handler.KeyHistory)
+		})
+
+		// Writing the corpus. Editor, and no higher: writing to a BRANCH is the
+		// safe act by construction — nothing reaches an app until a merge, and a
+		// merge needs an approver.
+		r.Group(func(r chi.Router) {
+			r.Use(handler.RequireIdentity(repository.RoleEditor))
+			r.Post("/keys", handler.CreateKey)
+			r.Patch("/keys/{id}", handler.PatchKey)
+			r.Delete("/keys/{id}", handler.DeleteKey)
+			r.Put("/keys/{id}/translations/{locale}", handler.PutTranslation)
+			r.Delete("/keys/{id}/translations/{locale}", handler.DeleteTranslation)
 		})
 
 		// Granting privileges requires holding them.

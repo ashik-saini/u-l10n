@@ -19,14 +19,19 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jinzhu/gorm"
+	_ "github.com/jinzhu/gorm/dialects/postgres"
 	_ "github.com/lib/pq"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/yougroupteam/u-common-components/database"
 )
 
 const (
@@ -37,6 +42,12 @@ const (
 // testDB is set by TestMain and shared by every test. Migrations are applied
 // once; tests keep to their own key names rather than resetting between cases.
 var testDB *sql.DB
+
+// testDSN is the resolved connection string, kept so the service-level tests
+// can open a GORM handle of their own. The repositories speak GORM; driving
+// them through database/sql would be testing a different code path from the one
+// that runs in production.
+var testDSN string
 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
@@ -67,6 +78,7 @@ func TestMain(m *testing.M) {
 	}
 
 	testDB = db
+	testDSN = dsn
 	code := m.Run()
 
 	_ = db.Close()
@@ -196,6 +208,48 @@ func localeID(t *testing.T, code string) int16 {
 		t.Fatalf("locale %q: %v", code, err)
 	}
 	return id
+}
+
+// --- driving the real repository and service layers -------------------------
+
+// gormConnector satisfies database.GORMConnector over a plain GORM handle.
+//
+// The production connector carries dynamic IAM credentials, APM instrumentation
+// and a refresh goroutine, none of which a test can or should stand up. The
+// interface is two methods wide, which is exactly why the repositories depend on
+// it rather than on a *gorm.DB — the same move as route.Pinger and
+// assetsvc.ObjectStore.
+type gormConnector struct{ db *gorm.DB }
+
+func (c gormConnector) GetDB() *gorm.DB { return c.db }
+
+// GetDBWithContext returns the same handle. GORM v1 has no per-request context
+// binding; the production connector does the same thing.
+func (c gormConnector) GetDBWithContext(context.Context) *gorm.DB { return c.db }
+
+var (
+	gormOnce   sync.Once
+	gormHandle *gorm.DB
+	gormErr    error
+)
+
+// testGORM opens a GORM handle against the same database the schema tests use.
+//
+// Opened once for the whole package: gorm.Open builds a connection pool, and one
+// per test would exhaust max_connections long before the suite finished.
+func testGORM(t *testing.T) database.GORMConnector {
+	t.Helper()
+
+	gormOnce.Do(func() {
+		gormHandle, gormErr = gorm.Open("postgres", testDSN)
+		if gormErr == nil {
+			gormHandle.DB().SetMaxOpenConns(8)
+		}
+	})
+	if gormErr != nil {
+		t.Fatalf("open gorm handle: %v", gormErr)
+	}
+	return gormConnector{db: gormHandle}
 }
 
 // requireRejected asserts that a statement was refused by the database.

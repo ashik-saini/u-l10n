@@ -22,6 +22,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/service/assetsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/importsvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/seed"
 	"github.com/yougroupteam/u-l10n/pkg/service/usersvc"
@@ -57,6 +58,7 @@ func injectService(ctx context.Context) (*Service, error) {
 		mergesvc.ProvideService,
 		importsvc.ProvideService,
 		usersvc.ProvideService,
+		keysvc.ProvideService,
 		googleauth.ProvideVerifier,
 		wire.Struct(new(Service), "*"),
 	)

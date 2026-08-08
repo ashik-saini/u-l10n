@@ -22,6 +22,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/service/assetsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/importsvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/seed"
 	"github.com/yougroupteam/u-l10n/pkg/service/usersvc"
@@ -85,11 +86,13 @@ func injectService(ctx context.Context) (*Service, error) {
 	verifier := googleauth.ProvideVerifier(configConfig)
 	userRepository := repository.ProvideUserRepository(gormConnector)
 	usersvcService := usersvc.ProvideService(transactional, userRepository, auditRepository)
-	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository, localeRepository, releaseRepository, assetsvcService, verifier, userRepository, usersvcService)
+	branchRepository := repository.ProvideBranchRepository(gormConnector)
+	tagRepository := repository.ProvideTagRepository(gormConnector)
+	mergeRequestRepository := repository.ProvideMergeRequestRepository(gormConnector)
+	keysvcService := keysvc.ProvideService(transactional, keyRepository, translationRepository, localeRepository, branchRepository, tagRepository, mergeRequestRepository, auditRepository)
+	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository, localeRepository, releaseRepository, assetsvcService, verifier, userRepository, usersvcService, keysvcService)
 	httpHandler := route.ProvideRoutes(apmConfig, configConfig, handler)
 	seedService := seed.ProvideService(transactional, localeRepository, keyRepository, translationRepository)
-	branchRepository := repository.ProvideBranchRepository(gormConnector)
-	mergeRequestRepository := repository.ProvideMergeRequestRepository(gormConnector)
 	mergesvcService := mergesvc.ProvideService(transactional, branchRepository, mergeRequestRepository, localeRepository, releaseRepository, exportRowReader)
 	importsvcService := importsvc.ProvideService(transactional, localeRepository, keyRepository, translationRepository)
 	mainService := &Service{
