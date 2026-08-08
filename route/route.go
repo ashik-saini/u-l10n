@@ -7,6 +7,7 @@ package route
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi"
 	"github.com/go-chi/chi/middleware"
@@ -129,6 +130,15 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(cnf.RequestTimeout))
 
+	// One limiter shared by every governed group, so a client cannot multiply
+	// its budget by spreading requests across prefixes. It runs BEFORE any
+	// authentication because the expensive paths it guards are pre-auth: an
+	// unseen bearer token costs an outbound Google call with a 10-second
+	// timeout, and an X-Api-Token costs a database lookup. The health probes
+	// are exempt by MOUNTING, not configuration — a kubelet that gets 429 from
+	// a liveness check restarts a healthy pod, turning overload into outage.
+	limiter := newIPRateLimiter(cnf, time.Now)
+
 	// Probe endpoints sit outside /api and outside authentication: kubelet
 	// presents no credentials, and a probe that can fail for auth reasons is
 	// a probe that reports the wrong thing.
@@ -138,6 +148,8 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 	// Mounted at /api/v1; the gateway exposes it to the portal and to scripts
 	// as /api/l10n/*.
 	r.Route("/api/v1", func(r chi.Router) {
+		r.Use(limiter.middleware)
+
 		// Scripts and CI authenticate with X-Api-Token. read_export is the
 		// minimum, so a token issued for pulling translations cannot be used to
 		// write them.
@@ -257,6 +269,10 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 	// The app calls it at launch before login, and the payload already ships
 	// inside the binary — see the handler for the full reasoning.
 	r.Route("/ota/v1", func(r chi.Router) {
+		// The OTA design names rate limiting as one of its stated controls,
+		// alongside the CDN. The CDN is the first line; this is the one that
+		// holds when a caller reaches the service directly.
+		r.Use(limiter.middleware)
 		r.Get("/bundles/{locale}", handler.OTABundle)
 	})
 

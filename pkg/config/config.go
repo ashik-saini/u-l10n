@@ -42,6 +42,22 @@ type Config struct {
 	// of every environment at once. Setting it closes a real hole — see
 	// pkg/googleauth.Verify — so it should be set everywhere the portal runs.
 	GoogleOAuthAudience string `configstruct:"SERVICECONFIG_GOOGLE_OAUTH_AUDIENCE" configdefault:""`
+
+	// RateLimitEnable turns the per-client request limiter on. Default on: the
+	// OTA design names rate limiting as one of its controls, and a default
+	// that silently ships without one turns a documented control into a
+	// decorative one.
+	RateLimitEnable bool `configstruct:"SERVICECONFIG_RATE_LIMIT_ENABLE" configdefault:"true"`
+
+	// RateLimitPerMinute is the sustained per-client budget across /api/v1 and
+	// /ota/v1. Health probes are exempt by mounting, not by configuration —
+	// kubelet must never see a 429.
+	RateLimitPerMinute int `configstruct:"SERVICECONFIG_RATE_LIMIT_PER_MINUTE" configdefault:"300"`
+
+	// RateLimitBurst is how far a client may run ahead of the sustained rate.
+	// A portal page load fires several requests at once; a burst below that
+	// fan-out would 429 ordinary use.
+	RateLimitBurst int `configstruct:"SERVICECONFIG_RATE_LIMIT_BURST" configdefault:"60"`
 }
 
 // ProvideConfig loads and validates the service configuration. It fails fast:
@@ -60,6 +76,14 @@ func ProvideConfig(configStore commonconfig.ConfigStore) (*Config, error) {
 	}
 	if cnf.ShutdownTimeout <= 0 {
 		return nil, fmt.Errorf("invalid SERVICECONFIG_SHUTDOWN_TIMEOUT %s", cnf.ShutdownTimeout)
+	}
+	if cnf.RateLimitEnable {
+		if cnf.RateLimitPerMinute <= 0 {
+			return nil, fmt.Errorf("invalid SERVICECONFIG_RATE_LIMIT_PER_MINUTE %d", cnf.RateLimitPerMinute)
+		}
+		if cnf.RateLimitBurst <= 0 {
+			return nil, fmt.Errorf("invalid SERVICECONFIG_RATE_LIMIT_BURST %d", cnf.RateLimitBurst)
+		}
 	}
 
 	return cnf, nil
