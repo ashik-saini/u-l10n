@@ -14,7 +14,10 @@ import (
 	"github.com/jinzhu/gorm"
 
 	"github.com/yougroupteam/u-common-components/database"
+	ulog "github.com/yougroupteam/u-common-util/log"
 )
+
+var log = ulog.GetLogger("u-l10n")
 
 // ErrOptimisticLock is returned when a version-guarded UPDATE affects zero
 // rows, meaning another writer moved the row first.
@@ -35,6 +38,7 @@ var WireSet = wire.NewSet(
 	ProvideKeyRepository,
 	ProvideTranslationRepository,
 	ProvideExportRowReader,
+	ProvideAPITokenRepository,
 )
 
 // base carries the connection plumbing shared by every repository.

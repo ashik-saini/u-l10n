@@ -20,6 +20,7 @@ import (
 	ulog "github.com/yougroupteam/u-common-util/log"
 
 	"github.com/yougroupteam/u-l10n/pkg/config"
+	"github.com/yougroupteam/u-l10n/pkg/repository"
 	"github.com/yougroupteam/u-l10n/pkg/service/seed"
 )
 
@@ -32,6 +33,7 @@ type Service struct {
 	Config  *config.Config
 	Handler http.Handler
 	Seed    *seed.Service
+	Tokens  repository.APITokenRepository
 }
 
 func main() {
@@ -48,7 +50,10 @@ func main() {
 	app.Action = func(*cli.Context) error {
 		return serve(ctx, service)
 	}
-	app.Commands = []cli.Command{seedFromFilesCommand(ctx, service)}
+	app.Commands = []cli.Command{
+		seedFromFilesCommand(ctx, service),
+		tokenCommand(ctx, service),
+	}
 
 	if err := app.Run(os.Args); err != nil {
 		log.Fatale(ctx, "service exited with error", err)
@@ -154,6 +159,63 @@ func seedFromFilesCommand(ctx context.Context, service *Service) cli.Command {
 				"translations_written", result.TranslationsWritten,
 				"warnings", len(result.Warnings))
 			return nil
+		},
+	}
+}
+
+// tokenCommand issues and revokes API tokens for scripts and CI.
+func tokenCommand(ctx context.Context, service *Service) cli.Command {
+	var name, scope, actor string
+
+	return cli.Command{
+		Name:  "token",
+		Usage: "Manage API tokens for scripts and CI",
+		Subcommands: []cli.Command{
+			{
+				Name:  "create",
+				Usage: "Issue a token; the plaintext is shown ONCE and is never recoverable",
+				Flags: []cli.Flag{
+					cli.StringFlag{Name: "name", Usage: "identifier, e.g. u-mobile-ci", Destination: &name},
+					cli.StringFlag{Name: "scope", Value: "read_export",
+						Usage: "read_export or read_write", Destination: &scope},
+					cli.StringFlag{Name: "actor", Usage: "email of the issuer", Destination: &actor},
+				},
+				Action: func(*cli.Context) error {
+					if name == "" || actor == "" {
+						return errors.New("token create: --name and --actor are required")
+					}
+					plaintext, token, err := service.Tokens.Create(ctx, nil, name, scope, actor, nil)
+					if err != nil {
+						return err
+					}
+					// Printed to stdout, deliberately NOT logged: the log ships
+					// to a central store where a live credential must never
+					// land. This is the only moment the plaintext exists
+					// outside the caller's terminal.
+					fmt.Printf("token %q created with scope %s\n", token.Name, token.Scope)
+					fmt.Printf("\n  %s\n\n", plaintext)
+					fmt.Println("Store it now. Only its SHA-256 is kept, so it cannot be shown again.")
+					return nil
+				},
+			},
+			{
+				Name:  "revoke",
+				Usage: "Revoke a token by name",
+				Flags: []cli.Flag{
+					cli.StringFlag{Name: "name", Destination: &name},
+					cli.StringFlag{Name: "actor", Usage: "email of the revoker", Destination: &actor},
+				},
+				Action: func(*cli.Context) error {
+					if name == "" || actor == "" {
+						return errors.New("token revoke: --name and --actor are required")
+					}
+					if err := service.Tokens.Revoke(ctx, nil, name, actor); err != nil {
+						return err
+					}
+					log.Infow(ctx, "token revoked", "name", name, "by", actor)
+					return nil
+				},
+			},
 		},
 	}
 }

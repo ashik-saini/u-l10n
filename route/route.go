@@ -19,6 +19,7 @@ import (
 	ulog "github.com/yougroupteam/u-common-util/log"
 
 	"github.com/yougroupteam/u-l10n/pkg/config"
+	"github.com/yougroupteam/u-l10n/pkg/repository"
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 )
 
@@ -40,17 +41,20 @@ type Handler struct {
 	cnf     *config.Config
 	db      Pinger
 	exports *exportsvc.Service
+	tokens  repository.APITokenRepository
 }
 
 func ProvideHandler(
 	cnf *config.Config,
 	sqlConnector database.SqlConnector,
 	exports *exportsvc.Service,
+	tokens repository.APITokenRepository,
 ) *Handler {
 	return &Handler{
 		cnf:     cnf,
 		db:      sqlConnector.GetDB(),
 		exports: exports,
+		tokens:  tokens,
 	}
 }
 
@@ -80,11 +84,13 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 	// Mounted at /api/v1; the gateway exposes it to the portal and to scripts
 	// as /api/l10n/*.
 	r.Route("/api/v1", func(r chi.Router) {
-		// TODO(auth): gate behind the API-token filter before this reaches any
-		// deployed environment. Unauthenticated today because the token store is
-		// not wired yet — an obviously absent auth check is safer than a
-		// half-built one that looks present.
-		r.Get("/export", handler.Export)
+		// Scripts and CI authenticate with X-Api-Token. read_export is the
+		// minimum, so a token issued for pulling translations cannot be used to
+		// write them.
+		r.Group(func(r chi.Router) {
+			r.Use(handler.RequireAPIToken(repository.ScopeReadExport))
+			r.Get("/export", handler.Export)
+		})
 	})
 
 	return r

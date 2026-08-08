@@ -54,7 +54,8 @@ func injectService(ctx context.Context) (*Service, error) {
 	translationRepository := repository.ProvideTranslationRepository(gormConnector)
 	exportRowReader := repository.ProvideExportRowReader(gormConnector)
 	service := exportsvc.ProvideService(localeRepository, keyRepository, translationRepository, exportRowReader)
-	handler := route.ProvideHandler(configConfig, sqlConnector, service)
+	apiTokenRepository := repository.ProvideAPITokenRepository(gormConnector)
+	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository)
 	httpHandler := route.ProvideRoutes(apmConfig, configConfig, handler)
 	transactional := database.ProvideTransactional(gormConnector)
 	seedService := seed.ProvideService(transactional, localeRepository, keyRepository, translationRepository)
@@ -62,6 +63,7 @@ func injectService(ctx context.Context) (*Service, error) {
 		Config:  configConfig,
 		Handler: httpHandler,
 		Seed:    seedService,
+		Tokens:  apiTokenRepository,
 	}
 	return mainService, nil
 }
