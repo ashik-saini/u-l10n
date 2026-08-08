@@ -41,7 +41,8 @@ test-report: test-report-dep
 # wire_gen.go does not import wire at runtime, so the two versions are
 # independent.
 gen-wire:
-	wire ./...
+	# Root package only: wire ./... fails on packages with no wire directives.
+	wire .
 
 pre-commit: gen-wire
 	go mod tidy
@@ -94,3 +95,8 @@ db-migrate: db-test
 
 run-local: db-local
 	$(LOCAL_ENV) go run .
+
+# Loads the committed u-mobile tree. Add DRY_RUN=--dry-run to rehearse.
+U_MOBILE_PATH ?= ../../FE/u-mobile
+seed-local: db-local
+	$(LOCAL_ENV) go run . seed-from-files --root $(U_MOBILE_PATH) --actor $(USER)@you.co $(DRY_RUN)

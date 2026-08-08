@@ -14,6 +14,8 @@ import (
 	"github.com/yougroupteam/u-common-components/secretclient"
 
 	"github.com/yougroupteam/u-l10n/pkg/config"
+	"github.com/yougroupteam/u-l10n/pkg/repository"
+	"github.com/yougroupteam/u-l10n/pkg/service/seed"
 	"github.com/yougroupteam/u-l10n/route"
 )
 
@@ -24,13 +26,16 @@ var commonWireSet = wire.NewSet(
 	apm.WireSet,
 	secretclient.WireSet,
 	database.WireSet,
+	database.ProvideTransactional,
 	config.ProvideConfig,
+	repository.WireSet,
 )
 
 func injectService(ctx context.Context) (*Service, error) {
 	wire.Build(
 		commonWireSet,
 		route.WireSet,
+		seed.ProvideService,
 		wire.Struct(new(Service), "*"),
 	)
 	return nil, nil

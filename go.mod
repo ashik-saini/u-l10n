@@ -6,6 +6,8 @@ require (
 	github.com/go-chi/chi v4.1.2+incompatible
 	github.com/go-chi/render v1.0.2
 	github.com/google/wire v0.5.0
+	github.com/jinzhu/gorm v1.9.15
+	github.com/lib/pq v1.10.9
 	github.com/stretchr/testify v1.9.0
 	github.com/urfave/cli v1.22.12
 	github.com/yougroupteam/u-common-components v0.0.0-20260417145603-3093bd52ce79
@@ -25,10 +27,8 @@ require (
 	github.com/fsnotify/fsnotify v1.4.9 // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect
 	github.com/jcchavezs/porto v0.1.0 // indirect
-	github.com/jinzhu/gorm v1.9.11 // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/joeshaw/multierror v0.0.0-20140124173710-69b34d4ec901 // indirect
-	github.com/lib/pq v1.10.9 // indirect
 	github.com/magiconair/properties v1.8.1 // indirect
 	github.com/mitchellh/mapstructure v1.1.2 // indirect
 	github.com/pelletier/go-toml v1.4.0 // indirect

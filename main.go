@@ -20,6 +20,7 @@ import (
 	ulog "github.com/yougroupteam/u-common-util/log"
 
 	"github.com/yougroupteam/u-l10n/pkg/config"
+	"github.com/yougroupteam/u-l10n/pkg/service/seed"
 )
 
 const serviceName = "u-l10n"
@@ -30,6 +31,7 @@ var log = ulog.GetLogger(serviceName)
 type Service struct {
 	Config  *config.Config
 	Handler http.Handler
+	Seed    *seed.Service
 }
 
 func main() {
@@ -46,6 +48,7 @@ func main() {
 	app.Action = func(*cli.Context) error {
 		return serve(ctx, service)
 	}
+	app.Commands = []cli.Command{seedFromFilesCommand(ctx, service)}
 
 	if err := app.Run(os.Args); err != nil {
 		log.Fatale(ctx, "service exited with error", err)
@@ -96,5 +99,61 @@ func serve(ctx context.Context, service *Service) error {
 
 		log.Infow(ctx, "shutdown complete")
 		return nil
+	}
+}
+
+// seedFromFilesCommand loads the committed u-mobile tree into the database.
+//
+// This is the disaster-recovery path, the drift-reconciliation tool at cutover,
+// and the reason the store and export engine can be proven before a Lokalise
+// API token exists.
+func seedFromFilesCommand(ctx context.Context, service *Service) cli.Command {
+	var root, actor string
+	var dryRun bool
+
+	return cli.Command{
+		Name:  "seed-from-files",
+		Usage: "Load translations from a committed u-mobile tree",
+		Flags: []cli.Flag{
+			cli.StringFlag{
+				Name:        "root",
+				Usage:       "path to the u-mobile repository root",
+				Destination: &root,
+			},
+			cli.StringFlag{
+				Name:        "actor",
+				Usage:       "email recorded as updated_by; writes to customer copy must be attributable",
+				Destination: &actor,
+			},
+			cli.BoolFlag{
+				// Runs the real pipeline in a transaction and rolls it back,
+				// exercising every constraint for real while leaving nothing
+				// behind.
+				Name:        "dry-run",
+				Usage:       "execute the full pipeline then roll back, reporting what would change",
+				Destination: &dryRun,
+			},
+		},
+		Action: func(*cli.Context) error {
+			result, err := service.Seed.Run(ctx, seed.Options{
+				Root:   root,
+				Actor:  actor,
+				DryRun: dryRun,
+			})
+			if err != nil {
+				return err
+			}
+
+			for _, w := range result.Warnings {
+				log.Infow(ctx, "seed warning", "detail", w)
+			}
+			log.Infow(ctx, "seed result",
+				"dry_run", result.DryRun,
+				"locales", result.LocalesSeen,
+				"keys_upserted", result.KeysUpserted,
+				"translations_written", result.TranslationsWritten,
+				"warnings", len(result.Warnings))
+			return nil
+		},
 	}
 }
