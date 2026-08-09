@@ -128,10 +128,17 @@ func (r *assetRepository) ByID(ctx context.Context, tx *gorm.DB, id int64) (Asse
 // DO NOTHING rather than DO UPDATE: an asset is its content, so there is
 // nothing an existing row could usefully be updated to. DO NOTHING returns no
 // row, hence the read-back below — the same shape as UpsertByName.
+//
+// The conflict target is (project_id, sha256), not sha256 alone: V1.12
+// dropped the global assets_sha256_unique in favour of
+// assets_project_sha256_unique, because two projects are now allowed to hold
+// the same image. This INSERT never names project_id, so every row it writes
+// still takes the column's DEFAULT 1 until a caller passes the scope
+// explicitly — see TODO(plan-2) at the other scoped call sites.
 const createAssetSQL = `
 INSERT INTO assets (s3_key, sha256, filename, content_type, bytes, width, height, uploaded_by)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-ON CONFLICT (sha256) DO NOTHING
+ON CONFLICT (project_id, sha256) DO NOTHING
 RETURNING ` + selectAssetColumns
 
 func (r *assetRepository) Create(ctx context.Context, tx *gorm.DB, a Asset) (Asset, error) {
