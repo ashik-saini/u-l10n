@@ -60,7 +60,9 @@ func (h *Handler) OTABundle(w http.ResponseWriter, r *http.Request) {
 		appVersion = ""
 	}
 
-	locale, err := h.locales.ByCode(r.Context(), nil, code)
+	// TODO(plan-2): the scope arrives from the request path once routes are
+	// project-prefixed. Hardcoded to YouTrip until then.
+	locale, err := h.locales.ByCode(r.Context(), nil, 1, code)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
 			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", otaNegativeMaxAge))
@@ -71,6 +73,24 @@ func (h *Handler) OTABundle(w http.ResponseWriter, r *http.Request) {
 		log.Errore(r.Context(), "ota: locale lookup failed", err)
 		render.Status(r, http.StatusInternalServerError)
 		render.JSON(w, r, errorResponse{Error: "internal_error"})
+		return
+	}
+
+	// An archived locale is not servable, and the check belongs here rather
+	// than inside ByCode: UpdateLocale needs that lookup unfiltered, or a
+	// locale could be archived but never un-archived.
+	//
+	// Without this the freeze is permanent and silent. releasesvc.Publish and
+	// mergesvc materialise bundles for ACTIVE locales only, so no future
+	// release ever refreshes an archived one — but its LAST bundle is still on
+	// disk, so this endpoint would keep answering 200 with it forever. Clients
+	// would sit on stale copy indefinitely rather than falling back to the
+	// strings shipped in the binary. Same 404 shape as an unknown locale,
+	// because from a client's point of view that is what it now is.
+	if locale.Status != repository.LocaleActive {
+		w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", otaNegativeMaxAge))
+		render.Status(r, http.StatusNotFound)
+		render.JSON(w, r, errorResponse{Error: "unknown_locale"})
 		return
 	}
 

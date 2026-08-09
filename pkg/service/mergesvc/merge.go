@@ -276,7 +276,9 @@ func (s *Service) Merge(ctx context.Context, branchName, actor string) (*Result,
 			return err
 		}
 
-		locales, err := s.locales.List(ctx, tx)
+		// TODO(plan-2): the scope arrives from the request path once routes are
+		// project-prefixed. Hardcoded to YouTrip until then.
+		locales, err := s.locales.List(ctx, tx, 1, false)
 		if err != nil {
 			return err
 		}

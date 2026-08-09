@@ -19,17 +19,25 @@ import (
 // stubLocales is a LocaleRepository with a fixed list.
 type stubLocales struct{ locales []model.Locale }
 
-func (s *stubLocales) List(context.Context, *gorm.DB) ([]model.Locale, error) {
+func (s *stubLocales) List(context.Context, *gorm.DB, int16, bool) ([]model.Locale, error) {
 	return s.locales, nil
 }
 
-func (s *stubLocales) ByCode(_ context.Context, _ *gorm.DB, code string) (model.Locale, error) {
+func (s *stubLocales) ByCode(_ context.Context, _ *gorm.DB, _ int16, code string) (model.Locale, error) {
 	for _, l := range s.locales {
 		if l.Code == code {
 			return l, nil
 		}
 	}
 	return model.Locale{}, fmt.Errorf("locale %q: %w", code, repository.ErrNotFound)
+}
+
+func (s *stubLocales) Create(context.Context, *gorm.DB, model.Locale) (model.Locale, error) {
+	return model.Locale{}, errors.New("stubLocales: Create not needed by this test")
+}
+
+func (s *stubLocales) Update(context.Context, *gorm.DB, int16, string, model.Locale) (model.Locale, error) {
+	return model.Locale{}, errors.New("stubLocales: Update not needed by this test")
 }
 
 // stubRows is an ExportRowReader with a fixed answer.

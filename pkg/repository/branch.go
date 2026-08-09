@@ -201,7 +201,7 @@ func scanBranch(row interface{ Scan(...interface{}) error }) (Branch, error) {
 	return b, err
 }
 
-// ErrBranchNameTaken is returned when Create hits branches_name_unique.
+// ErrBranchNameTaken is returned when Create hits branches_project_name_unique.
 //
 // An exported sentinel, following ErrTagNameTaken: the portal turns it into a
 // 409 with a body a human can act on, rather than a 500 carrying a driver
@@ -211,10 +211,17 @@ var ErrBranchNameTaken = errors.New("a branch with that name already exists")
 // createBranchSQL uses DO NOTHING so a taken name comes back as a missing row
 // rather than a driver error to pattern-match — the same move as createTagSQL,
 // and race-free in a way a pre-check is not.
+//
+// The conflict target is (project_id, name), following V1.11: project_id is
+// not yet in the column list — this repository does not pass a project scope
+// explicitly — but it is present with its DEFAULT 1, and the ON CONFLICT
+// target must name the constraint that actually exists or Postgres refuses
+// the statement outright, exactly the way upsertKeySQL and createTagSQL
+// already had to move to (project_id, name) in V1.10.
 const createBranchSQL = `
 INSERT INTO branches (name, description, created_by)
 VALUES ($1, $2, $3)
-ON CONFLICT (name) DO NOTHING
+ON CONFLICT (project_id, name) DO NOTHING
 RETURNING ` + branchColumns
 
 func (r *branchRepository) Create(ctx context.Context, tx *gorm.DB, name, description, createdBy string) (Branch, error) {
@@ -231,6 +238,16 @@ func (r *branchRepository) Create(ctx context.Context, tx *gorm.DB, name, descri
 	}
 }
 
+// TODO(plan-2): this WHERE has no project_id, and V1.11 dropped
+// branches_name_unique for branches_project_name_unique — per-project branch
+// names being the stated point of that migration, so that both teams may run a
+// `q3-copy` without one blocking the other. A name therefore no longer
+// identifies one branch, and `.Row()` returns whichever the planner reaches
+// first with no error. Every portal branch route resolves through here
+// (branchsvc looks a branch up by the name in the path before reading or
+// writing its deltas), so an ambiguous answer would put one project's edits on
+// another project's branch. Unreachable while one project exists; it needs a
+// project_id parameter and an AND project_id = $N before a second does.
 func (r *branchRepository) ByName(ctx context.Context, tx *gorm.DB, name string) (Branch, error) {
 	row := r.db(ctx, tx).Raw(
 		`SELECT `+branchColumns+` FROM branches WHERE name = $1`, name).Row()

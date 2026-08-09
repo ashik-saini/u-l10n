@@ -90,6 +90,16 @@ func scanAsset(row *sql.Row) (Asset, error) {
 	return a, nil
 }
 
+// TODO(plan-2): this WHERE has no project_id, and V1.12 dropped the global
+// assets_sha256_unique that used to guarantee sha256 named at most one row.
+// Once a second project holds an asset with the same content hash, this
+// becomes an arbitrary-row lookup — and it is the dedupe short-circuit behind
+// assetsvc.RequestUpload and assetsvc.Confirm, so project B uploading bytes
+// project A already holds could be handed project A's row, and Download would
+// then presign project A's S3 object for project B. These are screenshots of
+// a fintech app; that is a permission escape, not a performance concern. Not
+// yet reachable — no second project exists — but it must be scoped (a
+// project_id parameter and an AND project_id = $N) before one does.
 func (r *assetRepository) BySHA256(ctx context.Context, tx *gorm.DB, sha256 string) (Asset, error) {
 	row := r.db(ctx, tx).Raw(
 		`SELECT `+selectAssetColumns+` FROM assets WHERE sha256 = $1`, sha256).Row()
@@ -128,10 +138,17 @@ func (r *assetRepository) ByID(ctx context.Context, tx *gorm.DB, id int64) (Asse
 // DO NOTHING rather than DO UPDATE: an asset is its content, so there is
 // nothing an existing row could usefully be updated to. DO NOTHING returns no
 // row, hence the read-back below — the same shape as UpsertByName.
+//
+// The conflict target is (project_id, sha256), not sha256 alone: V1.12
+// dropped the global assets_sha256_unique in favour of
+// assets_project_sha256_unique, because two projects are now allowed to hold
+// the same image. This INSERT never names project_id, so every row it writes
+// still takes the column's DEFAULT 1 until a caller passes the scope
+// explicitly — see TODO(plan-2) at the other scoped call sites.
 const createAssetSQL = `
 INSERT INTO assets (s3_key, sha256, filename, content_type, bytes, width, height, uploaded_by)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-ON CONFLICT (sha256) DO NOTHING
+ON CONFLICT (project_id, sha256) DO NOTHING
 RETURNING ` + selectAssetColumns
 
 func (r *assetRepository) Create(ctx context.Context, tx *gorm.DB, a Asset) (Asset, error) {

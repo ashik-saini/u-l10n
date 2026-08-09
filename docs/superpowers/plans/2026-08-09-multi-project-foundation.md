@@ -735,7 +735,7 @@ git commit -m "feat(db): scope locales, keys, translations and tags to a project
 
 **Files:**
 - Create: `.db/V1.11__scope_workflow.sql`, `.db/U1.11__scope_workflow.sql`
-- Modify: `integration-tests/scope_constraints_test.go`
+- Create: `integration-tests/scope_workflow_test.go`
 
 **Interfaces:**
 - Consumes: `keys (project_id, id)` and `locales (project_id, id)` from Task 2.
@@ -838,7 +838,7 @@ Create `.db/U1.11__scope_workflow.sql` following U1.10's shape: drop each compos
 
 - [ ] **Step 3: Write the failing constraint test**
 
-Append to `integration-tests/scope_constraints_test.go`:
+Create `integration-tests/scope_workflow_test.go` (package `integrationtests`, importing `testing`, `github.com/stretchr/testify/assert` and `github.com/stretchr/testify/require`). Tasks 3, 4 and 5 run in parallel, so each owns its own test file — appending to a shared one would collide:
 
 ```go
 // TestCrossProjectBranchDeltaIsRefused: a branch may only carry deltas for
@@ -934,7 +934,7 @@ git commit -m "feat(db): scope branches and merge requests to a project"
 
 **Files:**
 - Create: `.db/V1.12__scope_releases_assets.sql`, `.db/U1.12__scope_releases_assets.sql`
-- Modify: `integration-tests/scope_constraints_test.go`
+- Create: `integration-tests/scope_releases_test.go`
 
 **Interfaces:**
 - Consumes: `locales (project_id, id)`, `keys (project_id, id)` from Task 2.
@@ -1021,7 +1021,7 @@ Create `.db/U1.12__scope_releases_assets.sql` in the same shape as U1.10 and U1.
 
 - [ ] **Step 2: Write the failing test**
 
-Append to `integration-tests/scope_constraints_test.go`:
+Create `integration-tests/scope_releases_test.go` (package `integrationtests`, importing `testing`, `github.com/stretchr/testify/assert` and `github.com/stretchr/testify/require`). Tasks 3, 4 and 5 run in parallel, so each owns its own test file — appending to a shared one would collide:
 
 ```go
 // TestReleaseVersionsRestartPerProject: YouBiz's first release is 1.
@@ -1082,7 +1082,7 @@ git commit -m "feat(db): scope releases, bundles and assets to a project"
 
 **Files:**
 - Create: `.db/V1.13__scope_identity.sql`, `.db/U1.13__scope_identity.sql`
-- Modify: `integration-tests/scope_constraints_test.go`
+- Create: `integration-tests/scope_identity_test.go`
 
 **Interfaces:**
 - Consumes: `projects` (Task 1), `keys (project_id, id)` and `locales (project_id, id)` (Task 2).
@@ -1196,7 +1196,7 @@ Create `.db/U1.13__scope_identity.sql`: drop `user_project_roles`, drop `is_plat
 
 - [ ] **Step 2: Write the failing test**
 
-Append to `integration-tests/scope_constraints_test.go`:
+Create `integration-tests/scope_identity_test.go` (package `integrationtests`, importing `testing`, `github.com/stretchr/testify/assert` and `github.com/stretchr/testify/require`). Tasks 3, 4 and 5 run in parallel, so each owns its own test file — appending to a shared one would collide:
 
 ```go
 // TestExistingOperatorsKeepTheirAccessOnYouTrip proves the V1.13 backfill

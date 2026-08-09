@@ -365,7 +365,8 @@ func TestReleaseVersionIsMonotonicAndUnique(t *testing.T) {
 
 	_, err := testDB.Exec(`
 		INSERT INTO releases (version, source, created_by) VALUES ($1, 'merge', 'a@you.co')`, second)
-	requireRejected(t, err, "a duplicate release version")
+	requireRejected(t, err, "releases_project_version_unique",
+		"a duplicate release version")
 }
 
 // TestBundleShaIsStableForIdenticalContent proves the ETag is a content

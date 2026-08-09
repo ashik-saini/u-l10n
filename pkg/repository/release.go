@@ -220,6 +220,18 @@ type ServableBundle struct {
 // The floor is compared as an INTEGER TRIPLE, not as text: '4.9.0' > '4.10.0'
 // lexically, which would withhold a release from exactly the clients it was
 // meant for. NULL means every client is eligible.
+//
+// The r.project_id predicate is load-bearing for the query PLAN, not for
+// correctness: a locale_id already names exactly one project (locales carries
+// a UNIQUE (project_id, id) since V1.10), so the join could never actually
+// cross a project boundary even without it. But V1.12 replaced
+// releases_version_unique with a project_id-LED index
+// (releases_project_version_unique / idx_releases_servable), and a leading
+// column an equality predicate never touches cannot be used to satisfy
+// `ORDER BY version DESC` once more than one project_id value exists in the
+// table — the planner falls back to scanning and sorting every eligible
+// release across every project before applying LIMIT 1. Naming the project
+// explicitly is what lets the planner use that index for the ordering again.
 const servableBundleSQL = `
 WITH client AS (
     SELECT COALESCE(NULLIF($2, ''), '0.0.0') AS v
@@ -228,6 +240,7 @@ SELECT r.version, rb.strings::text, rb.sha256
   FROM releases r
   JOIN release_bundles rb ON rb.release_id = r.id
  WHERE rb.locale_id = $1
+   AND r.project_id = (SELECT project_id FROM locales WHERE id = $1)
    AND r.rolled_back_at IS NULL
    AND (
         r.min_app_version IS NULL
@@ -357,6 +370,16 @@ func (r *releaseRepository) List(
 	return out, rows.Err()
 }
 
+// TODO(plan-2): this WHERE has no project_id, and V1.12 replaced the global
+// releases_version_unique with releases_project_version_unique, so a version
+// number no longer names at most one release. `.Row()` takes whichever the
+// planner reaches first — first-row-wins, no error — which means the portal
+// could show one project's release detail under another project's version.
+// Rollback below also calls it, both to decide between "no such release" and
+// "already rolled back" and to build the response it returns on success, so a
+// wrong row here misreports what was just rolled back as well.
+// Not reachable until a second project publishes; it needs a
+// project_id parameter and an AND project_id = $N before one does.
 func (r *releaseRepository) ByVersion(
 	ctx context.Context, tx *gorm.DB, version int64,
 ) (ReleaseDetail, error) {
@@ -380,6 +403,22 @@ func (r *releaseRepository) ByVersion(
 // second rollback overwriting it with a different name would erase that answer.
 // The schema's rollback_consistency_check requires both columns together, which
 // is why they are set in one statement.
+//
+// TODO(plan-2): THIS IS THE MOST DESTRUCTIVE UNSCOPED STATEMENT IN THE
+// CODEBASE. The WHERE names no project and the UPDATE carries no LIMIT.
+// V1.12 dropped releases_version_unique for releases_project_version_unique,
+// and V1.12's own header states that release versions restart per project —
+// YouBiz's first release is 1, not YouTrip's next number — so version numbers
+// are expected to COLLIDE across projects rather than merely be able to.
+// The moment a second project publishes, `POST /releases/1/rollback` rolls back
+// EVERY project's release 1 in one statement. Nothing downstream notices:
+// RowsAffected is 2, the `== 0` branch below is the only check there is, and
+// the handler answers 200. Rollback is the kill switch — it withdraws shipped
+// copy from every client on that release and makes OTA answer 410 — so the
+// blast radius of this is another product's live app, not a wrong row.
+// Unreachable today only because one project exists. Scoping this (a
+// project_id parameter and an AND project_id = $N) is the FIRST thing Plan 2
+// must do, before anything creates a second project.
 const rollbackSQL = `
 UPDATE releases
    SET rolled_back_at = now(), rolled_back_by = $2

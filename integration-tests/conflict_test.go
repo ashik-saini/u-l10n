@@ -159,10 +159,15 @@ func TestResolutionsAreUniquePerConflict(t *testing.T) {
 	}
 
 	require.NoError(t, ins(enSG, "mine"))
-	requireRejected(t, ins(enSG, "master"), "a second resolution for the same value conflict")
+	requireRejected(t, ins(enSG, "master"), "idx_merge_conflict_resolutions_unique",
+		"a second resolution for the same value conflict")
 
-	// Key-metadata conflicts carry a NULL locale and must also be unique.
+	// Key-metadata conflicts carry a NULL locale and must also be unique. Naming
+	// the same index for both halves is the assertion: a plain
+	// UNIQUE (merge_request_id, key_id, locale_id) would refuse the first
+	// insert and let this one through, so both must be refused by the
+	// COALESCE-expression index and by nothing else.
 	require.NoError(t, ins(nil, "mine"))
-	requireRejected(t, ins(nil, "master"),
+	requireRejected(t, ins(nil, "master"), "idx_merge_conflict_resolutions_unique",
 		"a second resolution for the same metadata conflict — NULLs would not collide without COALESCE")
 }

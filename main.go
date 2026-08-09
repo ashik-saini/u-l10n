@@ -25,6 +25,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/repository"
 	"github.com/yougroupteam/u-l10n/pkg/service/importsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/projectsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/seed"
 	"github.com/yougroupteam/u-l10n/pkg/service/usersvc"
 )
@@ -35,13 +36,14 @@ var log = ulog.GetLogger(serviceName)
 
 // Service is the fully-wired application graph, built by Wire.
 type Service struct {
-	Config  *config.Config
-	Handler http.Handler
-	Seed    *seed.Service
-	Tokens  repository.APITokenRepository
-	Merge   *mergesvc.Service
-	Import  *importsvc.Service
-	Users   *usersvc.Service
+	Config   *config.Config
+	Handler  http.Handler
+	Seed     *seed.Service
+	Tokens   repository.APITokenRepository
+	Merge    *mergesvc.Service
+	Import   *importsvc.Service
+	Users    *usersvc.Service
+	Projects *projectsvc.Service
 }
 
 func main() {
@@ -63,6 +65,7 @@ func main() {
 		importCommand(ctx, service),
 		tokenCommand(ctx, service),
 		userCommand(ctx, service),
+		projectCommand(ctx, service),
 	}
 
 	if err := app.Run(os.Args); err != nil {
@@ -336,6 +339,7 @@ func tokenCommand(ctx context.Context, service *Service) cli.Command {
 //	u-l10n user grant --email ashik.saini@you.co --role admin --actor ashik.saini@you.co
 func userCommand(ctx context.Context, service *Service) cli.Command {
 	var email, role, status, actor string
+	var platformAdmin bool
 
 	return cli.Command{
 		Name:  "user",
@@ -350,6 +354,16 @@ func userCommand(ctx context.Context, service *Service) cli.Command {
 						Usage: "viewer, editor, approver or admin", Destination: &role},
 					cli.StringFlag{Name: "status", Value: "active",
 						Usage: "active or disabled", Destination: &status},
+					cli.BoolFlag{
+						// The one privilege that is not scoped to a project: creating
+						// a project and granting its first role. Without this flag
+						// there is no way to mint the first platform admin, and the
+						// API can never bootstrap itself — see requirePlatformAdmin
+						// in route/identity.go.
+						Name:        "platform-admin",
+						Usage:       "also grant the platform-admin privilege (create projects, grant first roles)",
+						Destination: &platformAdmin,
+					},
 					cli.StringFlag{Name: "actor",
 						Usage:       "email of whoever is running this; recorded in the audit trail",
 						Destination: &actor},
@@ -358,11 +372,12 @@ func userCommand(ctx context.Context, service *Service) cli.Command {
 					if email == "" || actor == "" {
 						return errors.New("user grant: --email and --actor are required")
 					}
-					user, err := service.Users.Grant(ctx, email, role, status, actor, "cli")
+					user, err := service.Users.Grant(ctx, email, role, status, platformAdmin, actor, "cli")
 					if err != nil {
 						return err
 					}
-					fmt.Printf("%s is now %s (%s)\n", user.Email, user.Role, user.Status)
+					fmt.Printf("%s is now %s (%s, platform_admin=%t)\n",
+						user.Email, user.Role, user.Status, user.IsPlatformAdmin)
 					return nil
 				},
 			},
@@ -383,6 +398,79 @@ func userCommand(ctx context.Context, service *Service) cli.Command {
 					}
 					for _, u := range users {
 						fmt.Printf("%-40s %-9s %s\n", u.Email, u.Role, u.Status)
+					}
+					return nil
+				},
+			},
+		},
+	}
+}
+
+// projectCommand mints and lists projects from the shell.
+//
+// It exists for the same bootstrapping reason userCommand does. POST /projects
+// requires users.is_platform_admin; this command deliberately checks NOTHING,
+// because on a fresh database nobody holds that flag and an authorized path
+// could never mint the first project. --actor names who receives the first
+// admin grant, not who is permitted to run this. The escape hatch rests on the
+// same argument userCommand's does: anyone who can run it already has shell
+// and database access, which is strictly more privilege than any row in this
+// schema can express.
+//
+//	u-l10n project create --code youbiz --name YouBiz --actor ashik.saini@you.co
+func projectCommand(ctx context.Context, service *Service) cli.Command {
+	var code, name, lokaliseProjectID, actor string
+	var includeArchived bool
+
+	return cli.Command{
+		Name:  "project",
+		Usage: "Manage projects",
+		Subcommands: []cli.Command{
+			{
+				Name:  "create",
+				Usage: "Mint a project and grant its creator the admin role on it",
+				Flags: []cli.Flag{
+					cli.StringFlag{Name: "code", Usage: "URL slug, e.g. youbiz", Destination: &code},
+					cli.StringFlag{Name: "name", Usage: "display name, e.g. YouBiz", Destination: &name},
+					cli.StringFlag{Name: "lokalise-project-id",
+						Usage: "Lokalise project id this project imports from, if any", Destination: &lokaliseProjectID},
+					cli.StringFlag{Name: "actor",
+						Usage:       "email of whoever is running this; becomes the project's first admin",
+						Destination: &actor},
+				},
+				Action: func(*cli.Context) error {
+					if actor == "" {
+						return errors.New("project create: --actor is required")
+					}
+					p, err := service.Projects.Create(ctx, actor, projectsvc.NewProject{
+						Code:              code,
+						Name:              name,
+						LokaliseProjectID: lokaliseProjectID,
+					})
+					if err != nil {
+						return err
+					}
+					fmt.Printf("project %q (id %d) created; %s granted admin\n", p.Code, p.ID, actor)
+					return nil
+				},
+			},
+			{
+				Name:  "list",
+				Usage: "List projects",
+				Flags: []cli.Flag{
+					cli.BoolFlag{Name: "all", Usage: "include archived projects", Destination: &includeArchived},
+				},
+				Action: func(*cli.Context) error {
+					projects, err := service.Projects.List(ctx, includeArchived)
+					if err != nil {
+						return err
+					}
+					if len(projects) == 0 {
+						fmt.Println("no projects yet")
+						return nil
+					}
+					for _, p := range projects {
+						fmt.Printf("%-4d %-20s %-10s %s\n", p.ID, p.Code, p.Status, p.Name)
 					}
 					return nil
 				},

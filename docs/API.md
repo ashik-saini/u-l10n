@@ -40,6 +40,11 @@ minimum. An unknown role in the database satisfies nothing, not even viewer —
 it fails closed. The `x-yp-role` header the portal sends is **ignored
 entirely**; the portal must gate its UI on `GET /api/v1/me`.
 
+`is_platform_admin` is a separate flag, not a fifth role, and not scoped to
+any project — see [Projects](#projects). `requirePlatformAdmin` runs after
+the two checks above and reads the flag `RequireIdentity` already loaded;
+failing it answers 403 `forbidden`.
+
 ### Script auth: `RequireAPIToken`
 
 `X-Api-Token: <token>`. Missing → 401 `missing_token` with
@@ -125,6 +130,82 @@ nothing else. `/readyz` pings the database; unreachable → 503
 Returns the caller's identity and role: `{"email":"a@you.co","role":"editor"}`.
 No query parameters. This is what the portal gates its UI on. Nothing is
 queried — the middleware already read the row.
+
+## Projects
+
+u-l10n serves any number of projects — YouTrip and YouBiz today — each with
+its own keys, locales, branches and releases. Every other endpoint in this
+document is implicitly scoped to a project (currently YouTrip by default,
+while the remaining call sites are swept onto an explicit project one at a
+time — see `docs/OPERATIONS.md`); these four endpoints are the ones that
+manage the project dimension itself.
+
+**Platform admin, not a per-project role.** `POST /projects` and everything
+under `/projects/{project}/locales` require `users.is_platform_admin`, checked
+by `requirePlatformAdmin` — a middleware that runs strictly after
+`RequireIdentity` and reads the flag already loaded onto the request context.
+This is deliberately **not** one of the ordered per-project roles: minting a
+project — or adding the locale dimension a brand-new project translates
+into — cannot be gated by a role that lives on a project that does not exist
+yet. Failing the gate answers 403 `forbidden`, with no `WWW-Authenticate`
+header (the caller already proved who they are). `GET /projects` is the
+exception — knowing which projects exist is reading, not administering one —
+and sits at the viewer floor like everything else in this section.
+
+### `GET /api/v1/projects` — viewer
+
+No query parameters. 200 → `{"projects":[{"id","code","name","status","lokalise_project_id","created_at","updated_at"}]}`.
+Archived projects are excluded. `lokalise_project_id` is omitted (not sent as
+`""`) when the project has no Lokalise source at all — absent and blank are
+different facts here too.
+
+### `POST /api/v1/projects` — platform admin
+
+Body `{"code","name","lokalise_project_id"}` (`lokalise_project_id` optional).
+`code` is a slug: required, matches `^[a-z][a-z0-9-]{1,31}$` — it appears in
+every subsequent path segment under this project. 201 → the created project.
+The creator receives the project's first role, `admin`, in the **same
+transaction** that creates the row — a project whose creator holds no role on
+it is a project nobody could ever configure. 409 `project_code_taken` for a
+duplicate code.
+
+### `PATCH /api/v1/projects/{project}` — platform admin
+
+Body `{"name","status","lokalise_project_id"}` — all three required on every
+call; there is no partial-update sentinel here. `status` must be `active` or
+`archived`. 200 → the updated project. 404 `not_found` for an unknown project
+code.
+
+### `POST /api/v1/projects/{project}/locales` — platform admin
+
+Adds a locale to a project.
+
+| Field | Type | Rules |
+| --- | --- | --- |
+| `code` | string | required, matches `^[a-z]{2}(-[A-Z]{2})?$`, e.g. `vi-VN` |
+| `flutter_dir`, `android_values_dir`, `ios_lproj` | string | required, non-empty — the export directory names u-mobile's `run.sh` expects |
+| `sort_order` | int | display order |
+
+201 → the created locale (`{"id","project_id","code","flutter_dir","android_values_dir","ios_lproj","sort_order","status"}`), `status` always `"active"`. Adding a locale writes **no translation rows** — absent means untranslated (see `docs/DATA_MODEL.md` §2) — so a new locale starts empty and is cheap by construction, however many a project ends up with. 409 `locale_code_taken` when the project already has that code. 409 `locale_directory_taken` when another locale on the project already claims one of the three export directories — this is left entirely to the database's `UNIQUE (project_id, flutter_dir|android_values_dir|ios_lproj)` rather than pre-checked, because the other locale can appear between a check and the write.
+
+### `PATCH /api/v1/projects/{project}/locales/{code}` — platform admin
+
+Body:
+
+| Field | Type | Rules |
+| --- | --- | --- |
+| `flutter_dir`, `android_values_dir`, `ios_lproj` | string | required, non-empty — all three are written on every call, same as `PATCH /projects/{project}` |
+| `sort_order` | int | display order |
+| `status` | string | required, `active` or `archived` |
+
+200 → the updated locale. **The locale's `code` cannot be changed by this
+endpoint at all** — it is the path segment addressing the locale, never a
+body field, because it is the identifier every translation and history row
+references; renaming it would silently orphan all of them. `archived` is the
+only lifecycle move a locale has — **there is no delete endpoint**, for the
+same reason: an audit trail outlives its subject. 404 `not_found` for an
+unknown project or locale code. 409 `locale_directory_taken` on a directory
+collision, same as create.
 
 ## Keys
 
@@ -615,9 +696,13 @@ first user is the `user grant` CLI command's job. Every change is audited.
 | `account_disabled` | 403 | The account exists and is disabled |
 | `insufficient_role` | 403 | Provisioned, but below the route's minimum role |
 | `insufficient_scope` | 403 | API token authenticated, but below the route's minimum scope |
+| `forbidden` | 403 | Provisioned and authenticated, but not a platform admin — the one privilege `/projects` (create) and `/projects/{project}/locales` require |
 | `not_found` | 404 | The addressed entity does not exist |
 | `version_conflict` | 409 | Optimistic lock lost; on translation writes the body carries `mine` and `theirs` |
 | `name_taken` | 409 | An active key, tag or branch already claims the name |
+| `project_code_taken` | 409 | Another project already has that code |
+| `locale_code_taken` | 409 | The project already has a locale with that code |
+| `locale_directory_taken` | 409 | Another locale on the project already claims that flutter/android/ios export directory |
 | `branch_not_open` | 409 | The branch is closed or merged and cannot be edited/reopened |
 | `merge_request_not_live` | 409 | The request is not in a state that allows this transition |
 | `live_merge_request_exists` | 409 | The branch already has a live merge request |

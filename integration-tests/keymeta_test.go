@@ -50,7 +50,11 @@ func TestBranchKeysRefusesAKeylessDelta(t *testing.T) {
 		    (branch_id, key_id, name, platforms, status, base_master_version, updated_by)
 		VALUES ($1, NULL, 'keyless_delta', ARRAY['flutter']::TEXT[], 'active', 0, 'test@you.co')`,
 		branchID)
-	requireRejected(t, err, "a branch_keys delta naming no key")
+	// V1.07 made branch_keys.key_id NOT NULL, and a NOT NULL is the one
+	// class-23 rejection Postgres attaches no constraint name to — hence the
+	// column-asserting variant. Asserting the column is what stops this test
+	// going green on some other omitted NOT NULL column instead.
+	requireRejectedNotNull(t, err, "key_id", "a branch_keys delta naming no key")
 }
 
 // TestBranchTranslationsCannotOutrunTheirKey states the constraint that shapes
@@ -70,7 +74,8 @@ func TestBranchTranslationsCannotOutrunTheirKey(t *testing.T) {
 		INSERT INTO branch_translations
 		    (branch_id, key_id, locale_id, value, base_master_version, updated_by)
 		VALUES ($1, $2, $3, 'orphan', 0, 'test@you.co')`, branchID, maxKeyID, enSG)
-	requireRejected(t, err, "a branch value against a key that does not exist")
+	requireRejected(t, err, "branch_translations_key_fkey",
+		"a branch value against a key that does not exist")
 }
 
 func metaConflictCount(t *testing.T, branchID int64) int {

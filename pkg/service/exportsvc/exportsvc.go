@@ -199,7 +199,9 @@ func (s *Service) entriesFor(
 
 // selectLocales resolves the requested codes, or returns all of them.
 func (s *Service) selectLocales(ctx context.Context, codes []string) ([]model.Locale, error) {
-	all, err := s.locales.List(ctx, nil)
+	// TODO(plan-2): the scope arrives from the request path once routes are
+	// project-prefixed. Hardcoded to YouTrip until then.
+	all, err := s.locales.List(ctx, nil, 1, false)
 	if err != nil {
 		return nil, err
 	}

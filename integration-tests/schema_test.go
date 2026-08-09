@@ -57,7 +57,8 @@ func TestKeyNameUniqueAmongActiveOnly(t *testing.T) {
 	_, err := testDB.Exec(`
 		INSERT INTO keys (name, platforms, sort_index)
 		VALUES ('duplicate_name_case', ARRAY['flutter']::TEXT[], $1)`, nextSortIndex())
-	requireRejected(t, err, "a second ACTIVE key with an existing name")
+	requireRejected(t, err, "idx_keys_name_active",
+		"a second ACTIVE key with an existing name")
 
 	_, err = testDB.Exec(`UPDATE keys SET status = 'deleted' WHERE name = 'duplicate_name_case'`)
 	require.NoError(t, err)
@@ -69,30 +70,37 @@ func TestKeyNameUniqueAmongActiveOnly(t *testing.T) {
 }
 
 func TestKeyConstraintsRejectBadInput(t *testing.T) {
+	// constraint names the CHECK each case must trip. keys_platforms_check
+	// covers both halves of its own predicate — the vocabulary and the
+	// non-empty requirement — which is why two cases name it.
 	cases := []struct {
-		name, what, stmt string
+		name, what, constraint, stmt string
 	}{
 		{
-			name: "unknown status",
-			what: "status 'archived'",
+			name:       "unknown status",
+			what:       "status 'archived'",
+			constraint: "keys_status_check",
 			stmt: `INSERT INTO keys (name, platforms, sort_index, status)
 			       VALUES ('bad_status', ARRAY['flutter']::TEXT[], 900001, 'archived')`,
 		},
 		{
-			name: "unknown platform",
-			what: "platform 'windows'",
+			name:       "unknown platform",
+			what:       "platform 'windows'",
+			constraint: "keys_platforms_check",
 			stmt: `INSERT INTO keys (name, platforms, sort_index)
 			       VALUES ('bad_platform', ARRAY['windows']::TEXT[], 900002)`,
 		},
 		{
-			name: "empty platform list",
-			what: "a key belonging to no platform",
+			name:       "empty platform list",
+			what:       "a key belonging to no platform",
+			constraint: "keys_platforms_check",
 			stmt: `INSERT INTO keys (name, platforms, sort_index)
 			       VALUES ('no_platform', ARRAY[]::TEXT[], 900003)`,
 		},
 		{
-			name: "non-positive version",
-			what: "version 0",
+			name:       "non-positive version",
+			what:       "version 0",
+			constraint: "keys_version_check",
 			stmt: `INSERT INTO keys (name, platforms, sort_index, version)
 			       VALUES ('bad_version', ARRAY['flutter']::TEXT[], 900004, 0)`,
 		},
@@ -101,7 +109,7 @@ func TestKeyConstraintsRejectBadInput(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := testDB.Exec(tc.stmt)
-			requireRejected(t, err, tc.what)
+			requireRejected(t, err, tc.constraint, tc.what)
 		})
 	}
 }
@@ -117,7 +125,8 @@ func TestLokaliseKeyIDIsAnIdempotencyKey(t *testing.T) {
 	_, err = testDB.Exec(`
 		INSERT INTO keys (name, platforms, sort_index, lokalise_key_id)
 		VALUES ('imported_two', ARRAY['flutter']::TEXT[], $1, 55501)`, nextSortIndex())
-	requireRejected(t, err, "a second key claiming the same lokalise_key_id")
+	requireRejected(t, err, "keys_project_lokalise_key_unique",
+		"a second key claiming the same lokalise_key_id")
 }
 
 // TestTranslationThreeStates is the most important test in this file.
@@ -175,7 +184,8 @@ func TestTranslationConstraints(t *testing.T) {
 		_, err := testDB.Exec(`
 			INSERT INTO translations (key_id, locale_id, value, updated_by)
 			VALUES ($1, $2, 'second', 'test@you.co')`, keyID, enSG)
-		requireRejected(t, err, "a duplicate (key, locale) translation")
+		requireRejected(t, err, "translations_pkey",
+			"a duplicate (key, locale) translation")
 	})
 
 	t.Run("unknown render hint", func(t *testing.T) {
@@ -183,7 +193,8 @@ func TestTranslationConstraints(t *testing.T) {
 			INSERT INTO translations (key_id, locale_id, value, render_hint, updated_by)
 			VALUES ($1, $2, 'x', 'markdown', 'test@you.co')`,
 			insertKey(t, "bad_render_hint_case"), enSG)
-		requireRejected(t, err, "render_hint 'markdown'")
+		requireRejected(t, err, "translations_render_hint_check",
+			"render_hint 'markdown'")
 	})
 
 	t.Run("cascade removes translations with their key", func(t *testing.T) {
@@ -226,7 +237,8 @@ func TestHistoryRowsRefuseKeyHardDelete(t *testing.T) {
 		require.NoError(t, err)
 
 		_, err = testDB.Exec(`DELETE FROM keys WHERE id = $1`, keyID)
-		requireRejected(t, err, "a hard delete of a key that still has translation history")
+		requireRejected(t, err, "translation_history_key_fkey",
+			"a hard delete of a key that still has translation history")
 
 		var remaining int
 		require.NoError(t, testDB.QueryRow(
@@ -243,7 +255,8 @@ func TestHistoryRowsRefuseKeyHardDelete(t *testing.T) {
 		require.NoError(t, err)
 
 		_, err = testDB.Exec(`DELETE FROM keys WHERE id = $1`, keyID)
-		requireRejected(t, err, "a hard delete of a key that still has key history")
+		requireRejected(t, err, "key_history_key_fkey",
+			"a hard delete of a key that still has key history")
 	})
 
 	t.Run("NO ACTION, not undeletable: removing the history in the open unblocks it", func(t *testing.T) {
@@ -312,7 +325,8 @@ func TestBranchTranslationRemovalConsistency(t *testing.T) {
 			INSERT INTO branch_translations
 				(branch_id, key_id, locale_id, value, is_removed, base_master_version, updated_by)
 			VALUES ($1, $2, $3, 'still here', TRUE, 1, 'test@you.co')`, branchID, keyID, enSG)
-		requireRejected(t, err, "a tombstone delta that also carries a value")
+		requireRejected(t, err, "branch_translations_removed_value_check",
+			"a tombstone delta that also carries a value")
 	})
 
 	t.Run("a non-removal must carry a value", func(t *testing.T) {
@@ -320,7 +334,8 @@ func TestBranchTranslationRemovalConsistency(t *testing.T) {
 			INSERT INTO branch_translations
 				(branch_id, key_id, locale_id, value, is_removed, base_master_version, updated_by)
 			VALUES ($1, $2, $3, NULL, FALSE, 1, 'test@you.co')`, branchID, keyID, enSG)
-		requireRejected(t, err, "an edit delta with no value")
+		requireRejected(t, err, "branch_translations_removed_value_check",
+			"an edit delta with no value")
 	})
 
 	t.Run("base_master_version 0 records that no master row existed", func(t *testing.T) {
@@ -348,7 +363,8 @@ func TestOneLiveMergeRequestPerBranch(t *testing.T) {
 	_, err = testDB.Exec(`
 		INSERT INTO merge_requests (branch_id, title, created_by)
 		VALUES ($1, 'second', 'test@you.co')`, branchID)
-	requireRejected(t, err, "a second live merge request on the same branch")
+	requireRejected(t, err, "idx_merge_requests_one_live_per_branch",
+		"a second live merge request on the same branch")
 
 	_, err = testDB.Exec(`UPDATE merge_requests SET status = 'rejected' WHERE branch_id = $1`, branchID)
 	require.NoError(t, err)
@@ -374,7 +390,8 @@ func TestAssetConstraints(t *testing.T) {
 			INSERT INTO assets (s3_key, sha256, filename, content_type, bytes, uploaded_by)
 			VALUES ('screenshots/a/b/big.png', $1, 'big.png', 'image/png', 10485761, 'test@you.co')`,
 			sha("oversized"))
-		requireRejected(t, err, "an asset one byte over the 10 MB ceiling")
+		requireRejected(t, err, "assets_size_check",
+			"an asset one byte over the 10 MB ceiling")
 	})
 
 	t.Run("exactly at the ceiling accepted", func(t *testing.T) {
@@ -390,7 +407,8 @@ func TestAssetConstraints(t *testing.T) {
 			INSERT INTO assets (s3_key, sha256, filename, content_type, bytes, uploaded_by)
 			VALUES ('screenshots/a/b/empty.png', $1, 'empty.png', 'image/png', 0, 'test@you.co')`,
 			sha("empty"))
-		requireRejected(t, err, "a zero-byte asset")
+		requireRejected(t, err, "assets_size_check",
+			"a zero-byte asset")
 	})
 
 	t.Run("disallowed content type rejected", func(t *testing.T) {
@@ -398,14 +416,16 @@ func TestAssetConstraints(t *testing.T) {
 			INSERT INTO assets (s3_key, sha256, filename, content_type, bytes, uploaded_by)
 			VALUES ('screenshots/a/b/x.svg', $1, 'x.svg', 'image/svg+xml', 100, 'test@you.co')`,
 			sha("svg"))
-		requireRejected(t, err, "an SVG upload")
+		requireRejected(t, err, "assets_content_type_check",
+			"an SVG upload")
 	})
 
 	t.Run("malformed sha256 rejected", func(t *testing.T) {
 		_, err := testDB.Exec(`
 			INSERT INTO assets (s3_key, sha256, filename, content_type, bytes, uploaded_by)
 			VALUES ('screenshots/a/b/y.png', 'NOT-A-HASH', 'y.png', 'image/png', 100, 'test@you.co')`)
-		requireRejected(t, err, "a non-hex sha256")
+		requireRejected(t, err, "assets_sha256_format_check",
+			"a non-hex sha256")
 	})
 
 	t.Run("uppercase sha256 rejected", func(t *testing.T) {
@@ -413,7 +433,8 @@ func TestAssetConstraints(t *testing.T) {
 			INSERT INTO assets (s3_key, sha256, filename, content_type, bytes, uploaded_by)
 			VALUES ('screenshots/a/b/z.png', $1, 'z.png', 'image/png', 100, 'test@you.co')`,
 			strings.ToUpper(sha("uppercase")))
-		requireRejected(t, err, "an uppercase hash — one canonical encoding, or dedupe silently misses")
+		requireRejected(t, err, "assets_sha256_format_check",
+			"an uppercase hash — one canonical encoding, or dedupe silently misses")
 	})
 
 	t.Run("identical content deduplicates", func(t *testing.T) {
@@ -426,7 +447,8 @@ func TestAssetConstraints(t *testing.T) {
 		_, err = testDB.Exec(`
 			INSERT INTO assets (s3_key, sha256, filename, content_type, bytes, uploaded_by)
 			VALUES ('screenshots/a/b/second.png', $1, 'second.png', 'image/png', 100, 'test@you.co')`, dup)
-		requireRejected(t, err, "a re-upload of identical bytes under a new key")
+		requireRejected(t, err, "assets_project_sha256_unique",
+			"a re-upload of identical bytes under a new key")
 	})
 }
 
@@ -434,7 +456,8 @@ func TestReleaseRollbackConsistency(t *testing.T) {
 	_, err := testDB.Exec(`
 		INSERT INTO releases (version, source, created_by, rolled_back_at)
 		VALUES (9001, 'merge', 'test@you.co', now())`)
-	requireRejected(t, err, "a rollback timestamp with no actor recorded")
+	requireRejected(t, err, "releases_rollback_consistency_check",
+		"a rollback timestamp with no actor recorded")
 
 	_, err = testDB.Exec(`
 		INSERT INTO releases (version, source, created_by, rolled_back_at, rolled_back_by)
@@ -443,7 +466,8 @@ func TestReleaseRollbackConsistency(t *testing.T) {
 
 	_, err = testDB.Exec(`
 		INSERT INTO releases (version, source, created_by) VALUES (9002, 'merge', 'test@you.co')`)
-	requireRejected(t, err, "a duplicate release version")
+	requireRejected(t, err, "releases_project_version_unique",
+		"a duplicate release version")
 }
 
 func TestReleaseBundleSha256Format(t *testing.T) {
@@ -455,7 +479,8 @@ func TestReleaseBundleSha256Format(t *testing.T) {
 	_, err := testDB.Exec(`
 		INSERT INTO release_bundles (release_id, locale_id, strings, sha256, key_count, byte_size)
 		VALUES ($1, $2, '{}'::JSONB, 'deadbeef', 0, 0)`, releaseID, localeID(t, "en-SG"))
-	requireRejected(t, err, "a truncated sha256 as an ETag")
+	requireRejected(t, err, "release_bundles_sha256_check",
+		"a truncated sha256 as an ETag")
 }
 
 // TestEmailIsCaseInsensitive proves citext does the work, so no call site has
@@ -465,7 +490,8 @@ func TestEmailIsCaseInsensitive(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = testDB.Exec(`INSERT INTO users (email, role) VALUES ('ashik.saini@you.co', 'viewer')`)
-	requireRejected(t, err, "the same email in different case")
+	requireRejected(t, err, "users_email_unique",
+		"the same email in different case")
 
 	var role string
 	require.NoError(t, testDB.QueryRow(
@@ -476,7 +502,8 @@ func TestEmailIsCaseInsensitive(t *testing.T) {
 func TestUserRoleAndApiTokenConstraints(t *testing.T) {
 	t.Run("unknown role rejected", func(t *testing.T) {
 		_, err := testDB.Exec(`INSERT INTO users (email, role) VALUES ('x@you.co', 'superuser')`)
-		requireRejected(t, err, "role 'superuser'")
+		requireRejected(t, err, "users_role_check",
+			"role 'superuser'")
 	})
 
 	t.Run("token hash must be unique", func(t *testing.T) {
@@ -489,13 +516,15 @@ func TestUserRoleAndApiTokenConstraints(t *testing.T) {
 		_, err = testDB.Exec(`
 			INSERT INTO api_tokens (name, token_sha256, token_prefix, created_by)
 			VALUES ('ci-2', $1, 'ul10n_aaaa', 'test@you.co')`, hash)
-		requireRejected(t, err, "a duplicate token hash")
+		requireRejected(t, err, "api_tokens_sha256_unique",
+			"a duplicate token hash")
 	})
 
 	t.Run("unknown scope rejected", func(t *testing.T) {
 		_, err := testDB.Exec(`
 			INSERT INTO api_tokens (name, token_sha256, token_prefix, scope, created_by)
 			VALUES ('bad', $1, 'ul10n_bbbb', 'admin', 'test@you.co')`, strings.Repeat("b", 64))
-		requireRejected(t, err, "scope 'admin'")
+		requireRejected(t, err, "api_tokens_scope_check",
+			"scope 'admin'")
 	})
 }

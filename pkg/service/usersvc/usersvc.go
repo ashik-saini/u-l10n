@@ -11,6 +11,12 @@
 // can ever grant the first role — the API alone cannot bootstrap itself. Grant
 // is that escape hatch, and it is the same code path as the API's SetRole so
 // the two cannot drift into disagreeing about what a valid role is.
+//
+// Both also write TWICE: users.role, which the middleware reads today, and the
+// matching user_project_roles row, which it will read after Plan 2. Two tables
+// hold the same fact for as long as V1.13's transition lasts, and a write path
+// that updated only one of them would leave a demoted admin still holding
+// admin — see Grant for the full failure.
 package usersvc
 
 import (
@@ -33,20 +39,31 @@ var log = ulog.GetLogger("u-l10n")
 // 500. An unknown role is a typo, not a fault.
 var ErrBadRequest = errors.New("bad request")
 
+// bootstrapProjectID is the project every role written here lands on.
+//
+// TODO(plan-2): both write paths below still take a role but no project, so
+// the grant they mirror into user_project_roles has to name one, and YouTrip
+// is the only project any existing operator has. It becomes a parameter when
+// the CLI and PATCH /admin/users/{email}/role learn to say which project they
+// mean.
+const bootstrapProjectID int16 = 1
+
 // Service performs user writes. It owns the transaction boundary; no repository
 // it calls opens one.
 type Service struct {
 	tx    database.Transactional
 	users repository.UserRepository
+	roles repository.UserProjectRoleRepository
 	audit repository.AuditRepository
 }
 
 func ProvideService(
 	tx database.Transactional,
 	users repository.UserRepository,
+	roles repository.UserProjectRoleRepository,
 	audit repository.AuditRepository,
 ) *Service {
-	return &Service{tx: tx, users: users, audit: audit}
+	return &Service{tx: tx, users: users, roles: roles, audit: audit}
 }
 
 // SetRole changes an existing user's role.
@@ -82,6 +99,13 @@ func (s *Service) SetRole(
 		}
 		updated = u
 
+		// The grant moves with users.role, in the SAME transaction, or the two
+		// diverge silently — see Grant below for why that divergence is a
+		// privilege escalation rather than an inconsistency.
+		if err := s.roles.Grant(ctx, tx, email, bootstrapProjectID, role, actor); err != nil {
+			return err
+		}
+
 		return s.audit.Record(ctx, tx, repository.AuditEvent{
 			Actor:  actor,
 			Action: repository.ActionUserRoleChange,
@@ -111,7 +135,7 @@ func (s *Service) SetRole(
 // chain, and that person is already more privileged than any role this table
 // can express.
 func (s *Service) Grant(
-	ctx context.Context, email, role, status, actor, requestID string,
+	ctx context.Context, email, role, status string, isPlatformAdmin bool, actor, requestID string,
 ) (repository.User, error) {
 	var granted repository.User
 
@@ -149,24 +173,39 @@ func (s *Service) Grant(
 		}
 
 		u, err := s.users.Upsert(ctx, tx, repository.User{
-			Email:  email,
-			Role:   role,
-			Status: status,
+			Email:           email,
+			Role:            role,
+			Status:          status,
+			IsPlatformAdmin: isPlatformAdmin,
 		})
 		if err != nil {
 			return err
 		}
 		granted = u
 
+		// V1.13 backfilled a project-1 grant for every user that existed then,
+		// and projectsvc.Create writes one for each new project's creator.
+		// Nothing else did — so between that migration and Plan 2, every user
+		// this command creates would have a users.role and NO grant, and every
+		// demotion would leave a stale grant behind. Both are silent today
+		// (the middleware still reads users.role) and both surface at the
+		// cutover: the first as a lockout, the second as a demoted admin
+		// quietly regaining admin. Writing both here, in one transaction, is
+		// what stops the two tables drifting while both exist.
+		if err := s.roles.Grant(ctx, tx, email, bootstrapProjectID, role, actor); err != nil {
+			return err
+		}
+
 		return s.audit.Record(ctx, tx, repository.AuditEvent{
 			Actor:  actor,
 			Action: repository.ActionUserGrant,
 			Target: "user:" + email,
 			Metadata: map[string]any{
-				"from":   previous,
-				"to":     u.Role,
-				"status": u.Status,
-				"via":    "cli",
+				"from":           previous,
+				"to":             u.Role,
+				"status":         u.Status,
+				"platform_admin": u.IsPlatformAdmin,
+				"via":            "cli",
 			},
 			RequestID: requestID,
 		})
@@ -176,7 +215,8 @@ func (s *Service) Grant(
 	}
 
 	log.Infow(ctx, "user granted",
-		"email", granted.Email, "role", granted.Role, "status", granted.Status, "actor", actor)
+		"email", granted.Email, "role", granted.Role, "status", granted.Status,
+		"platform_admin", granted.IsPlatformAdmin, "actor", actor)
 	return granted, nil
 }
 

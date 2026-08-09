@@ -21,7 +21,7 @@ type stubLocales struct {
 	byCode map[string]model.Locale
 }
 
-func (s *stubLocales) List(context.Context, *gorm.DB) ([]model.Locale, error) {
+func (s *stubLocales) List(context.Context, *gorm.DB, int16, bool) ([]model.Locale, error) {
 	out := make([]model.Locale, 0, len(s.byCode))
 	for _, l := range s.byCode {
 		out = append(out, l)
@@ -29,12 +29,20 @@ func (s *stubLocales) List(context.Context, *gorm.DB) ([]model.Locale, error) {
 	return out, nil
 }
 
-func (s *stubLocales) ByCode(_ context.Context, _ *gorm.DB, code string) (model.Locale, error) {
+func (s *stubLocales) ByCode(_ context.Context, _ *gorm.DB, _ int16, code string) (model.Locale, error) {
 	l, ok := s.byCode[code]
 	if !ok {
 		return model.Locale{}, fmt.Errorf("locale %q: %w", code, repository.ErrNotFound)
 	}
 	return l, nil
+}
+
+func (s *stubLocales) Create(context.Context, *gorm.DB, model.Locale) (model.Locale, error) {
+	return model.Locale{}, fmt.Errorf("stubLocales: Create not needed by this test")
+}
+
+func (s *stubLocales) Update(context.Context, *gorm.DB, int16, string, model.Locale) (model.Locale, error) {
+	return model.Locale{}, fmt.Errorf("stubLocales: Update not needed by this test")
 }
 
 // stubReleases records what ServableBundle was asked. The embedded interface
@@ -75,7 +83,10 @@ func otaRequest(h *Handler, target, appVersion string) *httptest.ResponseRecorde
 func otaHandler(releases *stubReleases) *Handler {
 	return &Handler{
 		locales: &stubLocales{byCode: map[string]model.Locale{
-			"en-SG": {ID: 1, Code: "en-SG"},
+			// Status is explicit because the handler now reads it: a locale
+			// with an unset status is not active, so leaving it zero would 404
+			// every test in this file.
+			"en-SG": {ID: 1, Code: "en-SG", Status: repository.LocaleActive},
 		}},
 		releases: releases,
 	}
@@ -130,6 +141,35 @@ func TestOTABundleNegativeResponsesAreCacheable(t *testing.T) {
 
 		assert.Equal(t, http.StatusNotFound, rec.Code)
 		assert.Equal(t, "public, max-age=60", rec.Header().Get("Cache-Control"))
+	})
+
+	// An archived locale is the state this branch introduced, and it is the one
+	// negative answer OTA did not have. releasesvc.Publish and mergesvc
+	// materialise bundles for ACTIVE locales only, so nothing ever refreshes an
+	// archived locale's bundle — but the last one is still in release_bundles,
+	// so before this check the endpoint answered 200 with it forever and every
+	// client froze on stale copy instead of falling back to the strings shipped
+	// in the binary. The stub returns a perfectly good bundle here precisely so
+	// that a handler which forgot the status check would answer 200 and fail.
+	t.Run("an archived locale is a cacheable 404", func(t *testing.T) {
+		releases := &stubReleases{bundle: repository.ServableBundle{
+			ReleaseVersion: 41, Strings: []byte(`{"a":"b"}`), SHA256: "abc",
+		}}
+		h := &Handler{
+			locales: &stubLocales{byCode: map[string]model.Locale{
+				"en-SG": {ID: 1, Code: "en-SG", Status: repository.LocaleArchived},
+			}},
+			releases: releases,
+		}
+		rec := otaRequest(h, "/ota/v1/bundles/en-SG", "")
+
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+		assert.Equal(t, "public, max-age=60", rec.Header().Get("Cache-Control"))
+		assert.Contains(t, rec.Body.String(), "unknown_locale",
+			"an archived locale answers exactly as an unknown one does — from a "+
+				"client's point of view that is what it has become")
+		assert.Empty(t, releases.appVersions,
+			"an archived locale must not reach the bundle lookup at all")
 	})
 
 	t.Run("no release yet is a cacheable 404", func(t *testing.T) {

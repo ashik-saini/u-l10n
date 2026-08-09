@@ -18,6 +18,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mrsvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/projectsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/releasesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/tagsvc"
 )
@@ -196,7 +197,8 @@ func (h *Handler) portalError(w http.ResponseWriter, r *http.Request, op string,
 		errors.Is(err, branchsvc.ErrBadRequest),
 		errors.Is(err, mrsvc.ErrBadRequest),
 		errors.Is(err, tagsvc.ErrBadRequest),
-		errors.Is(err, releasesvc.ErrBadRequest):
+		errors.Is(err, releasesvc.ErrBadRequest),
+		errors.Is(err, projectsvc.ErrBadRequest):
 		h.badRequest(w, r, err)
 
 	// --- 404: the thing addressed does not exist ----------------------------
@@ -218,6 +220,24 @@ func (h *Handler) portalError(w http.ResponseWriter, r *http.Request, op string,
 		errors.Is(err, repository.ErrBranchNameTaken):
 		render.Status(r, http.StatusConflict)
 		render.JSON(w, r, errorResponse{Error: "name_taken", Details: err.Error()})
+
+	// A project code is a slug, and it appears in URLs — the taken/free split
+	// is the caller's mistake to fix, exactly like a name collision above.
+	case errors.Is(err, repository.ErrProjectCodeTaken):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, errorResponse{Error: "project_code_taken", Details: err.Error()})
+
+	// A locale code is likewise the caller's mistake to fix: the project
+	// already has one.
+	case errors.Is(err, repository.ErrLocaleCodeTaken):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, errorResponse{Error: "locale_code_taken", Details: err.Error()})
+
+	// Left to the database's UNIQUE (project_id, flutter_dir|android_values_dir|ios_lproj)
+	// rather than pre-checked — see LocaleRepository.Create's doc comment for why.
+	case errors.Is(err, repository.ErrLocaleDirectoryTaken):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, errorResponse{Error: "locale_directory_taken", Details: err.Error()})
 
 	case errors.Is(err, keysvc.ErrBranchNotOpen),
 		errors.Is(err, branchsvc.ErrBranchNotOpen):

@@ -213,11 +213,25 @@ func insertKey(t *testing.T, name string) int64 {
 	return id
 }
 
-// localeID resolves a locale code to its surrogate id.
+// localeID resolves a locale code to its surrogate id, within YouTrip.
+//
+// The project filter is load-bearing, not decoration. V1.10 dropped
+// locales_code_unique in favour of UNIQUE (project_id, code) so a second
+// project may ship its own en-SG — and three tests in this package now insert
+// exactly that. Unfiltered, this SELECT would return whichever row the planner
+// reached first while such a fixture was alive, so every test that pairs a
+// YouTrip key with "the" en-SG would silently start exercising a cross-project
+// foreign key instead of the thing it was written for, going red only under
+// -shuffle=on or a narrowed -run.
+//
+// TODO(plan-2): the literal 1 is the same hardcoded YouTrip scope the
+// production call sites carry. It becomes a parameter when the tests that need
+// another project's locale ask for it by project.
 func localeID(t *testing.T, code string) int16 {
 	t.Helper()
 	var id int16
-	if err := testDB.QueryRow(`SELECT id FROM locales WHERE code = $1`, code).Scan(&id); err != nil {
+	if err := testDB.QueryRow(
+		`SELECT id FROM locales WHERE code = $1 AND project_id = 1`, code).Scan(&id); err != nil {
 		t.Fatalf("locale %q: %v", code, err)
 	}
 	return id
@@ -265,28 +279,106 @@ func testGORM(t *testing.T) database.GORMConnector {
 	return gormConnector{db: gormHandle}
 }
 
-// requireRejected asserts that a statement was refused BY A CONSTRAINT.
+// requireRejected asserts that a statement was refused BY THE NAMED CONSTRAINT.
 //
 // The assertion is deliberately on the error, not on a row count: these tests
 // exist to prove the constraint fires, and a silently-succeeding write is the
 // exact failure they are written to catch.
 //
-// "Any error" is not good enough. A typo'd column name fails with SQLSTATE
-// 42703 and would satisfy a bare nil-check, turning a broken test into a
-// passing one. So when the driver's error is in the chain, it must be class 23
-// (integrity constraint violation: 23502 NOT NULL, 23503 FK, 23505 unique,
-// 23514 CHECK). A chain with no *pq.Error in it is a repository that detected
-// the refusal without surfacing the driver — e.g. ON CONFLICT DO NOTHING
-// returning no row, mapped to a typed sentinel like ErrTagNameTaken — and such
-// call sites assert the specific sentinel themselves, right next to this call.
-func requireRejected(t *testing.T, err error, what string) {
+// NAMING THE CONSTRAINT IS THE WHOLE POINT. An earlier version of this helper
+// accepted any SQLSTATE class 23, which lumps 23502 NOT NULL and 23514 CHECK in
+// with the 23503 FK and 23505 unique violations these tests are actually about.
+// That is precisely how five hollow tests reached review on this branch: a row
+// missing a NOT NULL column never reaches the foreign key it was written to
+// exercise, yet the test went green. Postgres populates the error's
+// constraint_name field for FK, unique and CHECK violations — including
+// violations of a bare CREATE UNIQUE INDEX, which reports the index name — so
+// the discrimination costs one string.
+//
+// Get the name from the migration that declares it, not from a guess: a wrong
+// name fails loudly here, which is the point, but a name copied from the
+// failure message proves nothing about what the test MEANT to exercise.
+//
+// Two rejections cannot name a constraint, and each has its own helper below
+// rather than a loophole in this one: requireRejectedNotNull (23502 carries a
+// column, not a constraint) and requireRejectedBySentinel (the repository
+// detected the refusal without the driver ever erroring).
+func requireRejected(t *testing.T, err error, constraint, what string) {
 	t.Helper()
 	if err == nil {
-		t.Fatalf("expected the database to reject %s, but it was accepted", what)
+		t.Fatalf("expected the database to reject %s (constraint %s), but it was accepted",
+			what, constraint)
 	}
+
 	var pqErr *pq.Error
-	if errors.As(err, &pqErr) && pqErr.Code.Class() != "23" {
+	if !errors.As(err, &pqErr) {
+		t.Fatalf("expected constraint %s to reject %s, but the chain carries no *pq.Error "+
+			"— if the repository maps this refusal to a sentinel, use "+
+			"requireRejectedBySentinel: %v", constraint, what, err)
+	}
+	if pqErr.Code.Class() != "23" {
 		t.Fatalf("expected a constraint violation (SQLSTATE class 23) rejecting %s, "+
 			"got SQLSTATE %s (%s): %v", what, pqErr.Code, pqErr.Code.Name(), err)
+	}
+	if pqErr.Constraint != constraint {
+		t.Fatalf("expected constraint %s to reject %s, but %s fired instead "+
+			"(SQLSTATE %s): %v", constraint, what, pqErr.Constraint, pqErr.Code, err)
+	}
+}
+
+// requireRejectedNotNull asserts a NOT NULL rejection on a named column.
+//
+// 23502 is the one class-23 violation Postgres does NOT attach a constraint
+// name to — it reports the column instead — so these sites cannot go through
+// requireRejected. Asserting the column keeps the discrimination anyway: a row
+// rejected for the wrong missing column is as hollow as one rejected by the
+// wrong constraint.
+//
+// Use this ONLY where the NOT NULL is itself the thing under test. A NOT NULL
+// that fires because the test forgot a column is the bug this whole family of
+// helpers exists to expose.
+func requireRejectedNotNull(t *testing.T, err error, column, what string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected the database to reject %s (NOT NULL on %s), but it was accepted",
+			what, column)
+	}
+
+	var pqErr *pq.Error
+	if !errors.As(err, &pqErr) {
+		t.Fatalf("expected a NOT NULL violation on %s rejecting %s, "+
+			"but the chain carries no *pq.Error: %v", column, what, err)
+	}
+	if pqErr.Code != "23502" {
+		t.Fatalf("expected a NOT NULL violation (SQLSTATE 23502) rejecting %s, "+
+			"got SQLSTATE %s (%s): %v", what, pqErr.Code, pqErr.Code.Name(), err)
+	}
+	if pqErr.Column != column {
+		t.Fatalf("expected the NOT NULL on %s to reject %s, but column %s was the null one: %v",
+			column, what, pqErr.Column, err)
+	}
+}
+
+// requireRejectedBySentinel asserts a refusal the repository detected WITHOUT
+// the driver ever raising an error.
+//
+// The shape is ON CONFLICT ... DO NOTHING followed by RETURNING: the conflict
+// yields no row, and the repository maps "no row" to a typed sentinel —
+// ErrTagNameTaken, ErrBranchNameTaken. That is deliberate (it keeps the check
+// race-free and the driver's wording out of our control flow), and it means
+// there is no *pq.Error and therefore no constraint name to assert. Every call
+// site must assert the specific sentinel itself, right next to this call;
+// otherwise this helper proves only that SOMETHING went wrong.
+func requireRejectedBySentinel(t *testing.T, err error, what string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected the repository to reject %s, but it was accepted", what)
+	}
+
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		t.Fatalf("expected %s to be refused without a driver error, but SQLSTATE %s (%s) "+
+			"surfaced — name the constraint and use requireRejected instead: %v",
+			what, pqErr.Code, pqErr.Code.Name(), err)
 	}
 }

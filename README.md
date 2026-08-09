@@ -4,8 +4,10 @@ In-house localization service — the source of truth for mobile translation key
 the byte-exact export engine, and the over-the-air string delivery endpoint
 (releases with ETag/304 revalidation and a rollback kill switch).
 
-Replaces [Lokalise](https://lokalise.com) for the YouTrip mobile apps: ~6,300
-keys across 6 locales, exported to Flutter JSON, Android XML and iOS `.strings`.
+Replaces [Lokalise](https://lokalise.com). Began with the YouTrip mobile apps
+(~6,300 keys across 6 locales, exported to Flutter JSON, Android XML and iOS
+`.strings`) and now serves any number of projects, each with its own keys and
+locales — see `docs/DATA_MODEL.md`.
 
 **Design documents**
 
