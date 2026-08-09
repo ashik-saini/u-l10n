@@ -44,12 +44,22 @@ func portalRouterPlatformAdmin(t *testing.T, email, role string, isPlatformAdmin
 // portalRouterForUser is the construction shared by portalRouter and
 // portalRouterPlatformAdmin, factored out so the two cannot drift into
 // wiring the stub authenticator two different ways.
-func portalRouterForUser(t *testing.T, u repository.User) http.Handler {
+//
+// mutate is applied to the Handler after it is built and before the router
+// is assembled, for the rare test that needs a working service rather than
+// the deliberate nil every other caller relies on — see
+// TestListProjectsIsNotGatedByPlatformAdmin, which needs ListProjects to
+// actually complete rather than panic, to tell "not gated" apart from
+// "unreachable for an unrelated reason".
+func portalRouterForUser(t *testing.T, u repository.User, mutate ...func(*Handler)) http.Handler {
 	t.Helper()
 
 	verifier := &stubVerifier{info: googleauth.TokenInfo{Email: u.Email}}
 	users := &stubUsers{byEmail: map[string]repository.User{u.Email: u}}
 	handler := identityHandler(verifier, users)
+	for _, m := range mutate {
+		m(handler)
+	}
 	return ProvideRoutes(&apm.ApmConfig{}, handler.cnf, handler)
 }
 

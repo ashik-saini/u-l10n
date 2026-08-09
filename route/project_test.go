@@ -1,6 +1,7 @@
 package route
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -8,8 +9,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jinzhu/gorm"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/yougroupteam/u-common-components/database"
+
+	"github.com/yougroupteam/u-l10n/pkg/model"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
 	"github.com/yougroupteam/u-l10n/pkg/service/projectsvc"
 )
@@ -80,4 +86,75 @@ func TestProjectRoutesRejectUnknownQueryParameters(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Contains(t, w.Body.String(), "typo")
+}
+
+// --- doubles for a WORKING project service ----------------------------------
+//
+// Every other test in this file relies on the Handler's services being nil,
+// so a request that reaches one panics rather than quietly passing — the
+// convention documented on portalRouter. That convention is exactly wrong for
+// TestListProjectsIsNotGatedByPlatformAdmin below: a panic and a 403 are both
+// "not a 200", so a nil projectSvc could never tell "the route isn't gated"
+// apart from "the route panicked for an unrelated reason". These doubles
+// exist so that ONE test can drive a real, completing request instead.
+
+type fakeProjectRepo struct{ projects []model.Project }
+
+func (f fakeProjectRepo) ByCode(context.Context, *gorm.DB, string) (model.Project, error) {
+	return model.Project{}, repository.ErrNotFound
+}
+func (f fakeProjectRepo) ByID(context.Context, *gorm.DB, int16) (model.Project, error) {
+	return model.Project{}, repository.ErrNotFound
+}
+func (f fakeProjectRepo) List(context.Context, *gorm.DB, bool) ([]model.Project, error) {
+	return f.projects, nil
+}
+func (f fakeProjectRepo) Create(context.Context, *gorm.DB, model.Project) (model.Project, error) {
+	return model.Project{}, errors.New("fakeProjectRepo: Create not needed by this test")
+}
+func (f fakeProjectRepo) Update(context.Context, *gorm.DB, int16, string, string, string) (model.Project, error) {
+	return model.Project{}, errors.New("fakeProjectRepo: Update not needed by this test")
+}
+
+type fakeRoleRepo struct{}
+
+func (fakeRoleRepo) Grant(context.Context, *gorm.DB, string, int16, string, string) error {
+	return errors.New("fakeRoleRepo: Grant not needed by this test")
+}
+
+// fakeTx runs the body directly, on no connection at all — every method the
+// two fakes above actually exercise ignores the *gorm.DB it is handed.
+type fakeTx struct{}
+
+func (fakeTx) WithTransaction(_ context.Context, fn database.TransactionFunc) error {
+	return fn(nil)
+}
+
+// TestListProjectsIsNotGatedByPlatformAdmin proves GET /projects sits in the
+// viewer group, not behind requirePlatformAdmin.
+//
+// route/key_test.go's own reasoning for driving the real router applies here
+// too: a route accidentally mounted in the wrong group is invisible to a test
+// of the handler in isolation. If ListProjects ever landed behind
+// requirePlatformAdmin, every non-platform-admin operator — which is nearly
+// everyone — would be locked out of listing projects at all, and nothing
+// else in this suite would notice.
+func TestListProjectsIsNotGatedByPlatformAdmin(t *testing.T) {
+	u := user("v@you.co", repository.RoleViewer, repository.StatusActive)
+	u.IsPlatformAdmin = false
+
+	router := portalRouterForUser(t, u, func(h *Handler) {
+		h.projectSvc = projectsvc.ProvideService(fakeTx{}, fakeProjectRepo{}, fakeRoleRepo{})
+	})
+
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	r.Header.Set("Authorization", "Bearer ya29.good")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, r)
+
+	require.NotEqual(t, http.StatusForbidden, w.Code,
+		"a plain viewer, not a platform admin, must not be refused here")
+	assert.NotContains(t, w.Body.String(), "forbidden")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.JSONEq(t, `{"projects":[]}`, w.Body.String())
 }
