@@ -28,11 +28,27 @@ import (
 // downstream.
 func portalRouter(t *testing.T, email, role string) http.Handler {
 	t.Helper()
+	return portalRouterForUser(t, user(email, role, repository.StatusActive))
+}
 
-	verifier := &stubVerifier{info: googleauth.TokenInfo{Email: email}}
-	users := &stubUsers{byEmail: map[string]repository.User{
-		email: user(email, role, repository.StatusActive),
-	}}
+// portalRouterPlatformAdmin is portalRouter with control over the global
+// privilege. Project creation is the one thing a project admin may not do,
+// so the flag has to be settable independently of the role.
+func portalRouterPlatformAdmin(t *testing.T, email, role string, isPlatformAdmin bool) http.Handler {
+	t.Helper()
+	u := user(email, role, repository.StatusActive)
+	u.IsPlatformAdmin = isPlatformAdmin
+	return portalRouterForUser(t, u)
+}
+
+// portalRouterForUser is the construction shared by portalRouter and
+// portalRouterPlatformAdmin, factored out so the two cannot drift into
+// wiring the stub authenticator two different ways.
+func portalRouterForUser(t *testing.T, u repository.User) http.Handler {
+	t.Helper()
+
+	verifier := &stubVerifier{info: googleauth.TokenInfo{Email: u.Email}}
+	users := &stubUsers{byEmail: map[string]repository.User{u.Email: u}}
 	handler := identityHandler(verifier, users)
 	return ProvideRoutes(&apm.ApmConfig{}, handler.cnf, handler)
 }

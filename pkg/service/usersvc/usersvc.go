@@ -111,7 +111,7 @@ func (s *Service) SetRole(
 // chain, and that person is already more privileged than any role this table
 // can express.
 func (s *Service) Grant(
-	ctx context.Context, email, role, status, actor, requestID string,
+	ctx context.Context, email, role, status string, isPlatformAdmin bool, actor, requestID string,
 ) (repository.User, error) {
 	var granted repository.User
 
@@ -149,9 +149,10 @@ func (s *Service) Grant(
 		}
 
 		u, err := s.users.Upsert(ctx, tx, repository.User{
-			Email:  email,
-			Role:   role,
-			Status: status,
+			Email:           email,
+			Role:            role,
+			Status:          status,
+			IsPlatformAdmin: isPlatformAdmin,
 		})
 		if err != nil {
 			return err
@@ -163,10 +164,11 @@ func (s *Service) Grant(
 			Action: repository.ActionUserGrant,
 			Target: "user:" + email,
 			Metadata: map[string]any{
-				"from":   previous,
-				"to":     u.Role,
-				"status": u.Status,
-				"via":    "cli",
+				"from":           previous,
+				"to":             u.Role,
+				"status":         u.Status,
+				"platform_admin": u.IsPlatformAdmin,
+				"via":            "cli",
 			},
 			RequestID: requestID,
 		})
@@ -176,7 +178,8 @@ func (s *Service) Grant(
 	}
 
 	log.Infow(ctx, "user granted",
-		"email", granted.Email, "role", granted.Role, "status", granted.Status, "actor", actor)
+		"email", granted.Email, "role", granted.Role, "status", granted.Status,
+		"platform_admin", granted.IsPlatformAdmin, "actor", actor)
 	return granted, nil
 }
 

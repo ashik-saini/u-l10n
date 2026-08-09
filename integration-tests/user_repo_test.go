@@ -1,10 +1,13 @@
 package integrationtests
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/yougroupteam/u-l10n/pkg/repository"
 )
 
 // These mirror the statements pkg/repository/user.go issues, following the same
@@ -106,6 +109,40 @@ func TestUserUpdatedAtMoves(t *testing.T) {
 	require.NoError(t, testDB.QueryRow(
 		`SELECT updated_at::text FROM users WHERE email = $1`, "touched@you.co").Scan(&after))
 	assert.NotEqual(t, before, after)
+}
+
+// TestUserRepositoryPersistsPlatformAdmin drives the real repository (rather
+// than mirroring its SQL, like the rest of this file) because is_platform_admin
+// is read straight off the row RequireIdentity loads — a scan that silently
+// dropped the column would leave every platform admin locked out of creating
+// a second project, with no error anywhere to catch it.
+func TestUserRepositoryPersistsPlatformAdmin(t *testing.T) {
+	ctx := context.Background()
+	repo := repository.ProvideUserRepository(testGORM(t))
+	t.Cleanup(func() {
+		_, _ = testDB.Exec(`DELETE FROM users WHERE email = $1`, "platform-admin@you.co")
+	})
+
+	created, err := repo.Upsert(ctx, nil, repository.User{
+		Email: "platform-admin@you.co", Role: repository.RoleAdmin,
+		Status: repository.StatusActive, IsPlatformAdmin: true,
+	})
+	require.NoError(t, err)
+	assert.True(t, created.IsPlatformAdmin)
+
+	fetched, err := repo.ByEmail(ctx, nil, "platform-admin@you.co")
+	require.NoError(t, err)
+	assert.True(t, fetched.IsPlatformAdmin, "the flag must survive a fresh read, not just the Upsert return value")
+
+	// Upsert writes the full desired state on every call, the same rule it
+	// already applies to role and status — re-granting without the flag
+	// revokes it rather than leaving it untouched.
+	demoted, err := repo.Upsert(ctx, nil, repository.User{
+		Email: "platform-admin@you.co", Role: repository.RoleAdmin,
+		Status: repository.StatusActive, IsPlatformAdmin: false,
+	})
+	require.NoError(t, err)
+	assert.False(t, demoted.IsPlatformAdmin)
 }
 
 // TestUserRoleAndStatusAreConstrained. The service validates first so a typo is

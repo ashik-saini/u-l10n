@@ -26,6 +26,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mrsvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/projectsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/releasesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/seed"
 	"github.com/yougroupteam/u-l10n/pkg/service/tagsvc"
@@ -99,18 +100,22 @@ func injectService(ctx context.Context) (*Service, error) {
 	mrsvcService := mrsvc.ProvideService(transactional, branchRepository, mergeRequestRepository, localeRepository, mergesvcService, auditRepository)
 	tagsvcService := tagsvc.ProvideService(transactional, tagRepository, auditRepository)
 	releasesvcService := releasesvc.ProvideService(transactional, releaseRepository, localeRepository, exportRowReader, auditRepository)
-	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository, localeRepository, releaseRepository, assetsvcService, verifier, userRepository, usersvcService, keysvcService, branchsvcService, mrsvcService, tagsvcService, releasesvcService)
+	projectRepository := repository.ProvideProjectRepository(gormConnector)
+	userProjectRoleRepository := repository.ProvideUserProjectRoleRepository(gormConnector)
+	projectsvcService := projectsvc.ProvideService(transactional, projectRepository, userProjectRoleRepository)
+	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository, localeRepository, releaseRepository, assetsvcService, verifier, userRepository, usersvcService, keysvcService, branchsvcService, mrsvcService, tagsvcService, releasesvcService, projectsvcService)
 	httpHandler := route.ProvideRoutes(apmConfig, configConfig, handler)
 	seedService := seed.ProvideService(transactional, localeRepository, keyRepository, translationRepository)
 	importsvcService := importsvc.ProvideService(transactional, localeRepository, keyRepository, translationRepository)
 	mainService := &Service{
-		Config:  configConfig,
-		Handler: httpHandler,
-		Seed:    seedService,
-		Tokens:  apiTokenRepository,
-		Merge:   mergesvcService,
-		Import:  importsvcService,
-		Users:   usersvcService,
+		Config:   configConfig,
+		Handler:  httpHandler,
+		Seed:     seedService,
+		Tokens:   apiTokenRepository,
+		Merge:    mergesvcService,
+		Import:   importsvcService,
+		Users:    usersvcService,
+		Projects: projectsvcService,
 	}
 	return mainService, nil
 }

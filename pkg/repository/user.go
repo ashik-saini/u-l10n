@@ -19,12 +19,17 @@ import (
 // every future change. Google answers "who is this?"; this table answers "what
 // may they do?".
 type User struct {
-	ID        int64
-	Email     string
-	Role      string
-	Status    string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID     int64
+	Email  string
+	Role   string
+	Status string
+	// IsPlatformAdmin is the one privilege that is not scoped to a project:
+	// creating a project and granting its first role. Everything else a
+	// person may do is decided per project, in user_project_roles — see
+	// .db/V1.13__scope_identity.sql.
+	IsPlatformAdmin bool
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // Roles, in ascending order of privilege. The ordering is the point: middleware
@@ -78,11 +83,11 @@ func ProvideUserRepository(connector database.GORMConnector) UserRepository {
 	return &userRepository{base{connector: connector}}
 }
 
-const selectUserColumns = `id, email, role, status, created_at, updated_at`
+const selectUserColumns = `id, email, role, status, is_platform_admin, created_at, updated_at`
 
 func scanUser(row *sql.Row) (User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.Email, &u.Role, &u.Status, &u.CreatedAt, &u.UpdatedAt)
+	err := row.Scan(&u.ID, &u.Email, &u.Role, &u.Status, &u.IsPlatformAdmin, &u.CreatedAt, &u.UpdatedAt)
 	return u, err
 }
 
@@ -109,14 +114,15 @@ func (r *userRepository) ByEmail(ctx context.Context, tx *gorm.DB, email string)
 // updated_at is set explicitly: there is no trigger on this table, and a column
 // that only ever holds its insert-time default is worse than no column at all.
 const upsertUserSQL = `
-INSERT INTO users (email, role, status)
-VALUES ($1, $2, $3)
+INSERT INTO users (email, role, status, is_platform_admin)
+VALUES ($1, $2, $3, $4)
 ON CONFLICT (email) DO UPDATE
-   SET role = EXCLUDED.role, status = EXCLUDED.status, updated_at = now()
+   SET role = EXCLUDED.role, status = EXCLUDED.status,
+       is_platform_admin = EXCLUDED.is_platform_admin, updated_at = now()
 RETURNING ` + selectUserColumns
 
 func (r *userRepository) Upsert(ctx context.Context, tx *gorm.DB, u User) (User, error) {
-	row := r.db(ctx, tx).Raw(upsertUserSQL, u.Email, u.Role, u.Status).Row()
+	row := r.db(ctx, tx).Raw(upsertUserSQL, u.Email, u.Role, u.Status, u.IsPlatformAdmin).Row()
 
 	created, err := scanUser(row)
 	if err != nil {
@@ -137,7 +143,7 @@ func (r *userRepository) List(ctx context.Context, tx *gorm.DB) ([]User, error) 
 	for rows.Next() {
 		var u User
 		if err := rows.Scan(&u.ID, &u.Email, &u.Role, &u.Status,
-			&u.CreatedAt, &u.UpdatedAt); err != nil {
+			&u.IsPlatformAdmin, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan user: %w", err)
 		}
 		out = append(out, u)

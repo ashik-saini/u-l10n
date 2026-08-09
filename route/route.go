@@ -27,6 +27,7 @@ import (
 	"github.com/yougroupteam/u-l10n/pkg/service/exportsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/keysvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mrsvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/projectsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/releasesvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/tagsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/usersvc"
@@ -75,6 +76,12 @@ type Handler struct {
 	// releaseSvc backs the release history, the manual publish and the OTA
 	// kill switch.
 	releaseSvc *releasesvc.Service
+
+	// projectSvc backs the project list every operator can read, and the
+	// create/patch pair gated by requirePlatformAdmin below — minting a
+	// project and granting its first, admin role is the one privilege that
+	// is not scoped to a project.
+	projectSvc *projectsvc.Service
 }
 
 func ProvideHandler(
@@ -93,6 +100,7 @@ func ProvideHandler(
 	mrSvc *mrsvc.Service,
 	tagSvc *tagsvc.Service,
 	releaseSvc *releasesvc.Service,
+	projectSvc *projectsvc.Service,
 ) *Handler {
 	return &Handler{
 		cnf:        cnf,
@@ -110,6 +118,7 @@ func ProvideHandler(
 		mrSvc:      mrSvc,
 		tagSvc:     tagSvc,
 		releaseSvc: releaseSvc,
+		projectSvc: projectSvc,
 	}
 }
 
@@ -209,6 +218,11 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 			r.Get("/releases", handler.ListReleases)
 			r.Get("/releases/{version}", handler.GetRelease)
 			r.Get("/releases/{version}/bundles/{locale}", handler.ReleaseBundle)
+
+			// Knowing which projects exist is reading, not administering
+			// one — creating or reconfiguring a project sits behind the
+			// platform-admin group below.
+			r.Get("/projects", handler.ListProjects)
 		})
 
 		// Writing the corpus. Editor, and no higher: writing to a BRANCH is the
@@ -266,6 +280,17 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 		r.Group(func(r chi.Router) {
 			r.Use(handler.RequireIdentity(repository.RoleAdmin))
 			r.Patch("/admin/users/{email}/role", handler.SetUserRole)
+		})
+
+		// Minting a project, and granting its first role, is the one
+		// privilege that is not scoped to a project — no per-project role
+		// can apply to a project that does not exist yet. requirePlatformAdmin
+		// runs after RequireIdentity and reads the flag it already loaded.
+		r.Group(func(r chi.Router) {
+			r.Use(handler.RequireIdentity(repository.RoleViewer))
+			r.Use(handler.requirePlatformAdmin)
+			r.Post("/projects", handler.CreateProject)
+			r.Patch("/projects/{project}", handler.PatchProject)
 		})
 	})
 

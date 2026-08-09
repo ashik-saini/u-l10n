@@ -47,6 +47,7 @@ var WireSet = wire.NewSet(
 	ProvideAuditRepository,
 	ProvideTagRepository,
 	ProvideUserRepository,
+	ProvideUserProjectRoleRepository,
 )
 
 // base carries the connection plumbing shared by every repository.

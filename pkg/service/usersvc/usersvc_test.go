@@ -209,7 +209,7 @@ func TestGrantCreatesTheFirstAdmin(t *testing.T) {
 	h := newHarness()
 
 	granted, err := h.svc.Grant(context.Background(),
-		"ashik.saini@you.co", repository.RoleAdmin, "", "ashik.saini@you.co", "cli")
+		"ashik.saini@you.co", repository.RoleAdmin, "", false, "ashik.saini@you.co", "cli")
 	require.NoError(t, err)
 	assert.Equal(t, repository.RoleAdmin, granted.Role)
 	// Status defaults to active: an operator created without one is meant to be
@@ -227,10 +227,10 @@ func TestGrantIsIdempotentAndPromotes(t *testing.T) {
 	h := newHarness()
 	ctx := context.Background()
 
-	_, err := h.svc.Grant(ctx, "a@you.co", repository.RoleViewer, "", "boot@you.co", "cli")
+	_, err := h.svc.Grant(ctx, "a@you.co", repository.RoleViewer, "", false, "boot@you.co", "cli")
 	require.NoError(t, err)
 
-	promoted, err := h.svc.Grant(ctx, "a@you.co", repository.RoleAdmin, "", "boot@you.co", "cli")
+	promoted, err := h.svc.Grant(ctx, "a@you.co", repository.RoleAdmin, "", false, "boot@you.co", "cli")
 	require.NoError(t, err)
 	assert.Equal(t, repository.RoleAdmin, promoted.Role)
 	assert.Len(t, h.users.rows, 1, "re-granting must not create a second row")
@@ -244,14 +244,14 @@ func TestGrantRefusals(t *testing.T) {
 
 	t.Run("unknown role", func(t *testing.T) {
 		h := newHarness()
-		_, err := h.svc.Grant(ctx, "a@you.co", "root", "", "boot@you.co", "cli")
+		_, err := h.svc.Grant(ctx, "a@you.co", "root", "", false, "boot@you.co", "cli")
 		assert.ErrorIs(t, err, ErrBadRequest)
 		assert.Zero(t, h.users.upsertAt)
 	})
 
 	t.Run("unknown status", func(t *testing.T) {
 		h := newHarness()
-		_, err := h.svc.Grant(ctx, "a@you.co", repository.RoleAdmin, "suspended", "boot@you.co", "cli")
+		_, err := h.svc.Grant(ctx, "a@you.co", repository.RoleAdmin, "suspended", false, "boot@you.co", "cli")
 		assert.ErrorIs(t, err, ErrBadRequest)
 		assert.Zero(t, h.users.upsertAt)
 	})
@@ -260,14 +260,14 @@ func TestGrantRefusals(t *testing.T) {
 		// audit_events.actor is NOT NULL, and a blank actor answers nothing. The
 		// CLI has no authenticated principal, so the human must name themselves.
 		h := newHarness()
-		_, err := h.svc.Grant(ctx, "a@you.co", repository.RoleAdmin, "", "  ", "cli")
+		_, err := h.svc.Grant(ctx, "a@you.co", repository.RoleAdmin, "", false, "  ", "cli")
 		assert.ErrorIs(t, err, ErrBadRequest)
 		assert.Zero(t, h.users.upsertAt)
 	})
 
 	t.Run("rubbish email", func(t *testing.T) {
 		h := newHarness()
-		_, err := h.svc.Grant(ctx, "nobody", repository.RoleAdmin, "", "boot@you.co", "cli")
+		_, err := h.svc.Grant(ctx, "nobody", repository.RoleAdmin, "", false, "boot@you.co", "cli")
 		assert.ErrorIs(t, err, ErrBadRequest)
 		assert.Zero(t, h.users.upsertAt)
 	})
@@ -280,9 +280,30 @@ func TestGrantCanDisable(t *testing.T) {
 	h := newHarness()
 	ctx := context.Background()
 
-	_, err := h.svc.Grant(ctx, "gone@you.co", repository.RoleAdmin, repository.StatusDisabled, "boot@you.co", "cli")
+	_, err := h.svc.Grant(ctx, "gone@you.co", repository.RoleAdmin, repository.StatusDisabled, false, "boot@you.co", "cli")
 	require.NoError(t, err)
 	assert.Equal(t, repository.StatusDisabled, h.users.rows["gone@you.co"].Status)
+}
+
+// TestGrantCanSetPlatformAdmin: without this flag there is no way to create
+// the first platform admin, and the API cannot bootstrap itself — creating a
+// project requires holding the flag, and nothing but this CLI path can set it
+// on an empty database.
+func TestGrantCanSetPlatformAdmin(t *testing.T) {
+	h := newHarness()
+	ctx := context.Background()
+
+	granted, err := h.svc.Grant(ctx, "boot@you.co", repository.RoleAdmin, "", true, "boot@you.co", "cli")
+	require.NoError(t, err)
+	assert.True(t, granted.IsPlatformAdmin)
+	assert.Equal(t, true, h.audit.events[0].Metadata["platform_admin"])
+
+	// Re-granting without the flag turns it back off: Grant always writes the
+	// full desired state, the same rule Upsert already applies to role and
+	// status.
+	demoted, err := h.svc.Grant(ctx, "boot@you.co", repository.RoleAdmin, "", false, "boot@you.co", "cli")
+	require.NoError(t, err)
+	assert.False(t, demoted.IsPlatformAdmin)
 }
 
 // TestEmailIsNotLowercased. users.email is CITEXT, so case is handled by the

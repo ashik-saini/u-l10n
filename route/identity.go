@@ -203,3 +203,27 @@ func forbidden(w http.ResponseWriter, r *http.Request, reason, details string) {
 	render.Status(r, http.StatusForbidden)
 	render.JSON(w, r, errorResponse{Error: reason, Details: details})
 }
+
+// requirePlatformAdmin restricts a route to the one privilege that is not
+// scoped to a project: minting a project and granting its first role.
+// Without it the grant flow deadlocks on itself — nobody could ever create a
+// second project, since every other role lives on a project that has to
+// exist first.
+//
+// It runs strictly after RequireIdentity and makes no database call of its
+// own: it reads the is_platform_admin flag RequireIdentity already loaded
+// onto the context alongside the rest of the user row. A project admin — the
+// role SetUserRole grants per project once Plan 2 lands — is still only an
+// admin on that one project, and must not pass this gate.
+func (h *Handler) requirePlatformAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, ok := IdentityFromContext(r.Context())
+		if !ok || !user.IsPlatformAdmin {
+			log.Infow(r.Context(), "rejected: caller is not a platform admin",
+				"email", user.Email)
+			forbidden(w, r, "forbidden", "only a platform admin may manage projects")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
