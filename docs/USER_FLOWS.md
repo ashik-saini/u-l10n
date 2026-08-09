@@ -98,12 +98,12 @@ sequenceDiagram
     participant CLI as u-l10n CLI
     participant PG as PostgreSQL
 
-    OP->>CLI: project create --code --name --actor
-    CLI->>PG: projects row + actor's admin grant, ONE transaction
-    Note over PG: platform admin only — the one privilege<br/>with no project to scope it to
     OP->>CLI: user grant --email --role [--platform-admin]
     CLI->>PG: users row (viewer < editor < approver < admin)
     Note over PG: a Google login means nothing<br/>until a role exists here
+    OP->>CLI: project create --code --name --actor
+    CLI->>PG: projects row + actor's admin grant, ONE transaction
+    Note over PG: actor must already have a users row —<br/>user_project_roles.email references it
     OP->>CLI: token create --name --scope
     CLI->>PG: SHA-256 at rest
     CLI-->>OP: plaintext shown ONCE on stdout

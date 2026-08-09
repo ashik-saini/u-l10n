@@ -108,7 +108,8 @@ func TestAddingALocaleWritesNoTranslations(t *testing.T) {
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM locales WHERE id = $1`, created.ID)
+		_, cleanupErr := testDB.Exec(`DELETE FROM locales WHERE id = $1`, created.ID)
+		require.NoError(t, cleanupErr)
 	})
 
 	var after int
@@ -133,7 +134,8 @@ func TestArchivedLocalesLeaveTheActiveList(t *testing.T) {
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM locales WHERE id = $1`, created.ID)
+		_, cleanupErr := testDB.Exec(`DELETE FROM locales WHERE id = $1`, created.ID)
+		require.NoError(t, cleanupErr)
 	})
 
 	created.Status = "archived"
@@ -204,7 +206,8 @@ func TestUpdatingALocaleCannotChangeItsCode(t *testing.T) {
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM locales WHERE id = $1`, created.ID)
+		_, cleanupErr := testDB.Exec(`DELETE FROM locales WHERE id = $1`, created.ID)
+		require.NoError(t, cleanupErr)
 	})
 
 	// Update is addressed by the OLD code; there is no field in model.Locale
