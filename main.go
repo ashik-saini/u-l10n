@@ -1,6 +1,6 @@
 // Command u-l10n is the in-house localization service: the source of truth for
-// mobile translation keys, the byte-exact export engine, and (later) the
-// over-the-air string delivery endpoint.
+// mobile translation keys, the byte-exact export engine, and the over-the-air
+// string delivery endpoint.
 //
 // See docs/ and the Confluence guide "u-l10n Backend Guide" for design detail.
 package main
@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/urfave/cli"
 
@@ -20,6 +21,7 @@ import (
 	ulog "github.com/yougroupteam/u-common-util/log"
 
 	"github.com/yougroupteam/u-l10n/pkg/config"
+	"github.com/yougroupteam/u-l10n/pkg/lokalise"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
 	"github.com/yougroupteam/u-l10n/pkg/service/importsvc"
 	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
@@ -58,6 +60,7 @@ func main() {
 	}
 	app.Commands = []cli.Command{
 		seedFromFilesCommand(ctx, service),
+		importCommand(ctx, service),
 		tokenCommand(ctx, service),
 		userCommand(ctx, service),
 	}
@@ -77,6 +80,15 @@ func serve(ctx context.Context, service *Service) error {
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", service.Config.HTTPPort),
 		Handler: service.Handler,
+
+		// The chi Timeout middleware only bounds handler execution — it cannot
+		// see a client that connects and then trickles its request headers in
+		// (slowloris), because the handler has not started yet. These two are
+		// the server-level backstop. Constants rather than config: nothing
+		// deployment-specific hangs on them, and a knob nobody turns is only a
+		// way to misconfigure the protection away.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Buffered so a signal arriving before we select is not dropped.
@@ -164,6 +176,81 @@ func seedFromFilesCommand(ctx context.Context, service *Service) cli.Command {
 				"locales", result.LocalesSeen,
 				"keys_upserted", result.KeysUpserted,
 				"translations_written", result.TranslationsWritten,
+				"warnings", len(result.Warnings))
+			return nil
+		},
+	}
+}
+
+// importCommand imports the Lokalise project: values from the API, key
+// presence from a directory of Lokalise file exports.
+//
+// Both sources are required because the API alone cannot distinguish a
+// deliberately-blank translation from an untranslated one — see pkg/service/importsvc.
+func importCommand(ctx context.Context, service *Service) cli.Command {
+	var token, project, exportRoot, actor string
+	var dryRun bool
+
+	return cli.Command{
+		Name:  "import",
+		Usage: "Import the Lokalise project (values from the API, presence from a file export)",
+		Flags: []cli.Flag{
+			cli.StringFlag{
+				// Prefer the environment variable: a token typed as a flag
+				// lands in shell history and `ps` output, and a token is a
+				// credential.
+				Name:        "token",
+				Usage:       "Lokalise API token (read scope); prefer $LOKALISE_API_TOKEN",
+				EnvVar:      "LOKALISE_API_TOKEN",
+				Destination: &token,
+			},
+			cli.StringFlag{
+				Name:        "project",
+				Usage:       "Lokalise project id",
+				EnvVar:      "LOKALISE_PROJECT_ID",
+				Destination: &project,
+			},
+			cli.StringFlag{
+				Name:        "export-root",
+				Usage:       "directory of Lokalise file exports; the presence oracle that keeps blank and untranslated apart",
+				Destination: &exportRoot,
+			},
+			cli.StringFlag{
+				Name:        "actor",
+				Usage:       "email recorded as updated_by; writes to customer copy must be attributable",
+				Destination: &actor,
+			},
+			cli.BoolFlag{
+				Name:        "dry-run",
+				Usage:       "execute the full pipeline then roll back, reporting what would change",
+				Destination: &dryRun,
+			},
+		},
+		Action: func(*cli.Context) error {
+			if token == "" || project == "" {
+				return errors.New("import: --token (or $LOKALISE_API_TOKEN) and --project are required")
+			}
+
+			client := lokalise.New(token, project)
+			defer client.Close()
+
+			result, err := service.Import.Run(ctx, client, importsvc.Options{
+				ExportRoot: exportRoot,
+				Actor:      actor,
+				DryRun:     dryRun,
+			})
+			if err != nil {
+				return err
+			}
+
+			for _, w := range result.Warnings {
+				log.Infow(ctx, "import warning", "detail", w)
+			}
+			log.Infow(ctx, "import result",
+				"dry_run", result.DryRun,
+				"keys_upserted", result.KeysUpserted,
+				"translations_written", result.TranslationsWritten,
+				"translations_skipped", result.TranslationsSkipped,
 				"warnings", len(result.Warnings))
 			return nil
 		},

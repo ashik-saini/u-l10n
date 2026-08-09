@@ -14,7 +14,7 @@ HTTP only on `:8080`. No gRPC, no Kafka.
 
 ## Stack
 
-Go 1.23, chi v4 (HTTP router), PostgreSQL (GORM v1 + hand-written SQL), Google
+Go 1.26, chi v4 (HTTP router), PostgreSQL (GORM v1 + hand-written SQL), Google
 Wire (DI), urfave/cli (CLI), Flyway (migrations), S3 via
 `u-common-components/storage/v4`, testcontainers (integration tests).
 
@@ -41,7 +41,7 @@ main.go                    urfave/cli: serve | seed-from-files | import | token 
 inject_service.go          Wire providers  →  wire_gen.go (generated, never edit)
 route/                     chi handlers, one file per endpoint group
 pkg/config/                configstruct env config
-pkg/model/                 pure types, zero imports
+pkg/model/                 pure types, stdlib-only imports
 pkg/repository/            ALL SQL lives here
 pkg/service/               business rules; owns transaction boundaries
 pkg/parse/  pkg/export/    the two independent format implementations
@@ -98,7 +98,7 @@ strings.
   and are **never executed** — Flyway Community cannot run `undo`. Forward-only
   in practice.
 - **Layers** `route/` decodes and maps to status codes; `pkg/service/` decides;
-  `pkg/repository/` speaks SQL; `pkg/model/` imports nothing.
+  `pkg/repository/` speaks SQL; `pkg/model/` imports the stdlib only.
 - **Query parameters** reject unknown ones rather than ignoring them — a client
   that misspells one must be told.
 - **Tests** testify; testcontainers for integration. Test that constraints

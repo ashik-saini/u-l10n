@@ -3,12 +3,16 @@ package integrationtests
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/yougroupteam/u-l10n/pkg/service/mergesvc"
+	"github.com/yougroupteam/u-l10n/pkg/service/mrsvc"
 )
 
 // The concurrency properties of the merge transaction, demonstrated rather than
@@ -20,16 +24,28 @@ import (
 
 const mergeLockKey int64 = 8_675_309
 
-// TestAdvisoryLockSerialisesMerges is the important one.
+// TestMergeLockKeyMatchesTheMergeService pins this file's key to the one the
+// merge transaction actually takes. Without this, the mechanics test below
+// could keep passing forever against a key nothing in production uses — the
+// exact tautology this file once had.
+func TestMergeLockKeyMatchesTheMergeService(t *testing.T) {
+	assert.Equal(t, mergeLockKey, mergesvc.MergeLockKey(),
+		"the advisory-lock tests exercise a different key from mergesvc.Merge; "+
+			"they would pass regardless of what the merge does")
+}
+
+// TestAdvisoryXactLockMechanicsSerialiseCriticalSections proves the PRIMITIVE:
+// two transactions taking pg_advisory_xact_lock on the merge's key cannot hold
+// their critical sections concurrently, and the lock releases on commit.
 //
-// Two merges run concurrently. Postgres defaults to READ COMMITTED, which does
-// NOT stop both from reading a consistent-looking world and both committing —
-// so without the lock, the second merge would compute its conflicts against a
-// master that the first is about to change, and would then overwrite it.
+// This is deliberately NOT a test of the merge code path — that is
+// TestConcurrentMergesSerialise below. What this one pins down is the Postgres
+// behaviour the merge design leans on: READ COMMITTED alone would let two
+// merges each read a consistent-looking world and both commit.
 //
 // The assertion is on OVERLAP: the second transaction must not enter its
 // critical section until the first has left it.
-func TestAdvisoryLockSerialisesMerges(t *testing.T) {
+func TestAdvisoryXactLockMechanicsSerialiseCriticalSections(t *testing.T) {
 	type window struct{ enter, exit time.Time }
 	windows := make([]window, 2)
 
@@ -73,6 +89,107 @@ func TestAdvisoryLockSerialisesMerges(t *testing.T) {
 	assert.False(t, second.enter.Before(first.exit),
 		"critical sections overlapped: second entered at %s, first exited at %s — the advisory lock is not serialising merges",
 		second.enter.Format(time.StampMilli), first.exit.Format(time.StampMilli))
+}
+
+// TestConcurrentMergesSerialise runs the REAL merge path — mrsvc.Merge, which
+// wraps mergesvc.Merge and its advisory lock — from two goroutines at once.
+//
+// Two approved merge requests on two branches, each editing its own key, race
+// to merge. Without the advisory lock inside mergesvc.Merge, both transactions
+// would compute `max(version) + 1` from the same snapshot and one would die on
+// the releases version unique index (SQLSTATE 23505), deadlock (40P01), or —
+// worse — interleave their conflict computation with the other's writes. With
+// the lock, both complete, cut distinct releases, and land both edits.
+//
+// The assertion is on OUTCOMES rather than on non-overlap of timing windows:
+// the merge holds the lock only for as long as its own work takes, so a
+// wall-clock overlap assertion would be a scheduling lottery. Red-verification
+// — removing pg_advisory_xact_lock from mergesvc.Merge and watching THIS test
+// fail — is a manual gate step (see CLAUDE.md "Gates"), not something the test
+// can do to its own production code.
+func TestConcurrentMergesSerialise(t *testing.T) {
+	ctx := context.Background()
+	keys := newKeySvc(t)
+	branches := newBranchSvc(t)
+	mrs := newMRSvc(t)
+
+	// Two independent, approved merge requests. Different keys, so neither
+	// conflicts with master or with the other — any failure below is a
+	// concurrency failure, not a review-workflow one.
+	type prepared struct {
+		keyID int64
+		mrID  int64
+		value string
+	}
+	var work [2]prepared
+	for i := range work {
+		value := fmt.Sprintf("racing copy %d", i)
+		key := createTestKey(t, keys, uniqueName(t, fmt.Sprintf("concurrent_merge_%d", i)))
+		branch := branchWithEdit(t, keys, branches, key.ID, value)
+
+		mr, err := mrs.Create(ctx, branch.Name, "race me", testActor, "req-1")
+		require.NoError(t, err)
+		_, err = mrs.Review(ctx, mr.ID, mrsvc.ActionApprove, "", "approver@you.co", "req-1")
+		require.NoError(t, err)
+
+		work[i] = prepared{keyID: key.ID, mrID: mr.ID, value: value}
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	results := make([]*mergesvc.Result, len(work))
+	errs := make([]error, len(work))
+	for i := range work {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // maximise the chance of a genuine race
+			results[i], errs[i] = mrs.Merge(ctx, work[i].mrID, "approver@you.co", "req-1")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	// Quarantine whatever was released, win or lose: the OTA tests assert on
+	// exactly which release a locale serves, and the package never resets
+	// between cases. Same reasoning as mergeAndQuarantine.
+	for _, r := range results {
+		if r == nil {
+			continue
+		}
+		version := r.ReleaseVersion
+		t.Cleanup(func() {
+			_, cleanupErr := testDB.Exec(`
+				UPDATE releases SET rolled_back_at = now(), rolled_back_by = 'test-cleanup'
+				 WHERE version = $1 AND rolled_back_at IS NULL`, version)
+			require.NoError(t, cleanupErr)
+		})
+	}
+
+	for i, err := range errs {
+		assert.NoError(t, err,
+			"merge %d failed under contention — a unique violation (23505), serialization "+
+				"failure (21000/40001) or deadlock (40P01) here means the advisory lock is "+
+				"not serialising real merges", i)
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	require.NotNil(t, results[0])
+	require.NotNil(t, results[1])
+	assert.NotEqual(t, results[0].ReleaseVersion, results[1].ReleaseVersion,
+		"serialised merges must cut DISTINCT release versions")
+
+	// Final master state is consistent: both edits landed, neither overwrote
+	// the other's world.
+	for i := range work {
+		got, err := keys.Get(ctx, work[i].keyID, "", []string{"en-SG"})
+		require.NoError(t, err)
+		cell := got.Keys[0].Values[got.Locales[0].ID]
+		require.True(t, cell.Found, "merge %d's edit must be on master", i)
+		assert.Equal(t, work[i].value, cell.Value)
+	}
 }
 
 // TestLockOrderingPreventsDeadlock demonstrates why the merge locks rows

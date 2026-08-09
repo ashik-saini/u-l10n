@@ -1,4 +1,5 @@
-// Package model holds the domain types. It imports nothing.
+// Package model holds the domain types. It imports the stdlib only — never
+// another package of this service, and never a third-party dependency.
 package model
 
 import "time"

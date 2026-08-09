@@ -15,6 +15,7 @@ package integrationtests
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,7 +27,7 @@ import (
 
 	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/postgres"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -36,6 +37,7 @@ import (
 
 const (
 	envDatabaseURL     = "TEST_DATABASE_URL"
+	envRequireTestDB   = "REQUIRE_TEST_DB"
 	defaultDatabaseURL = "postgres://localhost:5432/u_l10n_test?sslmode=disable"
 )
 
@@ -54,6 +56,17 @@ func TestMain(m *testing.M) {
 
 	dsn, cleanup, err := provisionDatabase(ctx)
 	if err != nil {
+		// A CI runner whose Docker is broken must not go green having run zero
+		// tests. REQUIRE_TEST_DB=1 turns this skip into a failure; unset, the
+		// suite still skips so `go test ./...` works on a machine without
+		// Docker or PostgreSQL.
+		if os.Getenv(envRequireTestDB) == "1" {
+			fmt.Fprintf(os.Stderr,
+				"integration-tests: FAILING, %s=1 but no database available (%v)\n"+
+					"  provide one with: make db-test, or set %s, or start Docker\n",
+				envRequireTestDB, err, envDatabaseURL)
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr,
 			"integration-tests: skipping, no database available (%v)\n"+
 				"  provide one with: make db-test, or set %s, or start Docker\n", err, envDatabaseURL)
@@ -252,14 +265,28 @@ func testGORM(t *testing.T) database.GORMConnector {
 	return gormConnector{db: gormHandle}
 }
 
-// requireRejected asserts that a statement was refused by the database.
+// requireRejected asserts that a statement was refused BY A CONSTRAINT.
 //
 // The assertion is deliberately on the error, not on a row count: these tests
 // exist to prove the constraint fires, and a silently-succeeding write is the
 // exact failure they are written to catch.
+//
+// "Any error" is not good enough. A typo'd column name fails with SQLSTATE
+// 42703 and would satisfy a bare nil-check, turning a broken test into a
+// passing one. So when the driver's error is in the chain, it must be class 23
+// (integrity constraint violation: 23502 NOT NULL, 23503 FK, 23505 unique,
+// 23514 CHECK). A chain with no *pq.Error in it is a repository that detected
+// the refusal without surfacing the driver — e.g. ON CONFLICT DO NOTHING
+// returning no row, mapped to a typed sentinel like ErrTagNameTaken — and such
+// call sites assert the specific sentinel themselves, right next to this call.
 func requireRejected(t *testing.T, err error, what string) {
 	t.Helper()
 	if err == nil {
 		t.Fatalf("expected the database to reject %s, but it was accepted", what)
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) && pqErr.Code.Class() != "23" {
+		t.Fatalf("expected a constraint violation (SQLSTATE class 23) rejecting %s, "+
+			"got SQLSTATE %s (%s): %v", what, pqErr.Code, pqErr.Code.Name(), err)
 	}
 }

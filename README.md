@@ -1,7 +1,8 @@
 # u-l10n
 
 In-house localization service — the source of truth for mobile translation keys,
-the byte-exact export engine, and (later) over-the-air string delivery.
+the byte-exact export engine, and the over-the-air string delivery endpoint
+(releases with ETag/304 revalidation and a rollback kill switch).
 
 Replaces [Lokalise](https://lokalise.com) for the YouTrip mobile apps: ~6,300
 keys across 6 locales, exported to Flutter JSON, Android XML and iOS `.strings`.
@@ -46,7 +47,7 @@ endpoint).
 
 ## Quick start
 
-Requires Go 1.23+ and PostgreSQL. Both the database and the service start with:
+Requires Go 1.26+ and PostgreSQL. Both the database and the service start with:
 
 ```
 make run-local
@@ -348,7 +349,7 @@ Layer discipline — when unsure where code belongs, match one of these sentence
 | `route/` | decode, validate, map errors to status codes | hold business rules or SQL |
 | `pkg/service/` | business rules; owns the transaction boundary | know about `http.Request` |
 | `pkg/repository/` | SQL, row↔struct mapping; accepts an optional `tx` | open its own transaction |
-| `pkg/model/` | types | import anything |
+| `pkg/model/` | types | import anything beyond the stdlib |
 
 The last rule is not stylistic: the shared `Transactional.WithTransaction`
 helper **does not nest** — a nested call opens a second, independent
@@ -366,6 +367,9 @@ from a ConfigMap via `envFrom`; locally the Makefile supplies them.
 | `SERVICECONFIG_REQUEST_TIMEOUT` | `60s` | Per-request deadline; cancels in-flight queries |
 | `SERVICECONFIG_SHUTDOWN_TIMEOUT` | `15s` | Drain window on SIGTERM; keep below `terminationGracePeriodSeconds` |
 | `SERVICECONFIG_GOOGLE_OAUTH_AUDIENCE` | *(empty)* | Portal OAuth client id. When set, access tokens issued to any other client are refused — see [Portal identity](#portal-identity) |
+| `SERVICECONFIG_RATE_LIMIT_ENABLE` | `true` | Per-client request limiter across `/api/v1` and `/ota/v1`. Health probes are exempt by mounting, so kubelet never sees a 429 |
+| `SERVICECONFIG_RATE_LIMIT_PER_MINUTE` | `300` | Sustained per-client request budget |
+| `SERVICECONFIG_RATE_LIMIT_BURST` | `60` | How far a client may run ahead of the sustained rate; a portal page load fires several requests at once |
 | `DATABASECONFIG_*` | — | Owned by `u-common-components/database` |
 | `STORAGE_CONFIG_AWS_*` | — | Owned by `u-common-components/storage/v4` |
 

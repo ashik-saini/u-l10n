@@ -1,5 +1,5 @@
 .PHONY: test test-report-dep test-report gen-wire pre-commit install clean \
-        db-local db-local-stop db-test db-migrate run-local s3-cred-local
+        db-local db-local-stop db-test db-migrate run-local seed-local s3-cred-local
 
 # Local development defaults. Override on the command line, e.g.
 #   make run-local DATABASECONFIG_DATABASENAME=u_l10n_scratch
@@ -96,9 +96,12 @@ db-test:
 # the filename convention and ordering.
 #
 #   brew install flyway
+# dropdb/createdb carry the same -h/-p as every other target here: without
+# them they act on libpq's defaults, so an overridden DATABASECONFIG_HOST would
+# migrate one server while dropdb destroyed a same-named database on another.
 db-migrate: db-test
-	@dropdb --if-exists $(MIGRATE_DATABASE_NAME)
-	@createdb $(MIGRATE_DATABASE_NAME)
+	@dropdb --if-exists -h $(DATABASECONFIG_HOST) -p $(DATABASECONFIG_PORT) $(MIGRATE_DATABASE_NAME)
+	@createdb -h $(DATABASECONFIG_HOST) -p $(DATABASECONFIG_PORT) $(MIGRATE_DATABASE_NAME)
 	flyway -url=jdbc:postgresql://$(DATABASECONFIG_HOST):$(DATABASECONFIG_PORT)/$(MIGRATE_DATABASE_NAME) \
 		-user=$(DATABASECONFIG_USER) -password=$(DATABASECONFIG_PASSWORD) \
 		-locations=filesystem:.db migrate

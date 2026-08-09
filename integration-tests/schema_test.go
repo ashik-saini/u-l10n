@@ -187,6 +187,11 @@ func TestTranslationConstraints(t *testing.T) {
 	})
 
 	t.Run("cascade removes translations with their key", func(t *testing.T) {
+		// This key deliberately has NO history rows: since V1.08 a key with
+		// history refuses a hard delete outright (see
+		// TestHistoryRowsRefuseKeyHardDelete). What this subtest proves is the
+		// half that still cascades — a value is content, not audit, and goes
+		// with its key.
 		doomed := insertKey(t, "cascade_case")
 		_, err := testDB.Exec(`
 			INSERT INTO translations (key_id, locale_id, value, updated_by)
@@ -200,6 +205,59 @@ func TestTranslationConstraints(t *testing.T) {
 		require.NoError(t, testDB.QueryRow(
 			`SELECT count(*) FROM translations WHERE key_id = $1`, doomed).Scan(&remaining))
 		assert.Zero(t, remaining)
+	})
+}
+
+// TestHistoryRowsRefuseKeyHardDelete proves V1.08: an audit row must survive
+// its subject, so a hard DELETE of a key that still has history is refused
+// rather than quietly amplified into deleting the audit trail.
+//
+// No production path hard-deletes keys — the API soft-deletes to
+// status = 'deleted' — so the only way to reach this constraint is a
+// hand-typed DELETE in psql, which is exactly when the trail matters most.
+func TestHistoryRowsRefuseKeyHardDelete(t *testing.T) {
+	enSG := localeID(t, "en-SG")
+
+	t.Run("translation history blocks the delete", func(t *testing.T) {
+		keyID := insertKey(t, "history_guard_translation_case")
+		_, err := testDB.Exec(`
+			INSERT INTO translation_history (key_id, locale_id, value, version, source, changed_by)
+			VALUES ($1, $2, 'v1', 1, 'ui', 'test@you.co')`, keyID, enSG)
+		require.NoError(t, err)
+
+		_, err = testDB.Exec(`DELETE FROM keys WHERE id = $1`, keyID)
+		requireRejected(t, err, "a hard delete of a key that still has translation history")
+
+		var remaining int
+		require.NoError(t, testDB.QueryRow(
+			`SELECT count(*) FROM translation_history WHERE key_id = $1`, keyID).Scan(&remaining))
+		assert.Equal(t, 1, remaining, "the audit row must survive the attempt")
+	})
+
+	t.Run("key history blocks the delete", func(t *testing.T) {
+		keyID := insertKey(t, "history_guard_key_case")
+		_, err := testDB.Exec(`
+			INSERT INTO key_history (key_id, name, platforms, status, version, source, changed_by)
+			VALUES ($1, 'history_guard_key_case', ARRAY['flutter']::TEXT[], 'active', 1, 'ui', 'test@you.co')`,
+			keyID)
+		require.NoError(t, err)
+
+		_, err = testDB.Exec(`DELETE FROM keys WHERE id = $1`, keyID)
+		requireRejected(t, err, "a hard delete of a key that still has key history")
+	})
+
+	t.Run("NO ACTION, not undeletable: removing the history in the open unblocks it", func(t *testing.T) {
+		keyID := insertKey(t, "history_guard_explicit_case")
+		_, err := testDB.Exec(`
+			INSERT INTO translation_history (key_id, locale_id, value, version, source, changed_by)
+			VALUES ($1, $2, 'v1', 1, 'ui', 'test@you.co')`, keyID, enSG)
+		require.NoError(t, err)
+
+		_, err = testDB.Exec(`DELETE FROM translation_history WHERE key_id = $1`, keyID)
+		require.NoError(t, err)
+		_, err = testDB.Exec(`DELETE FROM keys WHERE id = $1`, keyID)
+		assert.NoError(t, err,
+			"once the audit rows are deleted explicitly, the key delete is an ordinary delete")
 	})
 }
 

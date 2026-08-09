@@ -1,31 +1,36 @@
 package integrationtests
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/yougroupteam/u-l10n/pkg/repository"
 )
 
-// servable mirrors servableBundleSQL: the newest release for a locale that is
-// neither rolled back nor above the client's version.
+// servable asks the REAL repository method — the one the OTA handler serves
+// from — which release a client would receive. An earlier version of this
+// helper duplicated servableBundleSQL inline and returned (0, false) on ANY
+// error, so an input-dependent SQL failure was indistinguishable from "nothing
+// to serve". Only repository.ErrNotFound means not-servable; anything else is
+// a broken query and fails the test loudly.
 func servable(t *testing.T, localeID int16, appVersion string) (version int64, found bool) {
 	t.Helper()
-	err := testDB.QueryRow(`
-		WITH client AS (SELECT COALESCE(NULLIF($2, ''), '0.0.0') AS v)
-		SELECT r.version
-		  FROM releases r
-		  JOIN release_bundles rb ON rb.release_id = r.id
-		 WHERE rb.locale_id = $1
-		   AND r.rolled_back_at IS NULL
-		   AND (r.min_app_version IS NULL
-		     OR string_to_array(r.min_app_version, '.')::int[]
-		        <= string_to_array((SELECT v FROM client), '.')::int[])
-		 ORDER BY r.version DESC LIMIT 1`, localeID, appVersion).Scan(&version)
-	if err != nil {
+
+	repo := repository.ProvideReleaseRepository(testGORM(t))
+	bundle, err := repo.ServableBundle(context.Background(), nil, localeID, appVersion)
+	switch {
+	case err == nil:
+		return bundle.ReleaseVersion, true
+	case errors.Is(err, repository.ErrNotFound):
 		return 0, false
+	default:
+		t.Fatalf("ServableBundle(locale %d, app %q): %v", localeID, appVersion, err)
+		return 0, false // unreachable
 	}
-	return version, true
 }
 
 func newRelease(t *testing.T, localeID int16, minAppVersion interface{}, rolledBack bool) int64 {
