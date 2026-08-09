@@ -115,10 +115,10 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     participant CI as CI pipeline
-    participant EX as /export
+    participant EX as /api/v1/export
     participant S as u-l10n
 
-    CI->>EX: GET (Bearer token, read_export scope)
+    CI->>EX: GET (X-Api-Token, read_export scope)
     EX->>S: hash lookup — live tokens only
     S-->>CI: zip — Flutter JSON · Android XML · iOS .strings
     Note over S: an Android name collision fails the<br/>WHOLE export before a single file ships

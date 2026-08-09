@@ -20,8 +20,8 @@ sequenceDiagram
     R->>G: verify Google token
     G-->>R: email → role (users table)
     R->>K: SetTranslation
-    K->>T: upsert with version predicate
-    T->>PG: INSERT … ON CONFLICT DO UPDATE WHERE version = base
+    K->>T: write with version guard
+    T->>PG: new cell: INSERT … ON CONFLICT DO NOTHING<br/>existing: UPDATE … WHERE version = base
     alt version still matches
         PG-->>SPA: 200 — new version
     else someone saved first
@@ -43,7 +43,7 @@ sequenceDiagram
     participant F as pkg/export
     participant PG as PostgreSQL
 
-    CI->>R: GET /export (Bearer token)
+    CI->>R: GET /api/v1/export (X-Api-Token)
     R->>A: SHA-256(token) lookup
     A->>PG: match live token · throttled last_used_at
     A-->>R: scope ok
