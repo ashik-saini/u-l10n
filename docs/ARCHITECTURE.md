@@ -1,107 +1,131 @@
 # u-l10n — how it fits together
 
-The machinery view. For the persona journeys — translator, reviewer, mobile app, operator — see [USER_FLOWS.md](USER_FLOWS.md).
+The machinery view, one sequence per flow. For the persona journeys — translator, reviewer, mobile app, operator — see [USER_FLOWS.md](USER_FLOWS.md).
 
-## 1. Architecture & request flow
+Layering rule behind every diagram: `route/` decodes and maps errors to status codes → `pkg/service/` decides and owns the transaction → `pkg/repository/` speaks SQL → PostgreSQL. Repositories never open their own transaction; values always travel as `(value, found)` — absent and empty are different states.
 
-```mermaid
-flowchart TB
-    subgraph clients["Clients"]
-        portal["Translator portal SPA"]
-        apps["Mobile apps (Flutter / Android / iOS)"]
-        ci["CI / u-mobile build"]
-        operator["Operator CLI"]
-    end
-
-    subgraph edge["route/  — chi router :8080"]
-        mw["captureSocketAddr → RealIP → per-IP rate limit<br/>(rightmost public XFF hop, /api/v1 + /ota/v1)"]
-        api["/api/v1 portal handlers<br/>keys · translations · branches · MRs · tags · assets · releases · users"]
-        ota["/ota/v1/bundles/:locale<br/>ETag / 304 · kill switch · min_app_version floor"]
-        exp["/export  — zip of all 3 formats"]
-        health["healthz / readyz (rate-limit exempt)"]
-    end
-
-    subgraph auth["Identity"]
-        google["Google tokeninfo verifier<br/>(pkg/googleauth + users table roles)"]
-        token["API tokens<br/>crypto/rand · SHA-256 at rest"]
-    end
-
-    subgraph svc["pkg/service/  — business rules, OWNS transactions"]
-        keysvc["keysvc<br/>three-state values · OCC via version predicates"]
-        branchsvc["branchsvc / mrsvc<br/>copy-on-write deltas · review state machine"]
-        mergesvc["mergesvc<br/>advisory lock · 7-step merge tx"]
-        releasesvc["releasesvc<br/>publish · materialise bundle"]
-        assetsvc["assetsvc<br/>presigned POST · content-addressed verify"]
-        importsvc["importsvc / seed"]
-        exportsvc["exportsvc"]
-    end
-
-    subgraph data["Data layer"]
-        repo["pkg/repository/ — ALL SQL<br/>raw ON CONFLICT · FOR UPDATE · db(ctx, tx)"]
-        pg[("PostgreSQL<br/>Flyway .db/V1.00–V1.08")]
-    end
-
-    subgraph formats["Format engines (independent — round-trip gates R1/R2)"]
-        parse["pkg/parse<br/>Flutter JSON · Android XML · iOS .strings"]
-        export2["pkg/export<br/>byte-faithful serializers"]
-    end
-
-    subgraph ext["External"]
-        lokalise["Lokalise API<br/>(rate-limited client)"]
-        s3[("S3 via storage/v4")]
-        gapi["Google tokeninfo"]
-    end
-
-    portal --> mw
-    apps -->|"app launch"| mw
-    ci -->|"Bearer token"| mw
-    operator -->|"serve · seed · import · token · user"| svc
-
-    mw --> api & ota & exp & health
-    api --> google --> gapi
-    exp --> token
-    api --> keysvc & branchsvc & mergesvc & releasesvc & assetsvc
-    ota --> releasesvc
-    exp --> exportsvc
-
-    keysvc & branchsvc & mergesvc & releasesvc & assetsvc & importsvc --> repo --> pg
-    importsvc --> lokalise
-    importsvc & importsvc --> parse
-    exportsvc --> export2
-    assetsvc --> s3
-```
-
-## 2. The life of a copy change — branch → merge → OTA
+## 1. Portal write — saving a translation
 
 ```mermaid
-flowchart TB
-    edit["Translator edits on a branch<br/>branch_translations delta · base_master_version captured on FIRST touch only"]
-    mr["Merge request opened"]
-    review["Review state machine<br/>open ⇄ changes_requested → approved → merged (terminal)<br/>SetStatus is a compare-and-swap"]
-    resolve["Conflicts computed: master version ≠ base_master_version<br/>Resolve accepts only pairs actually in the conflict set<br/>choice = mine | master"]
+sequenceDiagram
+    autonumber
+    participant SPA as Portal SPA
+    participant R as route/
+    participant G as googleauth
+    participant K as keysvc
+    participant T as translation repo
+    participant PG as PostgreSQL
 
-    subgraph mergetx["mergesvc.Merge — one transaction, seven steps"]
-        lock["1–2 · pg_advisory_xact_lock(8675309)<br/>serialises merges (mutation-checked test)"]
-        rowlocks["3 · FOR UPDATE on affected translations AND keys rows<br/>deterministic order — no deadlocks"]
-        conflicts["4 · conflicts still unresolved? → refuse (409)"]
-        apply["5 · version-predicated CTE apply<br/>delta lands only if master still at base version or resolved 'mine'<br/>blocked rows → ErrConcurrentMasterWrite (409, retry)"]
-        history["6 · translation_history + key_history rows (source 'merge')"]
-        release["7 · release version allocated · bundle materialised<br/>sha256 + byte_size over the jsonb::text the wire serves"]
+    SPA->>R: PUT translation (value, base_version)
+    R->>G: verify Google token
+    G-->>R: email → role (users table)
+    R->>K: SetTranslation
+    K->>T: upsert with version predicate
+    T->>PG: INSERT … ON CONFLICT DO UPDATE WHERE version = base
+    alt version still matches
+        PG-->>SPA: 200 — new version
+    else someone saved first
+        K->>T: re-read current cell
+        T-->>K: theirs (value, found, version)
+        K-->>SPA: 409 — mine AND theirs, side by side
     end
-
-    served["GET /ota/v1/bundles/:locale<br/>newest eligible release · X-App-Version floor (validated N.N.N)<br/>ETag/304 · 410 after kill switch"]
-    phones["Strings reach users — no app release"]
-
-    edit --> mr --> review -->|approved| resolve --> mergetx
-    lock --> rowlocks --> conflicts --> apply --> history --> release
-    mergetx --> served --> phones
-
-    style mergetx fill:#f6f8fa,stroke:#57606a
 ```
 
-### Reading guide
+## 2. Authenticated export — CI pulls the three formats
 
-- **Three states everywhere:** no row = untranslated (omitted from export), `''` = deliberately blank (exported as `""`), else translated. Repositories return `(value, found, err)` — never a bare string.
-- **`pkg/parse` and `pkg/export` never import each other** — that independence is what makes gate R1 (98,320 values round-tripped, zero alterations) a real check instead of a tautology.
-- **Services own transactions; repositories take `tx` and speak SQL.** `WithTransaction` does not nest.
-- **The advisory lock serialises merge-vs-merge; the version-predicated applies (step 5) close portal-vs-merge races** — two different mechanisms, both mutation-verified.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CI as CI pipeline
+    participant R as route/export
+    participant A as apitoken repo
+    participant E as exportsvc
+    participant F as pkg/export
+    participant PG as PostgreSQL
+
+    CI->>R: GET /export (Bearer token)
+    R->>A: SHA-256(token) lookup
+    A->>PG: match live token · throttled last_used_at
+    A-->>R: scope ok
+    R->>E: Zip(locales)
+    E->>PG: keys + translations (master)
+    E->>F: serialize — Flutter JSON · Android XML · iOS .strings
+    Note over F: independent from pkg/parse —<br/>that independence makes gate R1 real
+    F-->>E: byte-faithful files
+    E-->>CI: zip (collision check failed the WHOLE export first, if any)
+```
+
+## 3. Asset upload — a context screenshot reaches S3
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SPA as Portal SPA
+    participant AS as assetsvc
+    participant S3 as S3 (storage/v4)
+    participant PG as PostgreSQL
+
+    SPA->>AS: Presign (filename, type, size)
+    AS-->>SPA: POST policy (metadata pinned)
+    SPA->>S3: upload bytes directly
+    SPA->>AS: Confirm
+    AS->>S3: read object back
+    AS->>AS: sha256(bytes) must equal its content-address
+    alt bytes match their name
+        AS->>PG: asset row + audit
+        AS-->>SPA: attached
+    else mismatch / absent / wrong size
+        AS-->>SPA: refused — object never becomes an asset
+    end
+```
+
+## 4. The merge transaction — seven steps, one lock
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant MR as mrsvc
+    participant M as mergesvc
+    participant PG as PostgreSQL
+
+    MR->>M: Merge(branch)
+    M->>PG: BEGIN
+    M->>PG: pg_advisory_xact_lock — merges serialize globally
+    M->>PG: FOR UPDATE on affected translations AND keys rows (ordered)
+    M->>PG: compute conflicts (master version ≠ base_master_version)
+    alt unresolved conflicts
+        M-->>MR: refuse — 409, nothing applied
+    else clean or resolved
+        M->>PG: apply deltas via version-predicated CTEs
+        alt master moved inside the window
+            M-->>MR: ErrConcurrentMasterWrite — rollback, 409 retry
+        else all deltas land
+            M->>PG: translation_history + key_history (source 'merge')
+            M->>PG: cut release · materialise bundle (sha over served bytes)
+            M->>PG: COMMIT — lock releases
+            M-->>MR: merged · release version
+        end
+    end
+```
+
+## 5. Import — reconciling from Lokalise
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant OP as Operator CLI
+    participant I as importsvc
+    participant L as Lokalise API
+    participant P as pkg/parse
+    participant PG as PostgreSQL
+
+    OP->>I: u-l10n import (--dry-run first)
+    loop paged fetch, rate-limited
+        I->>L: keys + translations
+        L-->>I: page (429 → honor Retry-After)
+    end
+    I->>P: file exports as presence oracle<br/>(API returns "" for blank AND untranslated)
+    I->>I: canonical names — colliding keys dedupe last-wins, warned
+    I->>PG: one transaction — batch upserts
+    I-->>OP: report: changed · warnings · (or dry-run diff)
+```

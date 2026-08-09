@@ -1,122 +1,129 @@
 # u-l10n — user flows
 
-Who touches the system, and what their path through it looks like. Companion to [ARCHITECTURE.md](ARCHITECTURE.md), which shows the machinery underneath.
+One sequence per persona. Companion to [ARCHITECTURE.md](ARCHITECTURE.md), which shows the machinery underneath each arrow.
 
-## 1. Translator — editing copy
+## 1. Translator — editing copy on a branch
 
 ```mermaid
-flowchart TB
-    login["Sign in with Google Workspace<br/>tokeninfo verified → role from users table"]
-    browse["Browse keys — /api/v1/keys<br/>filter by tag · status · text search<br/>(search resolves through the branch)"]
-    pick["Pick or create a branch<br/>master stays untouched"]
-    edit["Edit a translation<br/>delta stored in branch_translations<br/>base_master_version captured on first touch"]
-    ctx["Attach a context screenshot<br/>presigned POST → S3 → Confirm verifies bytes hash to their name"]
-    stale{"Someone else changed<br/>this cell meanwhile?"}
-    conflict409["409 with BOTH values —<br/>mine and theirs, side by side"]
-    reconcile["Reconcile and resave<br/>with the fresh base_version"]
-    openmr["Open a merge request"]
+sequenceDiagram
+    autonumber
+    actor T as Translator
+    participant P as Portal
+    participant S as u-l10n
 
-    login --> browse --> pick --> edit --> stale
-    edit -.optional.-> ctx
-    stale -->|no| openmr
-    stale -->|yes| conflict409 --> reconcile --> stale
+    T->>P: sign in with Google Workspace
+    P->>S: token → verified → role from users table
+    T->>P: browse keys (tag · status · text search)
+    Note over S: search resolves through the branch,<br/>not master
+    T->>P: pick/create a branch
+    T->>P: edit a value
+    P->>S: save (base_version)
+    Note over S: delta lands in branch_translations —<br/>base_master_version captured on FIRST touch
+    alt nobody else touched the cell
+        S-->>T: saved — new version
+    else concurrent edit
+        S-->>T: 409 with BOTH values — mine and theirs
+        T->>P: reconcile, save with fresh base
+        S-->>T: saved
+    end
+    opt context screenshot
+        T->>S: presign → upload to S3 → confirm (bytes verified)
+    end
+    T->>S: open merge request
 ```
 
-Three states matter while editing: **no value** (untranslated — omitted from exports), **empty** (deliberately blank — exported as `""`), and **translated**. Clearing a value and deleting it are different actions with different outcomes.
+Three states while editing: **no value** (untranslated — omitted from exports), **empty** (deliberately blank — exported as `""`), **translated**. Clearing and deleting are different actions.
 
-## 2. Reviewer / approver — the merge request
-
-```mermaid
-stateDiagram-v2
-    [*] --> open : translator opens MR
-    open --> changes_requested : reviewer requests changes
-    changes_requested --> open : translator revises
-    open --> approved : approver approves
-    changes_requested --> approved : approver approves
-    approved --> merged : approver merges
-    open --> closed : abandoned
-    changes_requested --> closed : abandoned
-    approved --> closed : abandoned
-    merged --> [*]
-    closed --> [*]
-
-    note right of approved
-        Conflicts must be resolved first:
-        each conflicting pair gets an explicit
-        choice — mine or master. Only pairs
-        actually in conflict can be resolved.
-    end note
-    note right of merged
-        Terminal. Every transition is a
-        compare-and-swap in SQL — a close
-        racing a merge loses cleanly.
-    end note
-```
+## 2. Reviewer & approver — the merge request
 
 ```mermaid
-flowchart LR
-    review["Review diff<br/>branch deltas vs master"]
-    conflicts{"Conflicts?<br/>master moved past<br/>base_master_version"}
-    resolve["Resolve each pair:<br/>mine / master"]
-    merge["Merge<br/>one serialized transaction"]
-    outcome{"Master moved during<br/>the merge window?"}
-    retry["409 concurrent_master_write —<br/>re-check and retry"]
-    done["Release cut · bundle materialised ·<br/>history recorded · MR merged"]
+sequenceDiagram
+    autonumber
+    actor T as Translator
+    actor RV as Reviewer
+    actor AP as Approver
+    participant S as u-l10n
 
-    review --> conflicts
-    conflicts -->|yes| resolve --> merge
-    conflicts -->|no| merge
-    merge --> outcome
-    outcome -->|no| done
-    outcome -->|yes| retry --> review
+    T->>S: open MR
+    loop until satisfied
+        RV->>S: review diff (branch deltas vs master)
+        RV->>S: request changes
+        T->>S: revise on the branch
+    end
+    opt conflicts exist (master moved past base)
+        AP->>S: resolve each pair — mine / master
+        Note over S: only pairs actually in conflict<br/>can be resolved
+    end
+    AP->>S: approve
+    AP->>S: merge
+    alt master untouched during the window
+        S-->>AP: merged — release cut, history recorded
+    else concurrent master write
+        S-->>AP: 409 concurrent_master_write
+        AP->>S: re-check conflicts, retry merge
+    end
+    Note over S: merged is terminal — every status change is a<br/>compare-and-swap; a close racing a merge loses cleanly
 ```
 
 ## 3. Mobile app user — strings over the air
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant App as Mobile app
-    participant OTA as GET /ota/v1/bundles/:locale
-    participant DB as PostgreSQL
+    participant OTA as /ota/v1/bundles/:locale
+    participant PG as PostgreSQL
 
-    App->>OTA: X-App-Version 4.12.0 · If-None-Match "<etag>"
-    Note over OTA: rate-limited per client IP<br/>version validated as N.N.N,<br/>anything else reads as 0.0.0
-    OTA->>DB: newest release for locale<br/>not rolled back · version floor satisfied
+    App->>OTA: X-App-Version · If-None-Match "etag"
+    Note over OTA: rate-limited per client IP ·<br/>version validated N.N.N, else reads as 0.0.0
+    OTA->>PG: newest eligible release (not rolled back, floor satisfied)
     alt nothing changed
         OTA-->>App: 304 — zero bytes
-    else new strings available
-        OTA-->>App: 200 — bundle JSON + ETag (sha256 of the served bytes)
-    else locale unknown / no release yet
+    else new strings
+        OTA-->>App: 200 — bundle + ETag (sha256 of served bytes)
+    else unknown locale / no release
         OTA-->>App: 404 (Cache-Control max-age=60)
     else release killed
-        OTA-->>App: 410 — app falls back to shipped strings
+        OTA-->>App: 410 — fall back to shipped strings
     end
-    Note over App: copy updates without an app release
+    Note over App: copy changes reach users without an app release
 ```
 
-## 4. Operator — CLI and administration
+## 4. Operator — CLI administration
 
 ```mermaid
-flowchart TB
-    subgraph cli["u-l10n CLI"]
-        serve["serve — run the service"]
-        seedcmd["seed-from-files<br/>load the committed u-mobile tree (--dry-run to rehearse)"]
-        importcmd["import<br/>reconcile from Lokalise ($LOKALISE_API_TOKEN)<br/>duplicate canonical names dedupe last-wins with warnings"]
-        tokencmd["token create / revoke<br/>plaintext shown once on stdout · SHA-256 at rest"]
-        usercmd["user grant / list<br/>roles: viewer < editor < approver < admin"]
-    end
+sequenceDiagram
+    autonumber
+    actor OP as Operator
+    participant CLI as u-l10n CLI
+    participant PG as PostgreSQL
 
-    subgraph consumers["Who uses what"]
-        ci["CI pipeline<br/>Bearer token → GET /export<br/>zip: Flutter JSON · Android XML · iOS .strings"]
-        newhire["New operator<br/>admin grants a role before<br/>their Google login means anything"]
-    end
+    OP->>CLI: user grant --email --role
+    CLI->>PG: users row (viewer < editor < approver < admin)
+    Note over PG: a Google login means nothing<br/>until a role exists here
+    OP->>CLI: token create --name --scope
+    CLI->>PG: SHA-256 at rest
+    CLI-->>OP: plaintext shown ONCE on stdout
+    OP->>CLI: seed-from-files (--dry-run to rehearse)
+    CLI->>PG: one-time load of the committed u-mobile tree
+    OP->>CLI: import (cutover reconciliation from Lokalise)
+```
 
-    tokencmd --> ci
-    usercmd --> newhire
-    seedcmd -->|"one-time, at setup"| serve
-    importcmd -->|"cutover reconciliation"| serve
+## 5. CI — pulling the release formats
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CI as CI pipeline
+    participant EX as /export
+    participant S as u-l10n
+
+    CI->>EX: GET (Bearer token, read_export scope)
+    EX->>S: hash lookup — live tokens only
+    S-->>CI: zip — Flutter JSON · Android XML · iOS .strings
+    Note over S: an Android name collision fails the<br/>WHOLE export before a single file ships
 ```
 
 ### Where the flows meet
 
-Translator edits land on a **branch**; the approver's **merge** is the only door to master; a merge **cuts a release**; the app's next launch **picks it up**. Nothing reaches users' screens without passing every gate in between — and each arrow above that crosses a trust boundary (login, token, version header, resolution choice) is validated on the server side, never assumed from the client.
+Translator edits land on a **branch**; the approver's **merge** is the only door to master; a merge **cuts a release**; the app's next launch **picks it up**. Every arrow that crosses a trust boundary — login, token, version header, resolution choice — is validated server-side, never assumed from the client.
