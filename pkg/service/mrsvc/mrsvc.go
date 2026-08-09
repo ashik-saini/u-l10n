@@ -444,7 +444,9 @@ func (s *Service) Resolve(
 				continue
 			}
 
-			locale, err := s.locales.ByCode(ctx, tx, r.LocaleCode)
+			// TODO(plan-2): the scope arrives from the request path once routes are
+			// project-prefixed. Hardcoded to YouTrip until then.
+			locale, err := s.locales.ByCode(ctx, tx, 1, r.LocaleCode)
 			if err != nil {
 				if errors.Is(err, repository.ErrNotFound) {
 					return fmt.Errorf("%w: unknown locale %q", ErrBadRequest, r.LocaleCode)

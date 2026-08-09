@@ -154,7 +154,7 @@ const selectTagColumns = `id, name, colour, created_at`
 const createTagSQL = `
 INSERT INTO tags (name, colour)
 VALUES ($1, $2)
-ON CONFLICT (name) DO NOTHING
+ON CONFLICT (project_id, name) DO NOTHING
 RETURNING ` + selectTagColumns
 
 func (r *tagRepository) Create(ctx context.Context, tx *gorm.DB, name, colour string) (Tag, error) {

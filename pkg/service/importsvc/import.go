@@ -132,7 +132,9 @@ func (s *Service) run(
 	languages []lokalise.Language, remoteKeys []lokalise.Key,
 	opts Options, result *Result,
 ) error {
-	locales, err := s.locales.List(ctx, tx)
+	// TODO(plan-2): the scope arrives from the request path once routes are
+	// project-prefixed. Hardcoded to YouTrip until then.
+	locales, err := s.locales.List(ctx, tx, 1, false)
 	if err != nil {
 		return err
 	}

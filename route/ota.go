@@ -60,7 +60,9 @@ func (h *Handler) OTABundle(w http.ResponseWriter, r *http.Request) {
 		appVersion = ""
 	}
 
-	locale, err := h.locales.ByCode(r.Context(), nil, code)
+	// TODO(plan-2): the scope arrives from the request path once routes are
+	// project-prefixed. Hardcoded to YouTrip until then.
+	locale, err := h.locales.ByCode(r.Context(), nil, 1, code)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
 			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", otaNegativeMaxAge))

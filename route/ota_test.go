@@ -21,7 +21,7 @@ type stubLocales struct {
 	byCode map[string]model.Locale
 }
 
-func (s *stubLocales) List(context.Context, *gorm.DB) ([]model.Locale, error) {
+func (s *stubLocales) List(context.Context, *gorm.DB, int16, bool) ([]model.Locale, error) {
 	out := make([]model.Locale, 0, len(s.byCode))
 	for _, l := range s.byCode {
 		out = append(out, l)
@@ -29,7 +29,7 @@ func (s *stubLocales) List(context.Context, *gorm.DB) ([]model.Locale, error) {
 	return out, nil
 }
 
-func (s *stubLocales) ByCode(_ context.Context, _ *gorm.DB, code string) (model.Locale, error) {
+func (s *stubLocales) ByCode(_ context.Context, _ *gorm.DB, _ int16, code string) (model.Locale, error) {
 	l, ok := s.byCode[code]
 	if !ok {
 		return model.Locale{}, fmt.Errorf("locale %q: %w", code, repository.ErrNotFound)

@@ -996,7 +996,9 @@ func branchID(b *repository.Branch) int64 {
 // locale must be told, not handed five columns where it asked for six and left
 // to conclude the sixth is untranslated everywhere.
 func (s *Service) selectLocales(ctx context.Context, codes []string) ([]model.Locale, error) {
-	all, err := s.locales.List(ctx, nil)
+	// TODO(plan-2): the scope arrives from the request path once routes are
+	// project-prefixed. Hardcoded to YouTrip until then.
+	all, err := s.locales.List(ctx, nil, 1, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1031,7 +1033,9 @@ func (s *Service) selectLocales(ctx context.Context, codes []string) ([]model.Lo
 }
 
 func (s *Service) localeByCode(ctx context.Context, tx *gorm.DB, code string) (model.Locale, error) {
-	l, err := s.locales.ByCode(ctx, tx, code)
+	// TODO(plan-2): the scope arrives from the request path once routes are
+	// project-prefixed. Hardcoded to YouTrip until then.
+	l, err := s.locales.ByCode(ctx, tx, 1, code)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
 			// A locale is reference data seeded by migration, so an unknown code

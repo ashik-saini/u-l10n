@@ -46,11 +46,13 @@ type Project struct {
 // serializers stay table-driven.
 type Locale struct {
 	ID               int16
+	ProjectID        int16
 	Code             string
 	FlutterDir       string
 	AndroidValuesDir string
 	IOSLproj         string
 	SortOrder        int16
+	Status           string
 }
 
 // Key is one translatable string identifier.

@@ -162,7 +162,7 @@ const upsertKeySQL = `
 INSERT INTO keys (name, description, platforms, android_name, ios_name,
                   status, sort_index, lokalise_key_id, created_at, updated_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
-ON CONFLICT (name) WHERE status = 'active' DO UPDATE SET
+ON CONFLICT (project_id, name) WHERE status = 'active' DO UPDATE SET
     description  = COALESCE(NULLIF(EXCLUDED.description, ''), keys.description),
     platforms    = ARRAY(SELECT DISTINCT unnest(keys.platforms || EXCLUDED.platforms) ORDER BY 1),
     android_name = COALESCE(EXCLUDED.android_name, keys.android_name),
@@ -510,7 +510,7 @@ INSERT INTO keys (name, description, platforms, android_name, ios_name,
 VALUES ($1, $2, $3, $4, $5, $6,
         COALESCE((SELECT max(sort_index) FROM keys), 0) + 100,
         now(), now())
-ON CONFLICT (name) WHERE status = 'active' DO NOTHING
+ON CONFLICT (project_id, name) WHERE status = 'active' DO NOTHING
 RETURNING id, name, description, platforms, android_name, ios_name, status,
           version, sort_index, lokalise_key_id, created_at, updated_at`
 

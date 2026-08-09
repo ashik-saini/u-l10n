@@ -111,7 +111,9 @@ func (s *Service) Bundle(
 		return bundle, fmt.Errorf("%w: version must be a positive integer", ErrBadRequest)
 	}
 
-	locale, err := s.locales.ByCode(ctx, nil, localeCode)
+	// TODO(plan-2): the scope arrives from the request path once routes are
+	// project-prefixed. Hardcoded to YouTrip until then.
+	locale, err := s.locales.ByCode(ctx, nil, 1, localeCode)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
 			// Locales are reference data seeded by migration, so an unknown code
@@ -154,7 +156,9 @@ func (s *Service) Publish(
 			return err
 		}
 
-		locales, err := s.locales.List(ctx, tx)
+		// TODO(plan-2): the scope arrives from the request path once routes are
+		// project-prefixed. Hardcoded to YouTrip until then.
+		locales, err := s.locales.List(ctx, tx, 1, false)
 		if err != nil {
 			return err
 		}
