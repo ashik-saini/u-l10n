@@ -155,6 +155,12 @@ func ProvideKeyRepository(connector database.GORMConnector) KeyRepository {
 // The conflict target is the PARTIAL unique index on active names, so the
 // statement needs the same WHERE predicate the index carries.
 //
+// TODO(plan-2): that target names project_id, but the column list below does
+// not — the row gets its project from the temporary `DEFAULT 1` V1.10 gave the
+// column. The two only agree because every insert is YouTrip's. Dropping the
+// default before this statement passes a project would make every import fail
+// on a NOT NULL violation.
+//
 // platforms is accumulated rather than replaced: a key seen in the Flutter file
 // and later in the Android file belongs to both, and whichever is imported
 // second must not erase the first.
@@ -201,6 +207,16 @@ func (r *keyRepository) UpsertByName(ctx context.Context, tx *gorm.DB, k model.K
 		// RETURNING yields nothing. That is the desired outcome — the row is
 		// already correct and its version was deliberately not churned — but
 		// the caller still needs the id, so read it back.
+		//
+		// TODO(plan-2): this read-back has no project_id. V1.10 rebuilt
+		// idx_keys_name_active as (project_id, name), so an active key name is
+		// unique WITHIN a project only, and this SELECT can match another
+		// project's key of the same name — `login_title` being exactly the sort
+		// of name two products both use. It would then return that key's id to
+		// the importer, which writes translations against it: one project's copy
+		// landing on another project's key, silently. The INSERT above is safe
+		// (its conflict target is the scoped index); only this fallback path is
+		// unscoped. Needs an AND project_id = $N once the scope is passed in.
 		row = r.db(ctx, tx).Raw(
 			`SELECT id FROM keys WHERE name = ? AND status = 'active'`, k.Name).Row()
 		if err := row.Scan(&id); err != nil {
@@ -504,6 +520,10 @@ func escapeLike(s string) string {
 // statement carries the same predicate the index does. DO NOTHING then RETURNING
 // makes "the name is taken" a missing row rather than a driver error to
 // pattern-match — the same move as createTagSQL.
+//
+// TODO(plan-2): same split as upsertKeySQL — the conflict target names
+// project_id, the column list does not, and the row's project comes from
+// V1.10's temporary `DEFAULT 1`.
 const createKeySQL = `
 INSERT INTO keys (name, description, platforms, android_name, ios_name,
                   status, sort_index, created_at, updated_at)

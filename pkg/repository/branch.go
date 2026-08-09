@@ -238,6 +238,16 @@ func (r *branchRepository) Create(ctx context.Context, tx *gorm.DB, name, descri
 	}
 }
 
+// TODO(plan-2): this WHERE has no project_id, and V1.11 dropped
+// branches_name_unique for branches_project_name_unique — per-project branch
+// names being the stated point of that migration, so that both teams may run a
+// `q3-copy` without one blocking the other. A name therefore no longer
+// identifies one branch, and `.Row()` returns whichever the planner reaches
+// first with no error. Every portal branch route resolves through here
+// (branchsvc looks a branch up by the name in the path before reading or
+// writing its deltas), so an ambiguous answer would put one project's edits on
+// another project's branch. Unreachable while one project exists; it needs a
+// project_id parameter and an AND project_id = $N before a second does.
 func (r *branchRepository) ByName(ctx context.Context, tx *gorm.DB, name string) (Branch, error) {
 	row := r.db(ctx, tx).Raw(
 		`SELECT `+branchColumns+` FROM branches WHERE name = $1`, name).Row()

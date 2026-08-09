@@ -68,5 +68,6 @@ func TestUserProjectRoleGrantRefusesAnUnknownRole(t *testing.T) {
 	})
 
 	err = repo.Grant(ctx, nil, email, 1, "superuser", "booter@you.co")
-	requireRejected(t, err, "a role outside the ordered set")
+	requireRejected(t, err, "user_project_roles_role_check",
+		"a role outside the ordered set")
 }

@@ -26,15 +26,19 @@ func TestProjectsSeed(t *testing.T) {
 }
 
 func TestProjectConstraintsRejectBadInput(t *testing.T) {
+	// The status case deliberately carries a VALID code: naming the constraint
+	// is what now proves it is projects_status_check doing the refusing rather
+	// than projects_code_format_check tripping first on a code chosen to be
+	// bad for an unrelated reason.
 	cases := []struct {
-		name, code, status string
+		name, code, status, constraint string
 	}{
-		{"duplicate code", "youtrip", "active"},
-		{"uppercase code", "YouBiz", "active"},
-		{"code with space", "you biz", "active"},
-		{"code starting with digit", "1biz", "active"},
-		{"empty code", "", "active"},
-		{"unknown status", "youbiz", "paused"},
+		{"duplicate code", "youtrip", "active", "projects_code_unique"},
+		{"uppercase code", "YouBiz", "active", "projects_code_format_check"},
+		{"code with space", "you biz", "active", "projects_code_format_check"},
+		{"code starting with digit", "1biz", "active", "projects_code_format_check"},
+		{"empty code", "", "active", "projects_code_format_check"},
+		{"unknown status", "youbiz", "paused", "projects_status_check"},
 	}
 
 	for _, c := range cases {
@@ -42,7 +46,7 @@ func TestProjectConstraintsRejectBadInput(t *testing.T) {
 			_, err := testDB.Exec(
 				`INSERT INTO projects (code, name, status) VALUES ($1, $2, $3)`,
 				c.code, "Test", c.status)
-			requireRejected(t, err, c.name)
+			requireRejected(t, err, c.constraint, c.name)
 		})
 	}
 }

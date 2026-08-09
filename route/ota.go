@@ -76,6 +76,24 @@ func (h *Handler) OTABundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An archived locale is not servable, and the check belongs here rather
+	// than inside ByCode: UpdateLocale needs that lookup unfiltered, or a
+	// locale could be archived but never un-archived.
+	//
+	// Without this the freeze is permanent and silent. releasesvc.Publish and
+	// mergesvc materialise bundles for ACTIVE locales only, so no future
+	// release ever refreshes an archived one — but its LAST bundle is still on
+	// disk, so this endpoint would keep answering 200 with it forever. Clients
+	// would sit on stale copy indefinitely rather than falling back to the
+	// strings shipped in the binary. Same 404 shape as an unknown locale,
+	// because from a client's point of view that is what it now is.
+	if locale.Status != repository.LocaleActive {
+		w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", otaNegativeMaxAge))
+		render.Status(r, http.StatusNotFound)
+		render.JSON(w, r, errorResponse{Error: "unknown_locale"})
+		return
+	}
+
 	bundle, err := h.releases.ServableBundle(r.Context(), nil, locale.ID, appVersion)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {

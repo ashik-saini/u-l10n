@@ -99,7 +99,8 @@ func TestCrossProjectBranchDeltaIsRefused(t *testing.T) {
 			`INSERT INTO branch_keys (project_id, branch_id, key_id, name, status, base_master_version, platforms, updated_by)
 			 VALUES ($1, $2, $3, 'branchscope.key', 'active', 0, '{"flutter"}', 'test@you.co')`,
 			otherProject, otherBranch, youtripKey)
-		requireRejected(t, err, "branch delta naming another project's key")
+		requireRejected(t, err, "branch_keys_key_fkey",
+			"branch delta naming another project's key")
 	})
 
 	t.Run("branch_keys: another project's branch claiming a YouTrip-adjacent key delta", func(t *testing.T) {
@@ -110,7 +111,8 @@ func TestCrossProjectBranchDeltaIsRefused(t *testing.T) {
 			`INSERT INTO branch_keys (project_id, branch_id, key_id, name, status, base_master_version, platforms, updated_by)
 			 VALUES ($1, $2, $3, 'branchscope.key2', 'active', 0, '{"flutter"}', 'test@you.co')`,
 			otherProject, youtripBranch, otherKey)
-		requireRejected(t, err, "another project's branch claiming a key delta")
+		requireRejected(t, err, "branch_keys_branch_fkey",
+			"another project's branch claiming a key delta")
 	})
 
 	t.Run("branch_translations: value delta naming another project's key", func(t *testing.T) {
@@ -121,7 +123,8 @@ func TestCrossProjectBranchDeltaIsRefused(t *testing.T) {
 			`INSERT INTO branch_translations (project_id, branch_id, key_id, locale_id, value, base_master_version, updated_by)
 			 VALUES ($1, $2, $3, $4, 'x', 0, 'test@you.co')`,
 			otherProject, otherBranch, youtripKey, otherLocale)
-		requireRejected(t, err, "value delta naming another project's key")
+		requireRejected(t, err, "branch_translations_key_fkey",
+			"value delta naming another project's key")
 	})
 
 	t.Run("branch_translations: value delta naming another project's locale", func(t *testing.T) {
@@ -131,7 +134,8 @@ func TestCrossProjectBranchDeltaIsRefused(t *testing.T) {
 			`INSERT INTO branch_translations (project_id, branch_id, key_id, locale_id, value, base_master_version, updated_by)
 			 VALUES ($1, $2, $3, $4, 'x', 0, 'test@you.co')`,
 			otherProject, otherBranch, otherKey, youtripLocale)
-		requireRejected(t, err, "value delta naming another project's locale")
+		requireRejected(t, err, "branch_translations_locale_fkey",
+			"value delta naming another project's locale")
 	})
 
 	t.Run("branch_translations: another project's branch claiming a value delta", func(t *testing.T) {
@@ -141,7 +145,8 @@ func TestCrossProjectBranchDeltaIsRefused(t *testing.T) {
 			`INSERT INTO branch_translations (project_id, branch_id, key_id, locale_id, value, base_master_version, updated_by)
 			 VALUES ($1, $2, $3, $4, 'x', 0, 'test@you.co')`,
 			otherProject, youtripBranch, otherKey, otherLocale)
-		requireRejected(t, err, "another project's branch claiming a value delta")
+		requireRejected(t, err, "branch_translations_branch_fkey",
+			"another project's branch claiming a value delta")
 	})
 }
 
@@ -181,7 +186,8 @@ func TestBranchNamesAreUniquePerProjectNotGlobally(t *testing.T) {
 	_, err = testDB.Exec(
 		`INSERT INTO branches (project_id, name, status, created_by)
 		 VALUES (1, 'shared-name', 'open', 'test@you.co')`)
-	requireRejected(t, err, "duplicate branch name within one project")
+	requireRejected(t, err, "branches_project_name_unique",
+		"duplicate branch name within one project")
 }
 
 // TestCrossProjectMergeRequestIsRefused: a merge request carries project_id
@@ -214,7 +220,8 @@ func TestCrossProjectMergeRequestIsRefused(t *testing.T) {
 		`INSERT INTO merge_requests (project_id, branch_id, title, created_by)
 		 VALUES ($1, $2, 'cross-project mr', 'test@you.co')`,
 		otherProject, youtripBranch)
-	requireRejected(t, err, "another project's merge request claiming a YouTrip branch")
+	requireRejected(t, err, "merge_requests_branch_fkey",
+		"another project's merge request claiming a YouTrip branch")
 }
 
 // TestCrossProjectMergeConflictResolutionIsRefused: merge_conflict_resolutions
@@ -288,7 +295,8 @@ func TestCrossProjectMergeConflictResolutionIsRefused(t *testing.T) {
 			`INSERT INTO merge_conflict_resolutions (project_id, merge_request_id, key_id, resolution, resolved_by)
 			 VALUES ($1, $2, $3, 'mine', 'test@you.co')`,
 			otherProject, mrID, youtripKey)
-		requireRejected(t, err, "another project's conflict resolution claiming a YouTrip key")
+		requireRejected(t, err, "merge_conflict_resolutions_key_fkey",
+			"another project's conflict resolution claiming a YouTrip key")
 	})
 
 	t.Run("resolution naming another project's locale is refused", func(t *testing.T) {
@@ -299,7 +307,8 @@ func TestCrossProjectMergeConflictResolutionIsRefused(t *testing.T) {
 			`INSERT INTO merge_conflict_resolutions (project_id, merge_request_id, key_id, locale_id, resolution, resolved_by)
 			 VALUES (1, $1, $2, $3, 'mine', 'test@you.co')`,
 			mrID, youtripKey, otherLocale)
-		requireRejected(t, err, "conflict resolution naming another project's locale")
+		requireRejected(t, err, "merge_conflict_resolutions_locale_fkey",
+			"conflict resolution naming another project's locale")
 	})
 
 	t.Run("a NULL-locale metadata resolution still inserts", func(t *testing.T) {

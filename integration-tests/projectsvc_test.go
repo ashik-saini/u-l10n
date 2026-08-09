@@ -113,6 +113,22 @@ func TestProjectCreateRollsBackTheProjectWhenTheGrantFails(t *testing.T) {
 	const code = "projectsvc-rollback-it"
 	const ghostActor = "ghost-actor-not-in-users@you.co"
 
+	// The assertion below is that this project row does NOT exist, so there is
+	// nothing to clean up when the test passes — which is precisely why the
+	// cleanup matters. If the rollback ever regresses, the row survives, and
+	// without this every subsequent run would fail on projects_code_unique
+	// during Create instead of on the assertion that would have named the real
+	// problem. A cleanup registered for the failure case only is still a
+	// cleanup.
+	t.Cleanup(func() {
+		_, cleanupErr := testDB.Exec(
+			`DELETE FROM user_project_roles WHERE project_id IN
+			     (SELECT id FROM projects WHERE code = $1)`, code)
+		require.NoError(t, cleanupErr)
+		_, cleanupErr = testDB.Exec(`DELETE FROM projects WHERE code = $1`, code)
+		require.NoError(t, cleanupErr)
+	})
+
 	_, err := svc.Create(ctx, ghostActor, projectsvc.NewProject{Code: code, Name: "Rollback Test"})
 	require.Error(t, err)
 
@@ -224,9 +240,16 @@ func TestAddLocaleWritesToTheNamedProject(t *testing.T) {
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM locales WHERE project_id = $1`, project.ID)
-		_, _ = testDB.Exec(`DELETE FROM user_project_roles WHERE project_id = $1`, project.ID)
-		_, _ = testDB.Exec(`DELETE FROM projects WHERE id = $1`, project.ID)
+		// Asserted, not discarded, like every scope_*_test.go cleanup: locales
+		// and grants both reference this project with no ON DELETE action, so a
+		// swallowed error here leaks the project AND a second 'km-KH' locale,
+		// and the next run fails somewhere else entirely.
+		_, cleanupErr := testDB.Exec(`DELETE FROM locales WHERE project_id = $1`, project.ID)
+		require.NoError(t, cleanupErr)
+		_, cleanupErr = testDB.Exec(`DELETE FROM user_project_roles WHERE project_id = $1`, project.ID)
+		require.NoError(t, cleanupErr)
+		_, cleanupErr = testDB.Exec(`DELETE FROM projects WHERE id = $1`, project.ID)
+		require.NoError(t, cleanupErr)
 	})
 
 	created, err := svc.AddLocale(ctx, "addlocale-target", projectsvc.NewLocale{

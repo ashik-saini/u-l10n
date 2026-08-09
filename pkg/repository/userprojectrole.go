@@ -13,9 +13,12 @@ import (
 // which project — split from identity (users.role) in
 // .db/V1.13__scope_identity.sql.
 //
-// It has exactly one method because that is all any caller needs so far: the
-// grant a project's creator receives for it, written in the same transaction
-// that creates the project. See projectsvc.Create.
+// It has exactly one method because that is all any caller needs so far, and
+// every caller uses it the same way — inside the transaction that writes the
+// fact the grant mirrors. projectsvc.Create pairs it with the project row;
+// usersvc.Grant and usersvc.SetRole pair it with users.role, because until
+// Plan 2 retires that column the two tables hold the same fact and a write to
+// one alone would silently outrank the other.
 type UserProjectRoleRepository interface {
 	// Grant creates or promotes a person's role on a project. Idempotent, for
 	// the same reason UserRepository.Upsert is: re-running the grant that

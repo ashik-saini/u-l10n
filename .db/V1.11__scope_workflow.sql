@@ -6,9 +6,13 @@
 -- delta must not name another project's key.
 --
 -- merge_requests carries project_id although it could be reached through its
--- branch. The merge transaction filters on it directly and the advisory lock
--- is derived from it; a join on every one of those statements would be cost
--- with no benefit.
+-- branch. The merge transaction will filter on it directly and the advisory
+-- lock will be derived from it; a join on every one of those statements would
+-- be cost with no benefit. Neither is true of the running code yet — mergesvc
+-- still takes one global lock (mergeLockKey) and never mentions project_id, so
+-- a merge in one project still blocks a merge in another. The column is here
+-- ahead of the code deliberately: adding it later would mean a second
+-- backfill.
 ALTER TABLE branches ADD COLUMN IF NOT EXISTS project_id SMALLINT;
 UPDATE branches SET project_id = 1 WHERE project_id IS NULL;
 ALTER TABLE branches

@@ -106,12 +106,17 @@ project's first `admin`, granted in the **same transaction** that creates the
 project row — a project whose creator holds no role on it is a project
 nobody could ever configure. `--lokalise-project-id` is optional; a project
 with no Lokalise source at all is legitimate. `project list --all` includes
-archived projects. Creating a project needs a platform admin (`user grant
---platform-admin`, above) — on a fresh database, or whenever nobody wants to
-expose project creation over the API yet, this CLI command is the way in,
-for the same bootstrapping reason `user grant` is: anyone who can run it
-already has database access, which is strictly more privilege than any role
-this schema can express.
+archived projects.
+
+**The platform-admin requirement is the API's, not this command's.**
+`POST /projects` checks `users.is_platform_admin` and answers 403 without it
+(`docs/API.md`, Projects). This CLI command checks nothing — `--actor` names
+who to grant the first role to, and is not authorized against anything. That
+is the point rather than an oversight: on a fresh database nobody is a
+platform admin yet, so an authorized path could never mint the first project.
+It is the same escape hatch `user grant` is, and it rests on the same
+argument — anyone who can run it already has shell and database access, which
+is strictly more privilege than any row in this schema can express.
 
 Adding a locale to a project (`POST /projects/{project}/locales`) and
 archiving one (`PATCH /projects/{project}/locales/{code}`) are API-only, not

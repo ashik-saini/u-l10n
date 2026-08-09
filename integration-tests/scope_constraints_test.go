@@ -60,14 +60,16 @@ func TestCrossProjectPairingIsRefused(t *testing.T) {
 		_, err := testDB.Exec(
 			`INSERT INTO translations (project_id, key_id, locale_id, value, version, updated_by)
 			 VALUES (1, $1, $2, 'x', 1, 'test@you.co')`, youtripKey, otherLocale)
-		requireRejected(t, err, "YouTrip key with another project's locale")
+		requireRejected(t, err, "translations_locale_fkey",
+			"YouTrip key with another project's locale")
 	})
 
 	t.Run("translation claiming the wrong project", func(t *testing.T) {
 		_, err := testDB.Exec(
 			`INSERT INTO translations (project_id, key_id, locale_id, value, version, updated_by)
 			 VALUES ($1, $2, $3, 'x', 1, 'test@you.co')`, otherProject, youtripKey, otherLocale)
-		requireRejected(t, err, "another project claiming a YouTrip key")
+		requireRejected(t, err, "translations_key_fkey",
+			"another project claiming a YouTrip key")
 	})
 }
 
@@ -116,7 +118,8 @@ func TestKeyTagPairingIsRefused(t *testing.T) {
 		_, err := testDB.Exec(
 			`INSERT INTO key_tags (project_id, key_id, tag_id) VALUES (1, $1, $2)`,
 			youtripKey, otherTag)
-		requireRejected(t, err, "YouTrip key tagged with another project's tag")
+		requireRejected(t, err, "key_tags_tag_fkey",
+			"YouTrip key tagged with another project's tag")
 	})
 
 	t.Run("another project claiming a YouTrip key", func(t *testing.T) {
@@ -127,7 +130,8 @@ func TestKeyTagPairingIsRefused(t *testing.T) {
 		_, err := testDB.Exec(
 			`INSERT INTO key_tags (project_id, key_id, tag_id) VALUES ($1, $2, $3)`,
 			otherProject, youtripKey, otherTag)
-		requireRejected(t, err, "another project claiming a YouTrip key via key_tags")
+		requireRejected(t, err, "key_tags_key_fkey",
+			"another project claiming a YouTrip key via key_tags")
 	})
 }
 
@@ -137,10 +141,12 @@ func TestLocaleExportDirectoriesAreUniquePerProject(t *testing.T) {
 	_, err := testDB.Exec(
 		`INSERT INTO locales (project_id, code, flutter_dir, android_values_dir, ios_lproj, sort_order)
 		 VALUES (1, 'xx-XX', 'en_SG', 'values-xx', 'xx.lproj', 99)`)
-	requireRejected(t, err, "duplicate flutter_dir within a project")
+	requireRejected(t, err, "locales_project_flutter_dir_unique",
+		"duplicate flutter_dir within a project")
 
 	_, err = testDB.Exec(
 		`INSERT INTO locales (project_id, code, flutter_dir, android_values_dir, ios_lproj, sort_order)
 		 VALUES (1, 'yy-YY', 'yy_YY', 'values', 'yy.lproj', 99)`)
-	requireRejected(t, err, "duplicate android_values_dir within a project")
+	requireRejected(t, err, "locales_project_android_dir_unique",
+		"duplicate android_values_dir within a project")
 }

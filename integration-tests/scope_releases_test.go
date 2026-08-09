@@ -45,7 +45,8 @@ func TestReleaseVersionsRestartPerProject(t *testing.T) {
 	_, err = testDB.Exec(
 		`INSERT INTO releases (project_id, version, source, created_by)
 		 VALUES (1, 9001, 'publish', 'test@you.co')`)
-	requireRejected(t, err, "duplicate version within one project")
+	requireRejected(t, err, "releases_project_version_unique",
+		"duplicate version within one project")
 }
 
 // TestCrossProjectReleaseBundleIsRefused proves release_bundles_release_fkey
@@ -98,7 +99,8 @@ func TestCrossProjectReleaseBundleIsRefused(t *testing.T) {
 			`INSERT INTO release_bundles (project_id, release_id, locale_id, strings, sha256, key_count, byte_size)
 			 VALUES (1, $1, $2, '{}'::jsonb, $3, 0, 2)`,
 			youtripRelease, otherLocale, assetSHA("bundle-cross-locale"))
-		requireRejected(t, err, "YouTrip release bundled for another project's locale")
+		requireRejected(t, err, "release_bundles_locale_fkey",
+			"YouTrip release bundled for another project's locale")
 	})
 
 	t.Run("another project claiming a YouTrip release", func(t *testing.T) {
@@ -111,7 +113,8 @@ func TestCrossProjectReleaseBundleIsRefused(t *testing.T) {
 			`INSERT INTO release_bundles (project_id, release_id, locale_id, strings, sha256, key_count, byte_size)
 			 VALUES ($1, $2, $3, '{}'::jsonb, $4, 0, 2)`,
 			otherProject, youtripRelease, otherLocale, assetSHA("bundle-cross-release"))
-		requireRejected(t, err, "another project claiming a YouTrip release via release_bundles")
+		requireRejected(t, err, "release_bundles_release_fkey",
+			"another project claiming a YouTrip release via release_bundles")
 	})
 }
 
@@ -163,7 +166,8 @@ func TestCrossProjectKeyAssetIsRefused(t *testing.T) {
 			`INSERT INTO key_assets (project_id, key_id, asset_id, created_by)
 			 VALUES (1, $1, $2, 'test@you.co')`,
 			youtripKey, otherAsset)
-		requireRejected(t, err, "YouTrip key linked to another project's asset")
+		requireRejected(t, err, "key_assets_asset_fkey",
+			"YouTrip key linked to another project's asset")
 	})
 
 	t.Run("another project claiming a YouTrip key via key_assets", func(t *testing.T) {
@@ -175,7 +179,8 @@ func TestCrossProjectKeyAssetIsRefused(t *testing.T) {
 			`INSERT INTO key_assets (project_id, key_id, asset_id, created_by)
 			 VALUES ($1, $2, $3, 'test@you.co')`,
 			otherProject, youtripKey, otherAsset)
-		requireRejected(t, err, "another project claiming a YouTrip key via key_assets")
+		requireRejected(t, err, "key_assets_key_fkey",
+			"another project claiming a YouTrip key via key_assets")
 	})
 }
 
@@ -221,5 +226,6 @@ func TestAssetSha256IsUniquePerProjectNotGlobally(t *testing.T) {
 		`INSERT INTO assets (project_id, s3_key, sha256, filename, content_type, bytes, uploaded_by)
 		 VALUES (1, 'screenshots/aa/bb/shared-3.png', $1, 'shared.png', 'image/png', 100, 'test@you.co')`,
 		sha)
-	requireRejected(t, err, "duplicate sha256 within one project")
+	requireRejected(t, err, "assets_project_sha256_unique",
+		"duplicate sha256 within one project")
 }

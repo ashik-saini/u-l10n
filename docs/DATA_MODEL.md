@@ -1,6 +1,6 @@
 # u-l10n — data model
 
-The schema, its invariants, and why each table exists. Derived from `.db/V1.00`–`V1.08` and `pkg/repository/`. For the request flows over this schema see [ARCHITECTURE.md](ARCHITECTURE.md).
+The schema, its invariants, and why each table exists. Derived from `.db/V1.00`–`V1.13` and `pkg/repository/`. For the request flows over this schema see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 One sentence version: `keys × locales → translations` is the master matrix, branches overlay deltas on it, merges fold deltas back and cut an immutable release, and everything a human does lands in an append-only history.
 

@@ -408,12 +408,14 @@ func userCommand(ctx context.Context, service *Service) cli.Command {
 
 // projectCommand mints and lists projects from the shell.
 //
-// It exists for the same bootstrapping reason userCommand does: creating a
-// project needs a platform admin, and on a fresh database — or one where
-// nobody wants to expose project creation over the API yet — the shell is
-// the way in. It shares the same escape-hatch reasoning: anyone who can run
-// this command already has database access, which is strictly more privilege
-// than any role this schema can express.
+// It exists for the same bootstrapping reason userCommand does. POST /projects
+// requires users.is_platform_admin; this command deliberately checks NOTHING,
+// because on a fresh database nobody holds that flag and an authorized path
+// could never mint the first project. --actor names who receives the first
+// admin grant, not who is permitted to run this. The escape hatch rests on the
+// same argument userCommand's does: anyone who can run it already has shell
+// and database access, which is strictly more privilege than any row in this
+// schema can express.
 //
 //	u-l10n project create --code youbiz --name YouBiz --actor ashik.saini@you.co
 func projectCommand(ctx context.Context, service *Service) cli.Command {

@@ -151,6 +151,10 @@ const selectTagColumns = `id, name, colour, created_at`
 // Detecting the duplicate through the conflict clause rather than by inspecting
 // a *pq.Error keeps the check race-free and keeps the driver's wording out of
 // our control flow.
+//
+// TODO(plan-2): the conflict target names project_id, the column list does not
+// — the row's project comes from the temporary `DEFAULT 1` V1.10 gave the
+// column. The two agree only while every insert is YouTrip's.
 const createTagSQL = `
 INSERT INTO tags (name, colour)
 VALUES ($1, $2)
@@ -202,6 +206,16 @@ func (r *tagRepository) List(ctx context.Context, tx *gorm.DB) ([]TagUsage, erro
 	return out, rows.Err()
 }
 
+// TODO(plan-2): this WHERE has no project_id, and V1.10 dropped
+// tags_name_unique for tags_project_name_unique, so a tag name now names at
+// most one row PER PROJECT rather than one row overall. `.Row()` would return
+// whichever the planner reaches first, with no error.
+//
+// The exposure is latent rather than live: tagsvc addresses tags by id
+// throughout, so nothing outside tag_repo_test.go calls this today. That makes
+// it the cheapest of the five to get wrong — the first caller added after a
+// second project exists inherits an arbitrary-row lookup and no failing test.
+// It needs a project_id parameter and an AND project_id = $N before then.
 func (r *tagRepository) ByName(ctx context.Context, tx *gorm.DB, name string) (Tag, error) {
 	var t Tag
 	row := r.db(ctx, tx).Raw(

@@ -152,9 +152,11 @@ func TestUserRepositoryPersistsPlatformAdmin(t *testing.T) {
 func TestUserRoleAndStatusAreConstrained(t *testing.T) {
 	_, err := testDB.Exec(
 		`INSERT INTO users (email, role) VALUES ($1, $2)`, "bad-role@you.co", "superadmin")
-	requireRejected(t, err, "a role outside the ordered set")
+	requireRejected(t, err, "users_role_check",
+		"a role outside the ordered set")
 
 	_, err = testDB.Exec(
 		`INSERT INTO users (email, status) VALUES ($1, $2)`, "bad-status@you.co", "suspended")
-	requireRejected(t, err, "an unknown status")
+	requireRejected(t, err, "users_status_check",
+		"an unknown status")
 }

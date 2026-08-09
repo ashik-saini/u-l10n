@@ -190,12 +190,14 @@ func TestRoleGrantsRequireAKnownRole(t *testing.T) {
 	_, err = testDB.Exec(
 		`INSERT INTO user_project_roles (email, project_id, role, granted_by)
 		 VALUES ('scope-role@you.co', 1, 'superuser', 'test@you.co')`)
-	requireRejected(t, err, "unknown role")
+	requireRejected(t, err, "user_project_roles_role_check",
+		"unknown role")
 
 	_, err = testDB.Exec(
 		`INSERT INTO user_project_roles (email, project_id, role, granted_by)
 		 VALUES ('scope-role@you.co', 999, 'viewer', 'test@you.co')`)
-	requireRejected(t, err, "grant against a project that does not exist")
+	requireRejected(t, err, "user_project_roles_project_id_fkey",
+		"grant against a project that does not exist")
 }
 
 // TestUserProjectRoleGrantCascadesWithTheUser proves user_project_roles_email_fkey
@@ -204,13 +206,26 @@ func TestRoleGrantsRequireAKnownRole(t *testing.T) {
 // A grant answers "what may this person do", not "what happened" — it has no
 // reason to outlive the person it describes.
 func TestUserProjectRoleGrantCascadesWithTheUser(t *testing.T) {
+	// ON CONFLICT DO NOTHING plus a cleanup, even though the test's own last
+	// act is to delete this user: any failure before that point leaks the row
+	// permanently, and every later run would then fail on users_email_unique
+	// instead of on whatever it was actually asserting — a red test that no
+	// longer tells you anything.
 	_, err := testDB.Exec(
-		`INSERT INTO users (email, role) VALUES ('scope-cascade@you.co', 'viewer')`)
+		`INSERT INTO users (email, role) VALUES ('scope-cascade@you.co', 'viewer')
+		 ON CONFLICT (email) DO NOTHING`)
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := testDB.Exec(`DELETE FROM users WHERE email = 'scope-cascade@you.co'`)
+		require.NoError(t, cleanupErr)
+	})
 
+	// Same reasoning: a run that died after this INSERT leaked the grant along
+	// with the user, so the pkey would be the thing failing next time round.
 	_, err = testDB.Exec(
 		`INSERT INTO user_project_roles (email, project_id, role, granted_by)
-		 VALUES ('scope-cascade@you.co', 1, 'viewer', 'test@you.co')`)
+		 VALUES ('scope-cascade@you.co', 1, 'viewer', 'test@you.co')
+		 ON CONFLICT (email, project_id) DO NOTHING`)
 	require.NoError(t, err)
 
 	_, err = testDB.Exec(`DELETE FROM users WHERE email = 'scope-cascade@you.co'`)
@@ -272,7 +287,8 @@ func TestHistoryCrossProjectPairingIsRefused(t *testing.T) {
 		_, err := testDB.Exec(
 			`INSERT INTO translation_history (project_id, key_id, locale_id, version, source, changed_by)
 			 VALUES (1, $1, $2, 1, 'ui', 'test@you.co')`, youtripKey, otherLocale)
-		requireRejected(t, err, "translation_history claiming a YouTrip key with another project's locale")
+		requireRejected(t, err, "translation_history_locale_fkey",
+			"translation_history claiming a YouTrip key with another project's locale")
 	})
 
 	t.Run("translation_history: another project claiming a YouTrip key", func(t *testing.T) {
@@ -299,7 +315,8 @@ func TestHistoryCrossProjectPairingIsRefused(t *testing.T) {
 		_, err := testDB.Exec(
 			`INSERT INTO translation_history (project_id, key_id, locale_id, version, source, changed_by)
 			 VALUES ($1, $2, $3, 1, 'ui', 'test@you.co')`, otherProject, youtripKey, otherLocale)
-		requireRejected(t, err, "another project's translation_history row claiming a YouTrip key")
+		requireRejected(t, err, "translation_history_key_fkey",
+			"another project's translation_history row claiming a YouTrip key")
 	})
 
 	t.Run("key_history: another project claiming a YouTrip key", func(t *testing.T) {
@@ -307,7 +324,8 @@ func TestHistoryCrossProjectPairingIsRefused(t *testing.T) {
 			`INSERT INTO key_history (project_id, key_id, name, platforms, status, version, source, changed_by)
 			 VALUES ($1, $2, 'scope.test.history.key', ARRAY['flutter']::TEXT[], 'active', 1, 'ui', 'test@you.co')`,
 			otherProject, youtripKey)
-		requireRejected(t, err, "another project's key_history row claiming a YouTrip key")
+		requireRejected(t, err, "key_history_key_fkey",
+			"another project's key_history row claiming a YouTrip key")
 	})
 }
 
@@ -323,28 +341,32 @@ func TestOperationalTablesRejectAnUnknownProject(t *testing.T) {
 		_, err := testDB.Exec(
 			`INSERT INTO api_tokens (project_id, name, token_sha256, token_prefix, created_by)
 			 VALUES ($1, 'ci', $2, 'ul10n_test', 'test@you.co')`, noSuchProject, hash)
-		requireRejected(t, err, "an api_token against a project that does not exist")
+		requireRejected(t, err, "api_tokens_project_fkey",
+			"an api_token against a project that does not exist")
 	})
 
 	t.Run("project_settings", func(t *testing.T) {
 		_, err := testDB.Exec(
 			`INSERT INTO project_settings (project_id, key, value, updated_by)
 			 VALUES ($1, 'scope.test.setting', '{}'::JSONB, 'test@you.co')`, noSuchProject)
-		requireRejected(t, err, "a project_settings row against a project that does not exist")
+		requireRejected(t, err, "project_settings_project_fkey",
+			"a project_settings row against a project that does not exist")
 	})
 
 	t.Run("audit_events", func(t *testing.T) {
 		_, err := testDB.Exec(
 			`INSERT INTO audit_events (project_id, actor, action)
 			 VALUES ($1, 'test@you.co', 'scope.test.action')`, noSuchProject)
-		requireRejected(t, err, "an audit_events row against a project that does not exist")
+		requireRejected(t, err, "audit_events_project_fkey",
+			"an audit_events row against a project that does not exist")
 	})
 
 	t.Run("import_runs", func(t *testing.T) {
 		_, err := testDB.Exec(
 			`INSERT INTO import_runs (project_id, started_by)
 			 VALUES ($1, 'test@you.co')`, noSuchProject)
-		requireRejected(t, err, "an import_runs row against a project that does not exist")
+		requireRejected(t, err, "import_runs_project_fkey",
+			"an import_runs row against a project that does not exist")
 	})
 }
 
@@ -382,5 +404,6 @@ func TestProjectSettingsKeyIsScopedPerProject(t *testing.T) {
 	_, err = testDB.Exec(
 		`INSERT INTO project_settings (project_id, key, value, updated_by)
 		 VALUES (1, 'scope.test.shared_key', '"duplicate"', 'test@you.co')`)
-	requireRejected(t, err, "a duplicate key within the same project")
+	requireRejected(t, err, "project_settings_pkey",
+		"a duplicate key within the same project")
 }

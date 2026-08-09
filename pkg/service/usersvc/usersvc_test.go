@@ -3,6 +3,7 @@ package usersvc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/jinzhu/gorm"
@@ -81,6 +82,36 @@ func (f *fakeUsers) SetRole(_ context.Context, _ *gorm.DB, email, role string) (
 	return u, nil
 }
 
+// fakeRoles is a UserProjectRoleRepository backed by a map keyed
+// (email, project_id), mirroring the real primary key so a second grant for the
+// same pair promotes rather than accumulating.
+type fakeRoles struct {
+	grants map[string]string // "email|projectID" -> role
+	by     map[string]string // same key -> granted_by
+	calls  int
+	err    error
+}
+
+func newFakeRoles() *fakeRoles {
+	return &fakeRoles{grants: map[string]string{}, by: map[string]string{}}
+}
+
+func grantKey(email string, projectID int16) string {
+	return fmt.Sprintf("%s|%d", key(email), projectID)
+}
+
+func (f *fakeRoles) Grant(
+	_ context.Context, _ *gorm.DB, email string, projectID int16, role, grantedBy string,
+) error {
+	f.calls++
+	if f.err != nil {
+		return f.err
+	}
+	f.grants[grantKey(email, projectID)] = role
+	f.by[grantKey(email, projectID)] = grantedBy
+	return nil
+}
+
 type fakeAudit struct {
 	events []repository.AuditEvent
 	err    error
@@ -106,13 +137,14 @@ func (f *fakeTx) WithTransaction(_ context.Context, fn database.TransactionFunc)
 type harness struct {
 	svc   *Service
 	users *fakeUsers
+	roles *fakeRoles
 	audit *fakeAudit
 	tx    *fakeTx
 }
 
 func newHarness() *harness {
-	h := &harness{users: newFakeUsers(), audit: &fakeAudit{}, tx: &fakeTx{}}
-	h.svc = &Service{tx: h.tx, users: h.users, audit: h.audit}
+	h := &harness{users: newFakeUsers(), roles: newFakeRoles(), audit: &fakeAudit{}, tx: &fakeTx{}}
+	h.svc = &Service{tx: h.tx, users: h.users, roles: h.roles, audit: h.audit}
 	return h
 }
 
@@ -139,7 +171,33 @@ func TestSetRoleChangesTheRoleAndAuditsIt(t *testing.T) {
 	assert.Equal(t, repository.RoleEditor, e.Metadata["from"])
 	assert.Equal(t, repository.RoleApprover, e.Metadata["to"])
 
-	assert.Equal(t, 1, h.tx.calls, "one transaction, so the row and its audit land together")
+	// The grant moves with users.role. Until Plan 2 retires that column the two
+	// tables hold the same fact, and a SetRole that wrote only one of them would
+	// leave a demoted operator holding their old role the moment the middleware
+	// switches — silently, since nothing errors at any step.
+	assert.Equal(t, repository.RoleApprover, h.roles.grants[grantKey("editor@you.co", 1)])
+	assert.Equal(t, "admin@you.co", h.roles.by[grantKey("editor@you.co", 1)],
+		"the grant records who made the change, not who it was migrated by")
+
+	assert.Equal(t, 1, h.tx.calls,
+		"one transaction, so the row, its grant and its audit land together")
+}
+
+// TestSetRoleFailsWhenTheGrantFails proves the grant is not best-effort: a
+// users.role that committed while its grant did not is the exact divergence
+// writing both was meant to prevent, so the whole call must fail.
+func TestSetRoleFailsWhenTheGrantFails(t *testing.T) {
+	h := newHarness()
+	h.roles.err = errors.New("user_project_roles is unreachable")
+	h.users.rows["a@you.co"] = repository.User{
+		Email: "a@you.co", Role: repository.RoleViewer, Status: repository.StatusActive}
+
+	_, err := h.svc.SetRole(context.Background(),
+		"a@you.co", repository.RoleAdmin, "admin@you.co", "req")
+	require.Error(t, err)
+	assert.Empty(t, h.audit.events,
+		"the error must propagate out of the transaction before anything else is written")
+	assert.Equal(t, 1, h.tx.calls)
 }
 
 // TestSetRoleRefusesAnUnknownRole. The users_role_check constraint would refuse
@@ -155,6 +213,7 @@ func TestSetRoleRefusesAnUnknownRole(t *testing.T) {
 			_, err := h.svc.SetRole(context.Background(), "a@you.co", role, "admin@you.co", "req")
 			assert.ErrorIs(t, err, ErrBadRequest)
 			assert.Zero(t, h.users.setRoleAt, "nothing may be written on a refused request")
+			assert.Zero(t, h.roles.calls, "least of all a grant carrying the bad role")
 			assert.Empty(t, h.audit.events)
 		})
 	}
@@ -221,6 +280,11 @@ func TestGrantCreatesTheFirstAdmin(t *testing.T) {
 	assert.Equal(t, repository.ActionUserGrant, e.Action)
 	assert.Equal(t, "(none)", e.Metadata["from"], "absent and present are different facts")
 	assert.Equal(t, "cli", e.Metadata["via"])
+
+	// The bootstrap admin needs a grant too. V1.13 backfilled one for everybody
+	// who already existed; anyone provisioned after it and before Plan 2 would
+	// otherwise have none at all, and be locked out entirely at the cutover.
+	assert.Equal(t, repository.RoleAdmin, h.roles.grants[grantKey("ashik.saini@you.co", 1)])
 }
 
 func TestGrantIsIdempotentAndPromotes(t *testing.T) {
@@ -247,6 +311,7 @@ func TestGrantRefusals(t *testing.T) {
 		_, err := h.svc.Grant(ctx, "a@you.co", "root", "", false, "boot@you.co", "cli")
 		assert.ErrorIs(t, err, ErrBadRequest)
 		assert.Zero(t, h.users.upsertAt)
+		assert.Zero(t, h.roles.calls)
 	})
 
 	t.Run("unknown status", func(t *testing.T) {
@@ -254,6 +319,7 @@ func TestGrantRefusals(t *testing.T) {
 		_, err := h.svc.Grant(ctx, "a@you.co", repository.RoleAdmin, "suspended", false, "boot@you.co", "cli")
 		assert.ErrorIs(t, err, ErrBadRequest)
 		assert.Zero(t, h.users.upsertAt)
+		assert.Zero(t, h.roles.calls)
 	})
 
 	t.Run("no actor", func(t *testing.T) {
@@ -263,6 +329,7 @@ func TestGrantRefusals(t *testing.T) {
 		_, err := h.svc.Grant(ctx, "a@you.co", repository.RoleAdmin, "", false, "  ", "cli")
 		assert.ErrorIs(t, err, ErrBadRequest)
 		assert.Zero(t, h.users.upsertAt)
+		assert.Zero(t, h.roles.calls)
 	})
 
 	t.Run("rubbish email", func(t *testing.T) {
@@ -270,6 +337,7 @@ func TestGrantRefusals(t *testing.T) {
 		_, err := h.svc.Grant(ctx, "nobody", repository.RoleAdmin, "", false, "boot@you.co", "cli")
 		assert.ErrorIs(t, err, ErrBadRequest)
 		assert.Zero(t, h.users.upsertAt)
+		assert.Zero(t, h.roles.calls)
 	})
 }
 

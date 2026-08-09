@@ -156,9 +156,19 @@ func (s *Service) Create(ctx context.Context, actor string, in NewProject) (mode
 
 // Update changes a project's name, status or Lokalise linkage.
 //
-// The lookup and the write share a transaction so a project archived by
-// another request between the two cannot silently reappear active under a
-// caller who never asked for that.
+// The lookup and the write share a transaction so that the code -> id
+// resolution and the UPDATE either both land or neither does: a caller can
+// never be told a project was updated when the row it resolved had been
+// deleted underneath it.
+//
+// It does NOT protect against a concurrent archive. ByCode takes no FOR UPDATE,
+// and the UPDATE below is unconditional on status, so two callers racing —
+// one archiving, one renaming — resolve the same id and the second write wins
+// on whatever it happens to set. That is last-writer-wins, and it is the
+// accepted behaviour here: a project's status is changed by a human at
+// human intervals, not by a workflow, so the optimistic-version machinery
+// translations carry would be cost with no reader. Say what the transaction
+// buys rather than implying it serialises these callers.
 func (s *Service) Update(ctx context.Context, code string, in ProjectPatch) (model.Project, error) {
 	var updated model.Project
 
@@ -260,10 +270,17 @@ func (s *Service) AddLocale(ctx context.Context, projectCode string, in NewLocal
 // UpdateLocale changes a locale's export directories, sort order or status.
 //
 // The code is not a parameter of LocalePatch and cannot be changed through
-// this method — see LocalePatch's doc comment. The lookup and the write
-// share a transaction for the same reason Update does above: a project
-// archived, or a locale archived by another request, between the two must
-// not be able to reappear silently under a caller who never asked for that.
+// this method — see LocalePatch's doc comment. The lookup and the write share
+// a transaction for the same reason Update does above, and with the same
+// limit: it makes the project-code resolution and the locale write atomic, but
+// neither read takes FOR UPDATE, so two callers racing on the same locale are
+// last-writer-wins rather than serialised.
+//
+// The unfiltered ByCode is deliberate and load-bearing on the locale side:
+// this is the only path that can set status back to active, so an archived
+// locale has to remain findable or archiving it would be irreversible. See
+// route/ota.go, which filters on status at the call site instead for exactly
+// that reason.
 func (s *Service) UpdateLocale(ctx context.Context, projectCode, code string, in LocalePatch) (model.Locale, error) {
 	var updated model.Locale
 

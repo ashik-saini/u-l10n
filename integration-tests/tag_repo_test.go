@@ -100,8 +100,12 @@ func TestTagCreateRejectsDuplicateName(t *testing.T) {
 		"colour must survive the round trip: Lokalise does not serve it, so a lost "+
 			"colour cannot be re-imported and has to be read off the UI again by hand")
 
+	// No constraint name to assert: createTagSQL is ON CONFLICT DO NOTHING and
+	// the repository reads "no row returned" as the duplicate, so
+	// tags_project_name_unique never raises a driver error at all. The
+	// sentinel assertion below is what carries the discrimination here.
 	_, err = repo.Create(ctx, nil, "tag.dup", "#00ff00")
-	requireRejected(t, err, "a second tag named tag.dup")
+	requireRejectedBySentinel(t, err, "a second tag named tag.dup")
 
 	// A typed sentinel, so the handler can answer 409 without matching on the
 	// driver's wording.
