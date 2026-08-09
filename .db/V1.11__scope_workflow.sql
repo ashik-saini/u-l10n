@@ -72,3 +72,16 @@ ALTER TABLE merge_conflict_resolutions DROP CONSTRAINT merge_conflict_resolution
 ALTER TABLE merge_conflict_resolutions
     ADD CONSTRAINT merge_conflict_resolutions_key_fkey
         FOREIGN KEY (project_id, key_id) REFERENCES keys (project_id, id) ON DELETE CASCADE;
+
+-- locale_id is NULL for a key-metadata conflict, which has no locale
+-- dimension (see V1.02). A composite key still closes the pairing gap for the
+-- rows that DO carry one: FOREIGN KEY (project_id, locale_id) uses Postgres's
+-- default MATCH SIMPLE, which skips enforcement only when locale_id itself is
+-- NULL — project_id is NOT NULL on this table, so a metadata-conflict row
+-- (locale_id NULL) still inserts freely, while a value-conflict row naming a
+-- real locale from another project is refused exactly like every other
+-- pairing this migration closes.
+ALTER TABLE merge_conflict_resolutions DROP CONSTRAINT merge_conflict_resolutions_locale_id_fkey;
+ALTER TABLE merge_conflict_resolutions
+    ADD CONSTRAINT merge_conflict_resolutions_locale_fkey
+        FOREIGN KEY (project_id, locale_id) REFERENCES locales (project_id, id);

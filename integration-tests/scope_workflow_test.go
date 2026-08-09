@@ -28,12 +28,15 @@ func TestCrossProjectBranchDeltaIsRefused(t *testing.T) {
 		 RETURNING id`).Scan(&otherProject))
 	// Registered first so it runs LAST (t.Cleanup is LIFO): branches_project_fkey,
 	// keys_project_fkey and locales_project_fkey carry no ON DELETE CASCADE, so
-	// deleting the project while any of them still points at it would fail —
-	// silently, since every cleanup below discards its error the same way
-	// scope_constraints_test.go does, to avoid one cleanup's failure masking
-	// the assertion that already ran.
+	// deleting the project before the rows below would fail. Every cleanup here
+	// asserts require.NoError, following scope_constraints_test.go's actual
+	// pattern (not the discard-the-error version this file wrongly claimed
+	// before review): a locale left behind by a swallowed error is exactly the
+	// leak that makes schema_test.go's unscoped `count(*) FROM locales` and
+	// helpers_test.go's unscoped `localeID` lookup depend on run order.
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM projects WHERE id = $1`, otherProject)
+		_, err := testDB.Exec(`DELETE FROM projects WHERE id = $1`, otherProject)
+		require.NoError(t, err)
 	})
 
 	var otherLocale int16
@@ -42,7 +45,8 @@ func TestCrossProjectBranchDeltaIsRefused(t *testing.T) {
 		 VALUES ($1, 'en-SG', 'en_SG', 'values', 'en-SG.lproj', 1)
 		 RETURNING id`, otherProject).Scan(&otherLocale))
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM locales WHERE id = $1`, otherLocale)
+		_, err := testDB.Exec(`DELETE FROM locales WHERE id = $1`, otherLocale)
+		require.NoError(t, err)
 	})
 
 	var otherBranch int64
@@ -51,7 +55,8 @@ func TestCrossProjectBranchDeltaIsRefused(t *testing.T) {
 		 VALUES ($1, 'q3-copy-other', 'open', 'test@you.co') RETURNING id`,
 		otherProject).Scan(&otherBranch))
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM branches WHERE id = $1`, otherBranch)
+		_, err := testDB.Exec(`DELETE FROM branches WHERE id = $1`, otherBranch)
+		require.NoError(t, err)
 	})
 
 	var otherKey int64
@@ -60,7 +65,8 @@ func TestCrossProjectBranchDeltaIsRefused(t *testing.T) {
 		 VALUES ($1, 'branchscope.other.key', '{"flutter"}', 'active', $2)
 		 RETURNING id`, otherProject, nextSortIndex()).Scan(&otherKey))
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM keys WHERE id = $1`, otherKey)
+		_, err := testDB.Exec(`DELETE FROM keys WHERE id = $1`, otherKey)
+		require.NoError(t, err)
 	})
 
 	var youtripBranch int64
@@ -69,7 +75,8 @@ func TestCrossProjectBranchDeltaIsRefused(t *testing.T) {
 		 VALUES (1, 'main-scope-branch', 'open', 'test@you.co') RETURNING id`).
 		Scan(&youtripBranch))
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM branches WHERE id = $1`, youtripBranch)
+		_, err := testDB.Exec(`DELETE FROM branches WHERE id = $1`, youtripBranch)
+		require.NoError(t, err)
 	})
 
 	var youtripKey int64
@@ -78,7 +85,8 @@ func TestCrossProjectBranchDeltaIsRefused(t *testing.T) {
 		 VALUES (1, 'branchscope.youtrip.key', '{"flutter"}', 'active', $1)
 		 RETURNING id`, nextSortIndex()).Scan(&youtripKey))
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM keys WHERE id = $1`, youtripKey)
+		_, err := testDB.Exec(`DELETE FROM keys WHERE id = $1`, youtripKey)
+		require.NoError(t, err)
 	})
 
 	youtripLocale := localeID(t, "en-MY")
@@ -144,7 +152,8 @@ func TestBranchNamesAreUniquePerProjectNotGlobally(t *testing.T) {
 		`INSERT INTO projects (code, name) VALUES ('namescope', 'Name Scope')
 		 RETURNING id`).Scan(&otherProject))
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM projects WHERE id = $1`, otherProject)
+		_, err := testDB.Exec(`DELETE FROM projects WHERE id = $1`, otherProject)
+		require.NoError(t, err)
 	})
 
 	_, err := testDB.Exec(
@@ -152,14 +161,16 @@ func TestBranchNamesAreUniquePerProjectNotGlobally(t *testing.T) {
 		 VALUES (1, 'shared-name', 'open', 'test@you.co')`)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM branches WHERE project_id = 1 AND name = 'shared-name'`)
+		_, err := testDB.Exec(`DELETE FROM branches WHERE project_id = 1 AND name = 'shared-name'`)
+		require.NoError(t, err)
 	})
 
 	// Registered after the project's cleanup, so it runs FIRST (t.Cleanup is
 	// LIFO) — branches_project_fkey carries no ON DELETE CASCADE, so deleting
 	// the project first would fail while this row still points at it.
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM branches WHERE project_id = $1 AND name = 'shared-name'`, otherProject)
+		_, err := testDB.Exec(`DELETE FROM branches WHERE project_id = $1 AND name = 'shared-name'`, otherProject)
+		require.NoError(t, err)
 	})
 
 	_, err = testDB.Exec(
@@ -183,7 +194,8 @@ func TestCrossProjectMergeRequestIsRefused(t *testing.T) {
 		`INSERT INTO projects (code, name) VALUES ('mrscope', 'MR Scope')
 		 RETURNING id`).Scan(&otherProject))
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM projects WHERE id = $1`, otherProject)
+		_, err := testDB.Exec(`DELETE FROM projects WHERE id = $1`, otherProject)
+		require.NoError(t, err)
 	})
 
 	var youtripBranch int64
@@ -192,7 +204,8 @@ func TestCrossProjectMergeRequestIsRefused(t *testing.T) {
 		 VALUES (1, 'mr-scope-branch', 'open', 'test@you.co') RETURNING id`).
 		Scan(&youtripBranch))
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM branches WHERE id = $1`, youtripBranch)
+		_, err := testDB.Exec(`DELETE FROM branches WHERE id = $1`, youtripBranch)
+		require.NoError(t, err)
 	})
 
 	// (otherProject, youtripBranch) names a branch that exists, but not under
@@ -205,17 +218,32 @@ func TestCrossProjectMergeRequestIsRefused(t *testing.T) {
 }
 
 // TestCrossProjectMergeConflictResolutionIsRefused: merge_conflict_resolutions
-// gained project_id and a composite key_fkey in V1.11, while its
-// merge_request_id foreign key stays a plain single column — a resolution is
-// always read alongside its merge request, which already carries project_id,
-// so there is no analogous pairing risk to close there.
+// gained project_id and composite key_fkey/locale_fkey in V1.11.
+//
+// merge_request_id stays a plain single-column foreign key. That IS a real
+// pairing gap — a project-2 resolution can still be inserted against a
+// project-1 merge request, the mirror image of what key_fkey and locale_fkey
+// now close — but closing it needs `UNIQUE (project_id, id)` on
+// merge_requests, a larger change deliberately deferred to the next plan.
+// This test does not cover that gap; it exists, it is not absent.
 func TestCrossProjectMergeConflictResolutionIsRefused(t *testing.T) {
 	var otherProject int16
 	require.NoError(t, testDB.QueryRow(
 		`INSERT INTO projects (code, name) VALUES ('conflictscope', 'Conflict Scope')
 		 RETURNING id`).Scan(&otherProject))
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM projects WHERE id = $1`, otherProject)
+		_, err := testDB.Exec(`DELETE FROM projects WHERE id = $1`, otherProject)
+		require.NoError(t, err)
+	})
+
+	var otherLocale int16
+	require.NoError(t, testDB.QueryRow(
+		`INSERT INTO locales (project_id, code, flutter_dir, android_values_dir, ios_lproj, sort_order)
+		 VALUES ($1, 'en-SG', 'en_SG', 'values', 'en-SG.lproj', 1)
+		 RETURNING id`, otherProject).Scan(&otherLocale))
+	t.Cleanup(func() {
+		_, err := testDB.Exec(`DELETE FROM locales WHERE id = $1`, otherLocale)
+		require.NoError(t, err)
 	})
 
 	var youtripKey int64
@@ -224,7 +252,8 @@ func TestCrossProjectMergeConflictResolutionIsRefused(t *testing.T) {
 		 VALUES (1, 'conflictscope.key', '{"flutter"}', 'active', $1)
 		 RETURNING id`, nextSortIndex()).Scan(&youtripKey))
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM keys WHERE id = $1`, youtripKey)
+		_, err := testDB.Exec(`DELETE FROM keys WHERE id = $1`, youtripKey)
+		require.NoError(t, err)
 	})
 
 	var youtripBranch int64
@@ -233,7 +262,8 @@ func TestCrossProjectMergeConflictResolutionIsRefused(t *testing.T) {
 		 VALUES (1, 'conflict-scope-branch', 'open', 'test@you.co') RETURNING id`).
 		Scan(&youtripBranch))
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM branches WHERE id = $1`, youtripBranch)
+		_, err := testDB.Exec(`DELETE FROM branches WHERE id = $1`, youtripBranch)
+		require.NoError(t, err)
 	})
 
 	var mrID int64
@@ -241,16 +271,49 @@ func TestCrossProjectMergeConflictResolutionIsRefused(t *testing.T) {
 		`INSERT INTO merge_requests (project_id, branch_id, title, created_by)
 		 VALUES (1, $1, 'conflict scope mr', 'test@you.co') RETURNING id`,
 		youtripBranch).Scan(&mrID))
+	// merge_conflict_resolutions_merge_request_id_fkey carries ON DELETE
+	// CASCADE, so deleting this merge request also removes the NULL-locale
+	// row the third subtest below actually persists — no separate cleanup
+	// needed for that row.
 	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM merge_requests WHERE id = $1`, mrID)
+		_, err := testDB.Exec(`DELETE FROM merge_requests WHERE id = $1`, mrID)
+		require.NoError(t, err)
 	})
 
-	// mrID is a real merge request (merge_conflict_resolutions_merge_request_id_fkey
-	// is satisfied), but (otherProject, youtripKey) is not a real key row: only
-	// merge_conflict_resolutions_key_fkey can refuse this row.
-	_, err := testDB.Exec(
-		`INSERT INTO merge_conflict_resolutions (project_id, merge_request_id, key_id, resolution, resolved_by)
-		 VALUES ($1, $2, $3, 'mine', 'test@you.co')`,
-		otherProject, mrID, youtripKey)
-	requireRejected(t, err, "another project's conflict resolution claiming a YouTrip key")
+	t.Run("resolution claiming a YouTrip key from another project", func(t *testing.T) {
+		// mrID is a real merge request (merge_conflict_resolutions_merge_request_id_fkey
+		// is satisfied), but (otherProject, youtripKey) is not a real key row: only
+		// merge_conflict_resolutions_key_fkey can refuse this row.
+		_, err := testDB.Exec(
+			`INSERT INTO merge_conflict_resolutions (project_id, merge_request_id, key_id, resolution, resolved_by)
+			 VALUES ($1, $2, $3, 'mine', 'test@you.co')`,
+			otherProject, mrID, youtripKey)
+		requireRejected(t, err, "another project's conflict resolution claiming a YouTrip key")
+	})
+
+	t.Run("resolution naming another project's locale is refused", func(t *testing.T) {
+		// project_id=1 pairs correctly with mrID and youtripKey; only
+		// merge_conflict_resolutions_locale_fkey can refuse (1, otherLocale) —
+		// otherLocale belongs to otherProject, not project 1.
+		_, err := testDB.Exec(
+			`INSERT INTO merge_conflict_resolutions (project_id, merge_request_id, key_id, locale_id, resolution, resolved_by)
+			 VALUES (1, $1, $2, $3, 'mine', 'test@you.co')`,
+			mrID, youtripKey, otherLocale)
+		requireRejected(t, err, "conflict resolution naming another project's locale")
+	})
+
+	t.Run("a NULL-locale metadata resolution still inserts", func(t *testing.T) {
+		// The whole point of leaving locale_id nullable: Postgres's default
+		// MATCH SIMPLE skips FK enforcement when ANY column of a composite key
+		// is NULL. project_id is NOT NULL here, so only locale_id being NULL can
+		// trigger that skip — proving the composite FK protects value-conflict
+		// rows without also silently blocking every metadata-conflict row. If
+		// this subtest failed instead of the one above, the "fix" would have
+		// been to make locale_id NOT NULL, which is the wrong migration.
+		_, err := testDB.Exec(
+			`INSERT INTO merge_conflict_resolutions (project_id, merge_request_id, key_id, resolution, resolved_by)
+			 VALUES (1, $1, $2, 'mine', 'test@you.co')`,
+			mrID, youtripKey)
+		require.NoError(t, err, "a metadata conflict resolution (NULL locale_id) must still be accepted")
+	})
 }

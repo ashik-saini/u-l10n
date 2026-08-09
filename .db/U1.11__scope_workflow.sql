@@ -6,6 +6,10 @@
 -- immediate silent corruption, not a return to a previous working state —
 -- exactly the case U1.10 already made for the core matrix, now true of the
 -- branch workflow too.
+ALTER TABLE merge_conflict_resolutions DROP CONSTRAINT merge_conflict_resolutions_locale_fkey;
+ALTER TABLE merge_conflict_resolutions
+    ADD CONSTRAINT merge_conflict_resolutions_locale_id_fkey
+        FOREIGN KEY (locale_id) REFERENCES locales (id);
 ALTER TABLE merge_conflict_resolutions DROP CONSTRAINT merge_conflict_resolutions_key_fkey;
 ALTER TABLE merge_conflict_resolutions
     ADD CONSTRAINT merge_conflict_resolutions_key_id_fkey
