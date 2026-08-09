@@ -15,6 +15,14 @@
 -- loss this undo file must not perform. If this migration is ever actually
 -- run, the operator must resolve the sha256 collision by hand, in the open,
 -- rather than have this script guess which project's asset survives.
+--
+-- Restoring `assets_s3_key_unique` fails for the identical reason, today
+-- unconditionally rather than only once collision is possible:
+-- assetsvc.s3Key() derives the key from sha256 alone, with no project
+-- component (see the TODO(plan-2) there and V1.12's header). Two projects
+-- holding the same bytes already produce two `assets` rows with the SAME
+-- s3_key, distinguished only by this migration's project-scoped unique index
+-- — restoring the global one hits that duplicate immediately.
 ALTER TABLE key_assets DROP CONSTRAINT key_assets_key_fkey, DROP CONSTRAINT key_assets_asset_fkey;
 ALTER TABLE key_assets
     ADD CONSTRAINT key_assets_key_id_fkey FOREIGN KEY (key_id) REFERENCES keys (id) ON DELETE CASCADE,

@@ -220,6 +220,18 @@ type ServableBundle struct {
 // The floor is compared as an INTEGER TRIPLE, not as text: '4.9.0' > '4.10.0'
 // lexically, which would withhold a release from exactly the clients it was
 // meant for. NULL means every client is eligible.
+//
+// The r.project_id predicate is load-bearing for the query PLAN, not for
+// correctness: a locale_id already names exactly one project (locales carries
+// a UNIQUE (project_id, id) since V1.10), so the join could never actually
+// cross a project boundary even without it. But V1.12 replaced
+// releases_version_unique with a project_id-LED index
+// (releases_project_version_unique / idx_releases_servable), and a leading
+// column an equality predicate never touches cannot be used to satisfy
+// `ORDER BY version DESC` once more than one project_id value exists in the
+// table — the planner falls back to scanning and sorting every eligible
+// release across every project before applying LIMIT 1. Naming the project
+// explicitly is what lets the planner use that index for the ordering again.
 const servableBundleSQL = `
 WITH client AS (
     SELECT COALESCE(NULLIF($2, ''), '0.0.0') AS v
@@ -228,6 +240,7 @@ SELECT r.version, rb.strings::text, rb.sha256
   FROM releases r
   JOIN release_bundles rb ON rb.release_id = r.id
  WHERE rb.locale_id = $1
+   AND r.project_id = (SELECT project_id FROM locales WHERE id = $1)
    AND r.rolled_back_at IS NULL
    AND (
         r.min_app_version IS NULL

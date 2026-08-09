@@ -4,11 +4,19 @@
 -- YouTrip's next number. Each app therefore has an independent version line,
 -- which is what makes a per-project min_app_version floor meaningful.
 --
--- ASSETS ARE ISOLATED RATHER THAN SHARED. Content addressing is preserved
--- within a project by putting the project in the S3 key prefix. Identical
--- bytes uploaded to two projects are stored twice — negligible for
--- screenshots, and it buys a permission model that is a column rather than a
--- join through key_assets, plus isolation at the storage layer.
+-- ASSETS ARE MEANT TO BE ISOLATED RATHER THAN SHARED, BUT THE STORAGE LAYER
+-- DOES NOT YET DO ITS PART. The design is: identical bytes uploaded to two
+-- projects are stored twice, by putting the project in the S3 key prefix —
+-- negligible cost for screenshots, and it buys a permission model that is a
+-- column rather than a join through key_assets, plus isolation at the storage
+-- layer. assetsvc.s3Key() does not carry a project component yet, so two
+-- projects uploading identical bytes today produce two `assets` rows (correctly
+-- distinguished by this migration's project-scoped uniques) that both compute
+-- the SAME s3_key and therefore point at ONE S3 object — deleting one
+-- project's asset would delete the other's. Prefixing s3Key() belongs with the
+-- rest of the explicit-scope work in the next plan (see the matching
+-- TODO(plan-2) at assetsvc.s3Key and at AssetRepository.BySHA256, which has the
+-- same gap on the read side).
 ALTER TABLE releases ADD COLUMN IF NOT EXISTS project_id SMALLINT;
 UPDATE releases SET project_id = 1 WHERE project_id IS NULL;
 ALTER TABLE releases
@@ -20,9 +28,14 @@ ALTER TABLE releases
 ALTER TABLE releases DROP CONSTRAINT releases_version_unique;
 ALTER TABLE releases ADD CONSTRAINT releases_project_version_unique UNIQUE (project_id, version);
 
--- The OTA servable lookup is the hottest read in the service and now filters
--- on project first. Leading the index with project_id keeps it a LIMIT 1
--- index scan as projects accumulate.
+-- The OTA servable lookup is the hottest read in the service. Leading the
+-- index with project_id is necessary but NOT sufficient on its own: an index
+-- led by a column the query never filters on cannot satisfy
+-- `ORDER BY version DESC` once a second project's rows are interleaved with
+-- the first's. pkg/repository/release.go's servableBundleSQL carries a
+-- matching `r.project_id = (SELECT project_id FROM locales WHERE id = $1)`
+-- predicate for exactly this reason — see the comment there for the measured
+-- query plan before and after.
 DROP INDEX IF EXISTS idx_releases_servable;
 CREATE INDEX IF NOT EXISTS idx_releases_servable
     ON releases (project_id, version DESC) WHERE rolled_back_at IS NULL;
