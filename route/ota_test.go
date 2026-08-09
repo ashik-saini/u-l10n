@@ -37,6 +37,14 @@ func (s *stubLocales) ByCode(_ context.Context, _ *gorm.DB, _ int16, code string
 	return l, nil
 }
 
+func (s *stubLocales) Create(context.Context, *gorm.DB, model.Locale) (model.Locale, error) {
+	return model.Locale{}, fmt.Errorf("stubLocales: Create not needed by this test")
+}
+
+func (s *stubLocales) Update(context.Context, *gorm.DB, int16, string, model.Locale) (model.Locale, error) {
+	return model.Locale{}, fmt.Errorf("stubLocales: Update not needed by this test")
+}
+
 // stubReleases records what ServableBundle was asked. The embedded interface
 // is nil, so any other method panics rather than quietly passing — the same
 // doctrine as the nil services on portalRouter's Handler.

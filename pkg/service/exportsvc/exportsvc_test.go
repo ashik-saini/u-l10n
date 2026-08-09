@@ -32,6 +32,14 @@ func (s *stubLocales) ByCode(_ context.Context, _ *gorm.DB, _ int16, code string
 	return model.Locale{}, fmt.Errorf("locale %q: %w", code, repository.ErrNotFound)
 }
 
+func (s *stubLocales) Create(context.Context, *gorm.DB, model.Locale) (model.Locale, error) {
+	return model.Locale{}, errors.New("stubLocales: Create not needed by this test")
+}
+
+func (s *stubLocales) Update(context.Context, *gorm.DB, int16, string, model.Locale) (model.Locale, error) {
+	return model.Locale{}, errors.New("stubLocales: Update not needed by this test")
+}
+
 // stubRows is an ExportRowReader with a fixed answer.
 type stubRows struct {
 	rows []repository.ExportRow

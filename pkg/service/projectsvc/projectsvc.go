@@ -37,6 +37,12 @@ var ErrBadRequest = errors.New("bad request")
 // driver error.
 var codePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{1,31}$`)
 
+// localeCodePattern is BCP-47-ish: "en" or "en-SG". The database has no CHECK
+// on locales.code (unlike projects.code), so this is the only validation a
+// malformed locale code gets before it would otherwise reach the driver as
+// an opaque error.
+var localeCodePattern = regexp.MustCompile(`^[a-z]{2}(-[A-Z]{2})?$`)
+
 const maxNameLen = 128
 
 // NewProject is what Create needs to mint a project.
@@ -55,20 +61,46 @@ type ProjectPatch struct {
 	LokaliseProjectID string
 }
 
+// NewLocale is what AddLocale needs to add a locale to a project.
+type NewLocale struct {
+	Code             string
+	FlutterDir       string
+	AndroidValuesDir string
+	IOSLproj         string
+	SortOrder        int16
+}
+
+// LocalePatch is what UpdateLocale may change. Every field but Code is
+// written on every call, matching ProjectPatch and LocaleRepository.Update:
+// there is no partial-update sentinel here.
+//
+// Code is deliberately ABSENT — see LocaleRepository.Update. It is the
+// identifier callers address the locale by, and renaming it would silently
+// orphan every translation and history row that references it.
+type LocalePatch struct {
+	FlutterDir       string
+	AndroidValuesDir string
+	IOSLproj         string
+	SortOrder        int16
+	Status           string
+}
+
 // Service performs project writes. It owns the transaction boundary; no
 // repository it calls opens one.
 type Service struct {
 	tx       database.Transactional
 	projects repository.ProjectRepository
 	roles    repository.UserProjectRoleRepository
+	locales  repository.LocaleRepository
 }
 
 func ProvideService(
 	tx database.Transactional,
 	projects repository.ProjectRepository,
 	roles repository.UserProjectRoleRepository,
+	locales repository.LocaleRepository,
 ) *Service {
-	return &Service{tx: tx, projects: projects, roles: roles}
+	return &Service{tx: tx, projects: projects, roles: roles, locales: locales}
 }
 
 // List returns every project the caller may reach.
@@ -164,6 +196,148 @@ func (s *Service) Update(ctx context.Context, code string, in ProjectPatch) (mod
 
 	log.Infow(ctx, "project updated", "project_id", updated.ID, "code", updated.Code, "status", updated.Status)
 	return updated, nil
+}
+
+// AddLocale adds a locale to a project.
+//
+// Adding a locale writes no translation rows — absent means untranslated, so
+// a new locale starts empty and fills in as translators work. That is what
+// makes arbitrary locale counts cheap, and it is why there is no bulk-seed
+// path here: one locale is one INSERT, same as any other.
+//
+// repository.ErrLocaleCodeTaken and ErrLocaleDirectoryTaken pass through
+// untouched, exactly like ErrProjectCodeTaken on Create above — the handler
+// maps both to 409 with errors.Is, and wrapping them further here would only
+// make that matching do more work for no benefit.
+func (s *Service) AddLocale(ctx context.Context, projectCode string, in NewLocale) (model.Locale, error) {
+	var created model.Locale
+
+	code, err := validateLocaleCode(in.Code)
+	if err != nil {
+		return created, err
+	}
+	flutterDir, err := validateDirName("flutter_dir", in.FlutterDir)
+	if err != nil {
+		return created, err
+	}
+	androidDir, err := validateDirName("android_values_dir", in.AndroidValuesDir)
+	if err != nil {
+		return created, err
+	}
+	iosDir, err := validateDirName("ios_lproj", in.IOSLproj)
+	if err != nil {
+		return created, err
+	}
+
+	err = s.tx.WithTransaction(ctx, func(tx *gorm.DB) error {
+		p, err := s.projects.ByCode(ctx, tx, projectCode)
+		if err != nil {
+			return err
+		}
+
+		l, err := s.locales.Create(ctx, tx, model.Locale{
+			ProjectID:        p.ID,
+			Code:             code,
+			FlutterDir:       flutterDir,
+			AndroidValuesDir: androidDir,
+			IOSLproj:         iosDir,
+			SortOrder:        in.SortOrder,
+		})
+		if err != nil {
+			return err
+		}
+		created = l
+		return nil
+	})
+	if err != nil {
+		return model.Locale{}, err
+	}
+
+	log.Infow(ctx, "locale added", "project_code", projectCode, "locale_code", created.Code)
+	return created, nil
+}
+
+// UpdateLocale changes a locale's export directories, sort order or status.
+//
+// The code is not a parameter of LocalePatch and cannot be changed through
+// this method — see LocalePatch's doc comment. The lookup and the write
+// share a transaction for the same reason Update does above: a project
+// archived, or a locale archived by another request, between the two must
+// not be able to reappear silently under a caller who never asked for that.
+func (s *Service) UpdateLocale(ctx context.Context, projectCode, code string, in LocalePatch) (model.Locale, error) {
+	var updated model.Locale
+
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return updated, fmt.Errorf("%w: locale code is required", ErrBadRequest)
+	}
+	flutterDir, err := validateDirName("flutter_dir", in.FlutterDir)
+	if err != nil {
+		return updated, err
+	}
+	androidDir, err := validateDirName("android_values_dir", in.AndroidValuesDir)
+	if err != nil {
+		return updated, err
+	}
+	iosDir, err := validateDirName("ios_lproj", in.IOSLproj)
+	if err != nil {
+		return updated, err
+	}
+	switch in.Status {
+	case repository.LocaleActive, repository.LocaleArchived:
+	default:
+		return updated, fmt.Errorf("%w: status must be %s or %s, got %q",
+			ErrBadRequest, repository.LocaleActive, repository.LocaleArchived, in.Status)
+	}
+
+	err = s.tx.WithTransaction(ctx, func(tx *gorm.DB) error {
+		p, err := s.projects.ByCode(ctx, tx, projectCode)
+		if err != nil {
+			return err
+		}
+
+		u, err := s.locales.Update(ctx, tx, p.ID, code, model.Locale{
+			FlutterDir:       flutterDir,
+			AndroidValuesDir: androidDir,
+			IOSLproj:         iosDir,
+			SortOrder:        in.SortOrder,
+			Status:           in.Status,
+		})
+		if err != nil {
+			return err
+		}
+		updated = u
+		return nil
+	})
+	if err != nil {
+		return model.Locale{}, err
+	}
+
+	log.Infow(ctx, "locale updated", "project_code", projectCode,
+		"locale_code", updated.Code, "status", updated.Status)
+	return updated, nil
+}
+
+// validateLocaleCode enforces the BCP-47-ish shape the database has no CHECK
+// for, so a malformed code reads as a 400 with a message instead of a
+// confusing downstream failure (or, worse, silent acceptance).
+func validateLocaleCode(code string) (string, error) {
+	if !localeCodePattern.MatchString(code) {
+		return "", fmt.Errorf("%w: locale code must match %s, got %q",
+			ErrBadRequest, localeCodePattern.String(), code)
+	}
+	return code, nil
+}
+
+// validateDirName requires a non-empty export directory name. All three
+// (flutter_dir, android_values_dir, ios_lproj) are required on every write —
+// there is no NULL/omitted state for them, unlike a key's android_name.
+func validateDirName(field, value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", fmt.Errorf("%w: %s is required", ErrBadRequest, field)
+	}
+	return trimmed, nil
 }
 
 // validateCode enforces what the database's CHECK also enforces, so a

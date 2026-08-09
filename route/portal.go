@@ -227,6 +227,18 @@ func (h *Handler) portalError(w http.ResponseWriter, r *http.Request, op string,
 		render.Status(r, http.StatusConflict)
 		render.JSON(w, r, errorResponse{Error: "project_code_taken", Details: err.Error()})
 
+	// A locale code is likewise the caller's mistake to fix: the project
+	// already has one.
+	case errors.Is(err, repository.ErrLocaleCodeTaken):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, errorResponse{Error: "locale_code_taken", Details: err.Error()})
+
+	// Left to the database's UNIQUE (project_id, flutter_dir|android_values_dir|ios_lproj)
+	// rather than pre-checked — see LocaleRepository.Create's doc comment for why.
+	case errors.Is(err, repository.ErrLocaleDirectoryTaken):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, errorResponse{Error: "locale_directory_taken", Details: err.Error()})
+
 	case errors.Is(err, keysvc.ErrBranchNotOpen),
 		errors.Is(err, branchsvc.ErrBranchNotOpen):
 		render.Status(r, http.StatusConflict)

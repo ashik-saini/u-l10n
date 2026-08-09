@@ -38,6 +38,7 @@ One binary, urfave/cli. With no subcommand it serves.
 | `import` | Import the Lokalise project: values from the API, key presence from a file export |
 | `token create` / `token revoke` | Issue and revoke `X-Api-Token` credentials for scripts and CI |
 | `user grant` / `user list` | Create/promote portal operators; the only way to create the first admin |
+| `project create` / `project list` | Mint and list projects; the only way to create the first project (and, with it, the first platform admin's project to administer) |
 
 **`seed-from-files`** — flags:
 
@@ -76,13 +77,46 @@ to stdout **once** and never logged; only its SHA-256 is stored.
 
 ```bash
 u-l10n user grant --email you@you.co --role admin --actor you@you.co
+u-l10n user grant --email you@you.co --role admin --platform-admin --actor you@you.co
 u-l10n user list
 ```
 
 `--role`: `viewer` (default), `editor`, `approver`, `admin`. `--status`:
-`active` (default) or `disabled`. Idempotent, and writes an `audit_events`
-row. On a fresh database nobody is an admin and the API cannot create one —
-this command is the bootstrap, run from the pod with its DB credentials.
+`active` (default) or `disabled`. `--platform-admin` additionally grants
+`is_platform_admin` — the one privilege that is not scoped to any project
+(minting a project, and granting its creator the first role on it). It is a
+separate flag rather than a fifth role because no per-project role can apply
+to a project that does not exist yet. Idempotent, and writes an
+`audit_events` row. On a fresh database nobody is an admin and the API cannot
+create one — this command is the bootstrap, run from the pod with its DB
+credentials.
+
+**`project`**:
+
+```bash
+u-l10n project create --code youbiz --name YouBiz --actor you@you.co
+u-l10n project create --code youbiz --name YouBiz --lokalise-project-id 123456 --actor you@you.co
+u-l10n project list [--all]
+```
+
+`--code` is a URL slug (`^[a-z][a-z0-9-]{1,31}$`) — it appears in every
+subsequent path segment under this project, e.g.
+`/api/v1/projects/youbiz/locales`. `--actor` is required and becomes the
+project's first `admin`, granted in the **same transaction** that creates the
+project row — a project whose creator holds no role on it is a project
+nobody could ever configure. `--lokalise-project-id` is optional; a project
+with no Lokalise source at all is legitimate. `project list --all` includes
+archived projects. Creating a project needs a platform admin (`user grant
+--platform-admin`, above) — on a fresh database, or whenever nobody wants to
+expose project creation over the API yet, this CLI command is the way in,
+for the same bootstrapping reason `user grant` is: anyone who can run it
+already has database access, which is strictly more privilege than any role
+this schema can express.
+
+Adding a locale to a project (`POST /projects/{project}/locales`) and
+archiving one (`PATCH /projects/{project}/locales/{code}`) are API-only, not
+CLI commands — see `docs/API.md`'s Projects section. They require the same
+platform-admin privilege.
 
 ## 2. Configuration
 

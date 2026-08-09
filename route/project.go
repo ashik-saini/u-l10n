@@ -55,6 +55,47 @@ type patchProjectRequest struct {
 	LokaliseProjectID string `json:"lokalise_project_id"`
 }
 
+type localeResponse struct {
+	ID               int16  `json:"id"`
+	ProjectID        int16  `json:"project_id"`
+	Code             string `json:"code"`
+	FlutterDir       string `json:"flutter_dir"`
+	AndroidValuesDir string `json:"android_values_dir"`
+	IOSLproj         string `json:"ios_lproj"`
+	SortOrder        int16  `json:"sort_order"`
+	Status           string `json:"status"`
+}
+
+func newLocaleResponse(l model.Locale) localeResponse {
+	return localeResponse{
+		ID:               l.ID,
+		ProjectID:        l.ProjectID,
+		Code:             l.Code,
+		FlutterDir:       l.FlutterDir,
+		AndroidValuesDir: l.AndroidValuesDir,
+		IOSLproj:         l.IOSLproj,
+		SortOrder:        l.SortOrder,
+		Status:           l.Status,
+	}
+}
+
+type addLocaleRequest struct {
+	Code             string `json:"code"`
+	FlutterDir       string `json:"flutter_dir"`
+	AndroidValuesDir string `json:"android_values_dir"`
+	IOSLproj         string `json:"ios_lproj"`
+	SortOrder        int16  `json:"sort_order"`
+}
+
+// patchLocaleRequest carries no Code field on purpose — see PatchLocale.
+type patchLocaleRequest struct {
+	FlutterDir       string `json:"flutter_dir"`
+	AndroidValuesDir string `json:"android_values_dir"`
+	IOSLproj         string `json:"ios_lproj"`
+	SortOrder        int16  `json:"sort_order"`
+	Status           string `json:"status"`
+}
+
 // --- handlers ---------------------------------------------------------------
 
 // ListProjects returns every live project.
@@ -154,6 +195,85 @@ func (h *Handler) PatchProject(w http.ResponseWriter, r *http.Request) {
 
 	render.Status(r, http.StatusOK)
 	render.JSON(w, r, newProjectResponse(updated))
+}
+
+// AddLocale adds a locale to a project.
+//
+//	POST /api/v1/projects/{project}/locales
+//	{"code":"vi-VN","flutter_dir":"vi_VN","android_values_dir":"values-vi","ios_lproj":"vi-VN.lproj","sort_order":7}
+//
+// Platform admin only, like CreateProject: minting a locale administers the
+// project's dimension, it does not translate within it. Adding one writes no
+// translation rows — absent means untranslated — so a seventh locale is
+// cheap and, if it turns out to be a mistake, reversible by archiving, never
+// by deleting.
+func (h *Handler) AddLocale(w http.ResponseWriter, r *http.Request) {
+	if err := rejectUnknownParams(r); err != nil {
+		h.badRequest(w, r, err)
+		return
+	}
+	project := chi.URLParam(r, "project")
+
+	var body addLocaleRequest
+	if err := decodePortalJSON(w, r, &body); err != nil {
+		h.badRequest(w, r, err)
+		return
+	}
+
+	created, err := h.projectSvc.AddLocale(r.Context(), project, projectsvc.NewLocale{
+		Code:             body.Code,
+		FlutterDir:       body.FlutterDir,
+		AndroidValuesDir: body.AndroidValuesDir,
+		IOSLproj:         body.IOSLproj,
+		SortOrder:        body.SortOrder,
+	})
+	if err != nil {
+		h.projectError(w, r, "add locale", err)
+		return
+	}
+
+	render.Status(r, http.StatusCreated)
+	render.JSON(w, r, newLocaleResponse(created))
+}
+
+// PatchLocale changes a locale's export directories, sort order or status.
+//
+//	PATCH /api/v1/projects/{project}/locales/{code}
+//	{"flutter_dir":"vi_VN","android_values_dir":"values-vi","ios_lproj":"vi-VN.lproj","sort_order":7,"status":"active"}
+//
+// Platform admin only. The code is deliberately not in the body and cannot
+// be changed here: it is the identifier callers address the locale by, and
+// renaming it would silently orphan every translation and history row that
+// references it. "archived" in status is the only lifecycle move — there is
+// no delete, because that history outlives the locale it describes.
+func (h *Handler) PatchLocale(w http.ResponseWriter, r *http.Request) {
+	if err := rejectUnknownParams(r); err != nil {
+		h.badRequest(w, r, err)
+		return
+	}
+	project := chi.URLParam(r, "project")
+	code := chi.URLParam(r, "code")
+
+	var body patchLocaleRequest
+	if err := decodePortalJSON(w, r, &body); err != nil {
+		h.badRequest(w, r, err)
+		return
+	}
+
+	updated, err := h.projectSvc.UpdateLocale(r.Context(), project, code, projectsvc.LocalePatch{
+		FlutterDir:       body.FlutterDir,
+		AndroidValuesDir: body.AndroidValuesDir,
+		IOSLproj:         body.IOSLproj,
+		SortOrder:        body.SortOrder,
+		Status:           body.Status,
+	})
+	if err != nil {
+		h.projectError(w, r, "update locale", err)
+		return
+	}
+
+	render.Status(r, http.StatusOK)
+	render.JSON(w, r, newLocaleResponse(updated))
 }
 
 // projectError maps the project service's sentinels onto status codes.

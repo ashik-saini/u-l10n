@@ -4,13 +4,23 @@ Guidance for Claude Code (http://claude.ai/code) when working in this repository
 
 ## What This Is
 
-u-l10n is the in-house localization service, replacing Lokalise for the YouTrip
-mobile apps: ~6,300 translation keys across 6 locales, exported byte-faithfully
-to Flutter JSON, Android XML and iOS `.strings`. It owns the source of truth,
+u-l10n is the in-house localization service, replacing Lokalise. It began
+serving one product — YouTrip: ~6,300 translation keys across 6 locales,
+exported byte-faithfully to Flutter JSON, Android XML and iOS `.strings` — but
+now serves any number of projects (YouTrip and YouBiz today), each with its
+own keys, locales, branches and releases, isolated from the others by
+`project_id` scoping and composite foreign keys throughout the schema (see
+`docs/DATA_MODEL.md`, "Projects and roles"). It owns the source of truth,
 serves the portal API, and delivers strings over the air so copy changes reach
 users without an app release.
 
 HTTP only on `:8080`. No gRPC, no Kafka.
+
+Locales are admin-managed data, not migration-seeded reference data: a project
+gains or reconfigures a locale through `POST /projects/{project}/locales` /
+`PATCH /projects/{project}/locales/{code}` (platform admin only), and adding
+one writes no translation rows — absent means untranslated, so an arbitrary
+locale count is cheap.
 
 ## Stack
 

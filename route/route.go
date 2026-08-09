@@ -286,11 +286,18 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 		// privilege that is not scoped to a project — no per-project role
 		// can apply to a project that does not exist yet. requirePlatformAdmin
 		// runs after RequireIdentity and reads the flag it already loaded.
+		//
+		// Locales sit in this same group: they are admin-managed data now
+		// (see .db/V1.10), not migration-seeded reference data, and adding or
+		// reconfiguring the dimension a project translates into is the same
+		// kind of privilege as minting the project itself.
 		r.Group(func(r chi.Router) {
 			r.Use(handler.RequireIdentity(repository.RoleViewer))
 			r.Use(handler.requirePlatformAdmin)
 			r.Post("/projects", handler.CreateProject)
 			r.Patch("/projects/{project}", handler.PatchProject)
+			r.Post("/projects/{project}/locales", handler.AddLocale)
+			r.Patch("/projects/{project}/locales/{code}", handler.PatchLocale)
 		})
 	})
 

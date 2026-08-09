@@ -20,6 +20,7 @@ func newProjectSvc(t *testing.T) *projectsvc.Service {
 		database.ProvideTransactional(conn),
 		repository.ProvideProjectRepository(conn),
 		repository.ProvideUserProjectRoleRepository(conn),
+		repository.ProvideLocaleRepository(conn),
 	)
 }
 
@@ -153,5 +154,161 @@ func TestProjectUpdateReportsAMissingProject(t *testing.T) {
 	svc := newProjectSvc(t)
 
 	_, err := svc.Update(ctx, "no-such-project", projectsvc.ProjectPatch{Name: "X", Status: "active"})
+	assert.ErrorIs(t, err, repository.ErrNotFound)
+}
+
+// TestAddLocaleValidatesBeforeWriting proves every one of AddLocale's
+// validation rules runs BEFORE the transaction opens — a malformed request
+// must never reach the database at all, let alone as a driver error. Each
+// case changes exactly one field away from an otherwise-valid request, so a
+// validator that stopped checking its one rule would show up as exactly one
+// case going from ErrBadRequest to nil (or to a driver error).
+func TestAddLocaleValidatesBeforeWriting(t *testing.T) {
+	ctx := context.Background()
+	svc := newProjectSvc(t)
+
+	valid := func() projectsvc.NewLocale {
+		return projectsvc.NewLocale{
+			Code: "km-KH", FlutterDir: "km_KH",
+			AndroidValuesDir: "values-km", IOSLproj: "km-KH.lproj", SortOrder: 9,
+		}
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*projectsvc.NewLocale)
+	}{
+		{"lowercase-only code", func(l *projectsvc.NewLocale) { l.Code = "KM" }},
+		{"three-letter code", func(l *projectsvc.NewLocale) { l.Code = "khm" }},
+		{"lowercase region", func(l *projectsvc.NewLocale) { l.Code = "km-kh" }},
+		{"empty code", func(l *projectsvc.NewLocale) { l.Code = "" }},
+		{"empty flutter_dir", func(l *projectsvc.NewLocale) { l.FlutterDir = "" }},
+		{"whitespace-only flutter_dir", func(l *projectsvc.NewLocale) { l.FlutterDir = "   " }},
+		{"empty android_values_dir", func(l *projectsvc.NewLocale) { l.AndroidValuesDir = "" }},
+		{"empty ios_lproj", func(l *projectsvc.NewLocale) { l.IOSLproj = "" }},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			in := valid()
+			c.mutate(&in)
+			_, err := svc.AddLocale(ctx, "youtrip", in)
+			assert.ErrorIs(t, err, projectsvc.ErrBadRequest)
+		})
+	}
+
+	var count int
+	require.NoError(t, testDB.QueryRow(
+		`SELECT count(*) FROM locales WHERE code = 'km-KH'`).Scan(&count))
+	assert.Zero(t, count, "no case above is valid; nothing should have been written")
+}
+
+// TestAddLocaleWritesToTheNamedProject proves AddLocale resolves the project
+// CODE in the path to the right numeric project_id before writing — a wrong
+// resolution would either write to project 1 regardless of the path, or fail
+// where it should succeed.
+func TestAddLocaleWritesToTheNamedProject(t *testing.T) {
+	ctx := context.Background()
+	svc := newProjectSvc(t)
+
+	const actor = "addlocale-target@you.co"
+	_, err := testDB.Exec(`INSERT INTO users (email, role) VALUES ($1, 'viewer')`, actor)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, err := testDB.Exec(`DELETE FROM users WHERE email = $1`, actor)
+		require.NoError(t, err)
+	})
+
+	project, err := svc.Create(ctx, actor, projectsvc.NewProject{
+		Code: "addlocale-target", Name: "AddLocale Target",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = testDB.Exec(`DELETE FROM locales WHERE project_id = $1`, project.ID)
+		_, _ = testDB.Exec(`DELETE FROM user_project_roles WHERE project_id = $1`, project.ID)
+		_, _ = testDB.Exec(`DELETE FROM projects WHERE id = $1`, project.ID)
+	})
+
+	created, err := svc.AddLocale(ctx, "addlocale-target", projectsvc.NewLocale{
+		Code: "km-KH", FlutterDir: "km_KH",
+		AndroidValuesDir: "values-km", IOSLproj: "km-KH.lproj", SortOrder: 9,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, project.ID, created.ProjectID,
+		"the locale must belong to the project named in the path, not project 1")
+	assert.Equal(t, "active", created.Status, "a new locale defaults to active")
+
+	// project 1 (youtrip) must be untouched: km-KH there would be a leak
+	// across the project boundary that ProjectID alone cannot catch if the
+	// repository's WHERE clause were wrong in a way that still returned a row.
+	var leaked int
+	require.NoError(t, testDB.QueryRow(
+		`SELECT count(*) FROM locales WHERE project_id = 1 AND code = 'km-KH'`).Scan(&leaked))
+	assert.Zero(t, leaked, "the locale must not also appear on project 1")
+}
+
+// TestAddLocalePropagatesDuplicateSentinels proves repository.ErrLocaleCodeTaken
+// and ErrLocaleDirectoryTaken pass through AddLocale unwrapped, exactly like
+// ErrProjectCodeTaken passes through Create — errors.Is on the sentinel, not
+// on a wrapped copy, is what the handler matches.
+func TestAddLocalePropagatesDuplicateSentinels(t *testing.T) {
+	ctx := context.Background()
+	svc := newProjectSvc(t)
+
+	_, err := svc.AddLocale(ctx, "youtrip", projectsvc.NewLocale{
+		Code: "en-SG", FlutterDir: "en_SG_svc_dup",
+		AndroidValuesDir: "values-svc-dup", IOSLproj: "en-SG-svc-dup.lproj", SortOrder: 30,
+	})
+	assert.ErrorIs(t, err, repository.ErrLocaleCodeTaken, "en-SG already exists on youtrip")
+
+	_, err = svc.AddLocale(ctx, "youtrip", projectsvc.NewLocale{
+		Code: "zz-ZZ", FlutterDir: "en_SG", // en-SG's directory, on a fresh code
+		AndroidValuesDir: "values-zz-svc-dup", IOSLproj: "zz-ZZ-svc-dup.lproj", SortOrder: 31,
+	})
+	assert.ErrorIs(t, err, repository.ErrLocaleDirectoryTaken)
+}
+
+// TestUpdateLocaleRejectsAnUnknownStatus mirrors
+// TestProjectUpdateRejectsAnUnknownStatus: the same "no third state" rule
+// applies to a locale's lifecycle.
+func TestUpdateLocaleRejectsAnUnknownStatus(t *testing.T) {
+	ctx := context.Background()
+	svc := newProjectSvc(t)
+
+	_, err := svc.UpdateLocale(ctx, "youtrip", "en-SG", projectsvc.LocalePatch{
+		FlutterDir: "en_SG", AndroidValuesDir: "values", IOSLproj: "en-SG.lproj",
+		Status: "paused",
+	})
+	assert.ErrorIs(t, err, projectsvc.ErrBadRequest)
+
+	// The rejected patch must not have written anything — status stays what
+	// it was.
+	var status string
+	require.NoError(t, testDB.QueryRow(
+		`SELECT status FROM locales WHERE project_id = 1 AND code = 'en-SG'`).Scan(&status))
+	assert.Equal(t, "active", status)
+}
+
+// TestUpdateLocaleReportsAMissingLocale: a typo'd code, or a code belonging
+// to a different project, is a 404 via repository.ErrNotFound.
+func TestUpdateLocaleReportsAMissingLocale(t *testing.T) {
+	ctx := context.Background()
+	svc := newProjectSvc(t)
+
+	_, err := svc.UpdateLocale(ctx, "youtrip", "no-such-locale", projectsvc.LocalePatch{
+		FlutterDir: "x", AndroidValuesDir: "y", IOSLproj: "z", Status: "active",
+	})
+	assert.ErrorIs(t, err, repository.ErrNotFound)
+}
+
+// TestUpdateLocaleReportsAMissingProject: the project half of the lookup can
+// also miss, and must not be confused with a missing locale.
+func TestUpdateLocaleReportsAMissingProject(t *testing.T) {
+	ctx := context.Background()
+	svc := newProjectSvc(t)
+
+	_, err := svc.UpdateLocale(ctx, "no-such-project", "en-SG", projectsvc.LocalePatch{
+		FlutterDir: "x", AndroidValuesDir: "y", IOSLproj: "z", Status: "active",
+	})
 	assert.ErrorIs(t, err, repository.ErrNotFound)
 }

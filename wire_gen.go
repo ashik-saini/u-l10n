@@ -102,7 +102,7 @@ func injectService(ctx context.Context) (*Service, error) {
 	releasesvcService := releasesvc.ProvideService(transactional, releaseRepository, localeRepository, exportRowReader, auditRepository)
 	projectRepository := repository.ProvideProjectRepository(gormConnector)
 	userProjectRoleRepository := repository.ProvideUserProjectRoleRepository(gormConnector)
-	projectsvcService := projectsvc.ProvideService(transactional, projectRepository, userProjectRoleRepository)
+	projectsvcService := projectsvc.ProvideService(transactional, projectRepository, userProjectRoleRepository, localeRepository)
 	handler := route.ProvideHandler(configConfig, sqlConnector, service, apiTokenRepository, localeRepository, releaseRepository, assetsvcService, verifier, userRepository, usersvcService, keysvcService, branchsvcService, mrsvcService, tagsvcService, releasesvcService, projectsvcService)
 	httpHandler := route.ProvideRoutes(apmConfig, configConfig, handler)
 	seedService := seed.ProvideService(transactional, localeRepository, keyRepository, translationRepository)
