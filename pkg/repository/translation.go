@@ -71,7 +71,13 @@ type TranslationRepository interface {
 	// Emphatically not the same as writing "": an absent row is omitted from
 	// the export, an empty one is exported as "". Returns ErrNotFound when there
 	// was nothing to remove, so a caller can tell the two outcomes apart.
-	Delete(ctx context.Context, tx *gorm.DB, keyID int64, localeID int16) error
+	//
+	// expectedVersion applies optimistic concurrency control when positive and
+	// is skipped when zero — the same convention as KeyRepository.Update. The
+	// guard lives in the DELETE's own predicate: a version check performed on a
+	// separate read is stale by the time the delete runs, and a concurrent edit
+	// would be silently destroyed. A mismatch returns ErrOptimisticLock.
+	Delete(ctx context.Context, tx *gorm.DB, keyID int64, localeID int16, expectedVersion int) error
 
 	// RecordHistory appends to the insert-only translation_history table.
 	//
@@ -254,10 +260,12 @@ func (r *translationRepository) UpdateWithVersion(
 		return fmt.Errorf("update translation (%d,%d): %w", t.KeyID, t.LocaleID, res.Error)
 	}
 
-	// Zero rows means the version moved: another writer got there first. This
-	// is the whole point of OCC — do not retry, surface it, let a human choose.
+	// Zero rows means the row is gone or the version moved, and those are
+	// different facts: a 404 tells an editor their translation vanished, a 409
+	// tells them a colleague saved first. Re-read to tell them apart — the same
+	// move as keyRepository.classifyMiss.
 	if res.RowsAffected == 0 {
-		return ErrOptimisticLock
+		return r.classifyMiss(ctx, tx, t.KeyID, t.LocaleID, expectedVersion)
 	}
 	return nil
 }
@@ -402,18 +410,55 @@ func (r *translationRepository) ResolveMany(
 	return out, rows.Err()
 }
 
+// deleteTranslationSQL carries the version guard in the DELETE's own predicate,
+// exactly as updateWithVersionSQL does for an edit. $3 = 0 means "no guard" —
+// translations.version starts at 1, so zero cannot be a real version.
+const deleteTranslationSQL = `
+DELETE FROM translations
+ WHERE key_id = $1 AND locale_id = $2
+   AND ($3 = 0 OR version = $3)`
+
 func (r *translationRepository) Delete(
-	ctx context.Context, tx *gorm.DB, keyID int64, localeID int16,
+	ctx context.Context, tx *gorm.DB, keyID int64, localeID int16, expectedVersion int,
 ) error {
-	res := r.db(ctx, tx).Exec(
-		`DELETE FROM translations WHERE key_id = ? AND locale_id = ?`, keyID, localeID)
+	res := r.db(ctx, tx).Exec(deleteTranslationSQL, keyID, localeID, expectedVersion)
 	if res.Error != nil {
 		return fmt.Errorf("delete translation (%d,%d): %w", keyID, localeID, res.Error)
 	}
 	if res.RowsAffected == 0 {
-		return fmt.Errorf("translation (%d,%d): %w", keyID, localeID, ErrNotFound)
+		// Two different facts behind one missing row: nothing to remove, or a
+		// concurrent write moved the version. The caller must be able to tell a
+		// 404 from a 409.
+		return r.classifyMiss(ctx, tx, keyID, localeID, expectedVersion)
 	}
 	return nil
+}
+
+// classifyMiss decides whether a version-guarded write missed because the row
+// is gone or because another writer moved it — the translation-side twin of
+// keyRepository.classifyMiss, and for the same reason: returning ErrNotFound
+// for both would tell an editor their translation vanished when in fact a
+// colleague saved first and the correct answer is a 409 showing both versions.
+func (r *translationRepository) classifyMiss(
+	ctx context.Context, tx *gorm.DB, keyID int64, localeID int16, expectedVersion int,
+) error {
+	var version int
+	row := r.db(ctx, tx).Raw(
+		`SELECT version FROM translations WHERE key_id = ? AND locale_id = ?`,
+		keyID, localeID).Row()
+	switch err := row.Scan(&version); {
+	case err == nil:
+	case isNoRows(err):
+		return fmt.Errorf("translation (%d,%d): %w", keyID, localeID, ErrNotFound)
+	default:
+		return fmt.Errorf("read translation (%d,%d): %w", keyID, localeID, err)
+	}
+
+	// The row exists, so the WHERE clause failed on the version predicate —
+	// either the caller's expectation is stale, or (for a guard-free miss) the
+	// row appeared between the statement and this read. Both are lost races.
+	return fmt.Errorf("translation (%d,%d) is at version %d, not %d: %w",
+		keyID, localeID, version, expectedVersion, ErrOptimisticLock)
 }
 
 func (r *translationRepository) RecordHistory(

@@ -75,6 +75,21 @@ type TagRepository interface {
 	// because a rename must not break a bookmarked filter.
 	ByID(ctx context.Context, tx *gorm.DB, id int16) (Tag, error)
 
+	// ByIDs resolves many tags in one query — the bulk twin of ByID, mirroring
+	// KeyRepository.IDsByName. Ids that resolve to nothing are simply absent
+	// from the map, so a caller can report exactly which of a request's ids
+	// were typos rather than failing on the first one it happens to try.
+	ByIDs(ctx context.Context, tx *gorm.DB, ids []int16) (map[int16]Tag, error)
+
+	// KeyExists reports whether a keys row exists.
+	//
+	// It lives here, not on KeyRepository, because it exists for SetKeyTags'
+	// guard: key_tags.key_id references keys, and tagsvc — which owns no key
+	// repository — must be able to answer 404 for a nonexistent key instead of
+	// letting the FK violation surface as a 500, or worse, letting an empty
+	// tag set "succeed" against a key that is not there.
+	KeyExists(ctx context.Context, tx *gorm.DB, keyID int64) (bool, error)
+
 	// Update renames or recolours a tag, returning ErrTagNameTaken when the new
 	// name belongs to another tag and ErrNotFound when there is no such row.
 	Update(ctx context.Context, tx *gorm.DB, id int16, name, colour string) (Tag, error)
@@ -215,6 +230,48 @@ func (r *tagRepository) ByID(ctx context.Context, tx *gorm.DB, id int16) (Tag, e
 	default:
 		return t, fmt.Errorf("tag %d: %w", id, err)
 	}
+}
+
+func (r *tagRepository) ByIDs(ctx context.Context, tx *gorm.DB, ids []int16) (map[int16]Tag, error) {
+	out := make(map[int16]Tag, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+
+	// pq.Array over []int64 with an explicit ::smallint[] cast, the same
+	// handling as SetKeyTags: lib/pq has a fast path for []int64 and Postgres
+	// narrows on the cast.
+	wide := make([]int64, len(ids))
+	for i, id := range ids {
+		wide[i] = int64(id)
+	}
+
+	rows, err := r.db(ctx, tx).Raw(
+		`SELECT `+selectTagColumns+` FROM tags WHERE id = ANY($1::smallint[])`,
+		pq.Array(wide)).Rows()
+	if err != nil {
+		return nil, fmt.Errorf("resolve %d tag ids: %w", len(ids), err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var t Tag
+		if err := rows.Scan(&t.ID, &t.Name, &t.Colour, &t.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan tag: %w", err)
+		}
+		out[t.ID] = t
+	}
+	return out, rows.Err()
+}
+
+func (r *tagRepository) KeyExists(ctx context.Context, tx *gorm.DB, keyID int64) (bool, error) {
+	var exists bool
+	row := r.db(ctx, tx).Raw(
+		`SELECT EXISTS (SELECT 1 FROM keys WHERE id = $1)`, keyID).Row()
+	if err := row.Scan(&exists); err != nil {
+		return false, fmt.Errorf("check key %d exists: %w", keyID, err)
+	}
+	return exists, nil
 }
 
 const updateTagSQL = `

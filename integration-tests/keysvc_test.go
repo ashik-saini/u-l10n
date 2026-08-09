@@ -332,6 +332,65 @@ func TestDeleteTranslationRemovesTheRowRatherThanBlankingIt(t *testing.T) {
 	assert.ErrorIs(t, err, repository.ErrNotFound)
 }
 
+// TestDeleteRefusesAStaleVersion pins the OCC guard inside the DELETE itself.
+//
+// The service's pre-check reads the version and compares — but that read is
+// stale by the time the delete runs, and without a version predicate in the
+// statement a concurrent edit landing in between is silently destroyed. The
+// repository-level call is the only place the race can be exercised
+// deterministically: it IS the losing half of the race.
+func TestDeleteRefusesAStaleVersion(t *testing.T) {
+	ctx := context.Background()
+	svc := newKeySvc(t)
+	translations := repository.ProvideTranslationRepository(testGORM(t))
+	enSG := localeID(t, "en-SG")
+
+	key := createTestKey(t, svc, uniqueName(t, "delete_occ"))
+	setPortalValue(t, svc, key.ID, "en-SG", "v1", 0)
+	setPortalValue(t, svc, key.ID, "en-SG", "v2 — the edit a stale delete would destroy", 1)
+
+	// The deleter saw version 1; the row is at 2.
+	err := translations.Delete(ctx, nil, key.ID, enSG, 1)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, repository.ErrOptimisticLock,
+		"a version mismatch is a 409-shaped conflict, not a 404 and never a silent delete")
+
+	// The concurrent edit survived.
+	cell, err := translations.GetCell(ctx, nil, key.ID, enSG)
+	require.NoError(t, err)
+	assert.True(t, cell.Found, "the row must still exist")
+	assert.Equal(t, 2, cell.Version)
+
+	t.Run("a missing row is still a 404, not a conflict", func(t *testing.T) {
+		other := createTestKey(t, svc, uniqueName(t, "delete_occ_missing"))
+		err := translations.Delete(ctx, nil, other.ID, enSG, 1)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, repository.ErrNotFound)
+		assert.False(t, errors.Is(err, repository.ErrOptimisticLock))
+	})
+
+	t.Run("the matching version deletes, and the service surfaces both sides", func(t *testing.T) {
+		// Through the service: stale base_version → ConflictError carrying
+		// what actually won, the same 409 shape SetTranslation produces.
+		stale := 1
+		err := svc.DeleteTranslation(ctx, key.ID, "en-SG", "", &stale, testActor, "req-1")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, repository.ErrOptimisticLock)
+
+		var conflict *keysvc.ConflictError
+		require.ErrorAs(t, err, &conflict)
+		assert.Equal(t, 2, conflict.Theirs.Version)
+		assert.Equal(t, 1, conflict.ExpectedVersion)
+
+		// With the version the editor was actually shown, the delete lands.
+		current := 2
+		require.NoError(t, svc.DeleteTranslation(ctx, key.ID, "en-SG", "", &current, testActor, "req-1"))
+		cell, err := translations.GetCell(ctx, nil, key.ID, enSG)
+		require.NoError(t, err)
+		assert.False(t, cell.Found)
+	})
+}
+
 // TestDeleteTranslationRecordsBecameUntranslated: the history row must carry
 // NULL, not "", or the timeline loses the same distinction the table does.
 func TestDeleteTranslationRecordsBecameUntranslated(t *testing.T) {
@@ -399,6 +458,76 @@ func TestUntranslatedInResolvesThroughTheBranch(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, result.Keys, 1)
 		assert.Equal(t, done.Name, result.Keys[0].Key.Name)
+	})
+}
+
+// TestValueSearchResolvesThroughTheBranch.
+//
+// The search filter must apply the SAME delta-or-master rule every other read
+// does. Searching master's rows alone makes text changed only on a branch
+// unfindable in the branch's own view — a copywriter searching for the words
+// they just wrote is told those words do not exist — while still finding the
+// key by master text the branch has already rewritten.
+func TestValueSearchResolvesThroughTheBranch(t *testing.T) {
+	ctx := context.Background()
+	svc := newKeySvc(t)
+
+	key := createTestKey(t, svc, uniqueName(t, "vsearch"))
+	setPortalValue(t, svc, key.ID, "en-SG", "aurora original wording", 0)
+
+	branch := createBranch(t, uniqueName(t, "br"))
+	_, err := svc.SetTranslation(ctx, keysvc.SetTranslationRequest{
+		KeyID: key.ID, LocaleCode: "en-SG", Branch: branch.Name,
+		Value: "zephyr rewritten copy",
+	}, testActor, "req-1")
+	require.NoError(t, err)
+
+	find := func(branchName, needle string) bool {
+		result, err := svc.Browse(ctx, keysvc.BrowseRequest{
+			Branch: branchName, Search: needle, Locales: []string{"en-SG"},
+		})
+		require.NoError(t, err)
+		for _, k := range result.Keys {
+			if k.Key.ID == key.ID {
+				return true
+			}
+		}
+		return false
+	}
+
+	assert.True(t, find(branch.Name, "zephyr rewritten"),
+		"text that exists only on the branch must be findable in the branch view")
+	assert.False(t, find(branch.Name, "aurora original"),
+		"master text the branch has overridden must NOT match in the branch view")
+	assert.True(t, find("", "aurora original"),
+		"master's view is untouched by the branch's delta")
+	assert.False(t, find("", "zephyr rewritten"),
+		"branch-only text must not leak into master's search")
+
+	t.Run("an unmodified pair still falls through to master", func(t *testing.T) {
+		other := createTestKey(t, svc, uniqueName(t, "vsearch_fallthrough"))
+		setPortalValue(t, svc, other.ID, "en-SG", "quiescent master text", 0)
+
+		result, err := svc.Browse(ctx, keysvc.BrowseRequest{
+			Branch: branch.Name, Search: "quiescent master", Locales: []string{"en-SG"},
+		})
+		require.NoError(t, err)
+		require.Len(t, result.Keys, 1,
+			"a pair the branch never touched must still match by its master value")
+		assert.Equal(t, other.ID, result.Keys[0].Key.ID)
+	})
+
+	t.Run("a tombstoned value is unfindable on the branch", func(t *testing.T) {
+		gone := createTestKey(t, svc, uniqueName(t, "vsearch_tombstone"))
+		setPortalValue(t, svc, gone.ID, "en-SG", "ephemeral doomed text", 0)
+		require.NoError(t, svc.DeleteTranslation(ctx, gone.ID, "en-SG", branch.Name, nil, testActor, "req-1"))
+
+		result, err := svc.Browse(ctx, keysvc.BrowseRequest{
+			Branch: branch.Name, Search: "ephemeral doomed", Locales: []string{"en-SG"},
+		})
+		require.NoError(t, err)
+		assert.Empty(t, result.Keys,
+			"a value the branch removed reads as untranslated there, and untranslated text cannot match")
 	})
 }
 

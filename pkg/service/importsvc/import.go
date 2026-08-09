@@ -177,6 +177,12 @@ func (s *Service) run(
 
 	byLocale := make(map[string][]model.Translation, len(locales))
 
+	// remoteByName records which Lokalise keys produced each canonical name.
+	// Canonical() falls back Web -> IOS -> Other -> Android, so two remote keys
+	// with different per-platform names can canonicalise to ONE name — and
+	// therefore one keys row and one (key_id, locale_id) per locale.
+	remoteByName := make(map[string][]int64, len(remoteKeys))
+
 	for i, rk := range remoteKeys {
 		name := rk.KeyName.Canonical()
 		if name == "" {
@@ -184,6 +190,7 @@ func (s *Service) run(
 				fmt.Sprintf("lokalise key %d has no name on any platform; skipped", rk.KeyID))
 			continue
 		}
+		remoteByName[name] = append(remoteByName[name], rk.KeyID)
 
 		keyID, err := s.keys.UpsertByName(ctx, tx, model.Key{
 			Name:        name,
@@ -223,15 +230,65 @@ func (s *Service) run(
 		}
 	}
 
+	// Name the collisions before writing anything, so the warning appears even
+	// on a dry run and names the REMOTE ids someone has to clean up. Sorted so
+	// the report does not reshuffle with map iteration order between runs.
+	var collisions []string
+	for name, remoteIDs := range remoteByName {
+		if len(remoteIDs) > 1 {
+			collisions = append(collisions, fmt.Sprintf(
+				"lokalise keys %v all canonicalise to %q; their values collide per locale and the last one (highest lokalise id) wins",
+				remoteIDs, name))
+		}
+	}
+	sort.Strings(collisions)
+	result.Warnings = append(result.Warnings, collisions...)
+
 	for _, locale := range locales {
-		batch := byLocale[locale.Code]
+		// Collapse duplicate (key_id, locale_id) writes last-wins BEFORE the
+		// batch upsert — the same move seed.go makes, for a harder reason: two
+		// rows for one (key_id, locale_id) inside a single INSERT ... ON
+		// CONFLICT DO UPDATE is SQLSTATE 21000 ("cannot affect row a second
+		// time") and the whole import fails. Last-wins matches the iteration
+		// order above: remote keys sorted by Lokalise id, highest id last.
+		batch := dedupeTranslations(byLocale[locale.Code])
 		if err := s.translations.UpsertBatch(ctx, tx, batch); err != nil {
 			return err
 		}
 		result.TranslationsWritten += len(batch)
 	}
 
+	// DELIBERATE GAP: no translation_history rows are written here, although
+	// the merge path records its applied deltas. An import touches the whole
+	// corpus — ~36,000 rows per run — and history is an append-only table read
+	// by humans; six-figure batches of identical 'import' entries would bury
+	// the timeline they exist to explain. The audit trail for an import is the
+	// run itself: idempotent, attributable via Options.Actor, and re-runnable.
+
 	return nil
+}
+
+// dedupeTranslations collapses duplicate (KeyID, LocaleID) entries last-wins,
+// preserving each pair's first-occurrence position — the same discipline as
+// seed.go's duplicate handling, so a re-import stays byte-reproducible.
+func dedupeTranslations(batch []model.Translation) []model.Translation {
+	type pair struct {
+		keyID    int64
+		localeID int16
+	}
+
+	index := make(map[pair]int, len(batch))
+	out := make([]model.Translation, 0, len(batch))
+	for _, t := range batch {
+		p := pair{t.KeyID, t.LocaleID}
+		if at, seen := index[p]; seen {
+			out[at] = t // last-wins, in the first occurrence's slot
+			continue
+		}
+		index[p] = len(out)
+		out = append(out, t)
+	}
+	return out
 }
 
 // loadPresence reads each locale's exported JSON and records which keys it

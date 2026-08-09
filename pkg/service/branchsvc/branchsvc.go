@@ -73,8 +73,9 @@ func (s *Service) List(ctx context.Context, status string) ([]repository.BranchS
 
 // Get returns one branch with its counts.
 //
-// It goes through Summaries rather than ByName so the detail view and the list
-// cannot disagree about how many changes a branch carries.
+// It goes through SummaryByID rather than ByName alone so the detail view and
+// the list cannot disagree about how many changes a branch carries — the
+// counts come from the same statement Summaries uses, scoped to one row.
 func (s *Service) Get(ctx context.Context, name string) (repository.BranchSummary, error) {
 	var out repository.BranchSummary
 
@@ -82,19 +83,9 @@ func (s *Service) Get(ctx context.Context, name string) (repository.BranchSummar
 	if err != nil {
 		return out, err
 	}
-
-	summaries, err := s.branches.Summaries(ctx, nil, "")
-	if err != nil {
-		return out, err
-	}
-	for _, summary := range summaries {
-		if summary.ID == branch.ID {
-			return summary, nil
-		}
-	}
-	// Only reachable if the branch was deleted between the two reads. Reporting
-	// it as absent is the honest answer.
-	return out, fmt.Errorf("branch %q: %w", name, repository.ErrNotFound)
+	// A miss here is only reachable if the branch was deleted between the two
+	// reads; SummaryByID reports it as absent, which is the honest answer.
+	return s.branches.SummaryByID(ctx, nil, branch.ID)
 }
 
 // Create opens a new branch.

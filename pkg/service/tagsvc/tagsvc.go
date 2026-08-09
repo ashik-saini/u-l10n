@@ -236,17 +236,39 @@ func (s *Service) SetKeyTags(
 	}
 
 	err := s.tx.WithTransaction(ctx, func(tx *gorm.DB) error {
+		// The key must exist BEFORE anything is written. With tags attached the
+		// FK violation would surface as a 500; with an empty set nothing would
+		// touch the key at all and a nonexistent id would get a phantom success
+		// plus an audit row claiming a change that never happened.
+		exists, err := s.tags.KeyExists(ctx, tx, keyID)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("key %d: %w", keyID, repository.ErrNotFound)
+		}
+
 		// Every tag is resolved before anything is written, so a typo in one id
-		// does not leave the key with a partially applied set.
+		// does not leave the key with a partially applied set — and ALL the
+		// typos are reported at once, in one lookup rather than one per tag.
+		byID, err := s.tags.ByIDs(ctx, tx, tagIDs)
+		if err != nil {
+			return err
+		}
+		var missing []int16
 		resolved := make([]repository.Tag, 0, len(tagIDs))
 		ids := make([]int16, 0, len(tagIDs))
 		for _, id := range tagIDs {
-			tag, err := s.tags.ByID(ctx, tx, id)
-			if err != nil {
-				return err
+			tag, ok := byID[id]
+			if !ok {
+				missing = append(missing, id)
+				continue
 			}
 			resolved = append(resolved, tag)
 			ids = append(ids, tag.ID)
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("%w: unknown tag ids %v", ErrBadRequest, missing)
 		}
 
 		if err := s.tags.SetKeyTags(ctx, tx, keyID, ids); err != nil {

@@ -171,6 +171,18 @@ func TestMergeRefusalsAreAllConflictsWithSomethingToActOn(t *testing.T) {
 		assert.Equal(t, int64(9), body.Collisions[0].MasterKeyID)
 	})
 
+	t.Run("a concurrent master write is a retryable 409", func(t *testing.T) {
+		// The merge rolled back whole; nothing was applied. Retrying surfaces
+		// the new conflict for a human — a 500 would page an engineer for a
+		// race the workflow is built to absorb.
+		rec := runMergeError(t, fmt.Errorf("%w: 1 value delta(s) no longer match master",
+			mergesvc.ErrConcurrentMasterWrite))
+		assert.Equal(t, http.StatusConflict, rec.Code)
+		assert.Contains(t, rec.Body.String(), "concurrent_master_write")
+		assert.Contains(t, rec.Body.String(), "retry",
+			"the body must tell the caller the merge is safe to retry")
+	})
+
 	t.Run("an unreachable database is still a 500", func(t *testing.T) {
 		// The mapping must not turn everything into a 409: a real outage hiding
 		// behind a 4xx is exactly as expensive as the reverse.
@@ -200,6 +212,13 @@ func TestWorkflowRefusalsAreConflictsNotNotFound(t *testing.T) {
 	}{
 		{"approving a merged request", fmt.Errorf("%w: merged", mrsvc.ErrNotLive), "merge_request_not_live"},
 		{"reopening into a live one", fmt.Errorf("x: %w", repository.ErrLiveMergeRequestExists), "live_merge_request_exists"},
+		// The repository-level CAS miss, unwrapped: the backstop for the merge
+		// transaction's own approved → merged move losing a race.
+		{"a guarded transition that lost its race",
+			fmt.Errorf("x: %w", repository.ErrStaleMergeRequestStatus), "merge_request_not_live"},
+		// Two publishes picked the same version; the loser retries.
+		{"a publish version race",
+			fmt.Errorf("x: %w", repository.ErrReleaseVersionRace), "release_version_race"},
 	}
 
 	for _, tc := range cases {

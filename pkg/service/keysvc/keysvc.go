@@ -893,12 +893,31 @@ func (s *Service) DeleteTranslation(
 		if !current.Found {
 			return fmt.Errorf("translation (%d,%s): %w", keyID, locale.Code, repository.ErrNotFound)
 		}
+		// The comparison below is a courtesy: it produces a 409 whose body
+		// already carries the surviving value. The guard that actually holds is
+		// the version predicate inside Delete, which runs in the same statement
+		// as the removal — anything checked before a write is stale by the time
+		// the write happens. Same shape as SetTranslation above.
 		if baseVersion != nil && *baseVersion != current.Version {
 			return &ConflictError{KeyID: keyID, Locale: locale.Code,
 				Theirs: current, ExpectedVersion: *baseVersion}
 		}
 
-		if err := s.translations.Delete(ctx, tx, keyID, locale.ID); err != nil {
+		expected := 0
+		if baseVersion != nil {
+			expected = *baseVersion
+		}
+		if err := s.translations.Delete(ctx, tx, keyID, locale.ID, expected); err != nil {
+			if errors.Is(err, repository.ErrOptimisticLock) {
+				// Lost the race between the read above and the delete. Re-read so
+				// the caller sees what actually won, not what we saw first.
+				theirs, readErr := s.translations.GetCell(ctx, tx, keyID, locale.ID)
+				if readErr != nil {
+					return readErr
+				}
+				return &ConflictError{KeyID: keyID, Locale: locale.Code,
+					Theirs: theirs, ExpectedVersion: expected}
+			}
 			return err
 		}
 

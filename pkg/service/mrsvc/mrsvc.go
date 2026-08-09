@@ -121,6 +121,12 @@ type Detail struct {
 	Conflicts    Conflicts
 }
 
+// valueConflictKey identifies one (key, locale) pair in the conflict set.
+type valueConflictKey struct {
+	KeyID    int64
+	LocaleID int16
+}
+
 // Resolution is one human decision about one conflict.
 type Resolution struct {
 	KeyID int64
@@ -224,15 +230,9 @@ func (s *Service) Get(ctx context.Context, mrID int64) (Detail, error) {
 	}
 	detail.MergeRequest = mr
 
-	summaries, err := s.branches.Summaries(ctx, nil, "")
+	detail.Branch, err = s.branches.SummaryByID(ctx, nil, mr.BranchID)
 	if err != nil {
 		return detail, err
-	}
-	for _, summary := range summaries {
-		if summary.ID == mr.BranchID {
-			detail.Branch = summary
-			break
-		}
 	}
 
 	detail.Events, err = s.mrs.Events(ctx, nil, mrID)
@@ -340,7 +340,16 @@ func (s *Service) Review(
 			if err := s.mrs.Approve(ctx, tx, mrID, actor); err != nil {
 				return err
 			}
-		} else if err := s.mrs.SetStatus(ctx, tx, mrID, rule.to, actor, comment); err != nil {
+		} else if err := s.mrs.SetStatus(ctx, tx, mrID, rule.to, rule.from, actor, comment); err != nil {
+			// The check above read the status without a lock, so a concurrent
+			// transition — a merge committing while this close is in flight —
+			// can still slip between it and the UPDATE. The state predicate
+			// inside SetStatus is the guard that actually holds; surface its
+			// miss as the same 409 the pre-check produces.
+			if errors.Is(err, repository.ErrStaleMergeRequestStatus) {
+				return fmt.Errorf("%w: cannot %s this merge request, its status just changed (allowed from: %s)",
+					ErrNotLive, action, strings.Join(rule.from, ", "))
+			}
 			return err
 		}
 
@@ -398,11 +407,37 @@ func (s *Service) Resolve(
 			return fmt.Errorf("%w: merge request %d is %s", ErrNotLive, mrID, mr.Status)
 		}
 
+		// Every resolution must decide a conflict that actually EXISTS. The
+		// merge honours a 'master' resolution by discarding the branch's side,
+		// so a resolution recorded against a clean pair would silently throw
+		// away a delta nobody disputed. Computed inside this transaction so
+		// the set checked is the set the rows land against.
+		values, err := s.mrs.Conflicts(ctx, tx, mrID, mr.BranchID)
+		if err != nil {
+			return err
+		}
+		valueConflicts := make(map[valueConflictKey]bool, len(values))
+		for _, c := range values {
+			valueConflicts[valueConflictKey{c.KeyID, c.LocaleID}] = true
+		}
+		meta, err := s.mrs.MetaConflicts(ctx, tx, mrID, mr.BranchID)
+		if err != nil {
+			return err
+		}
+		metaConflicts := make(map[int64]bool, len(meta))
+		for _, c := range meta {
+			metaConflicts[c.KeyID] = true
+		}
+
 		for _, r := range resolutions {
 			if r.LocaleCode == "" {
 				// No locale means a key-metadata conflict, stored with a NULL
 				// locale_id. Routing it through Resolve instead would record it
 				// against a locale that does not exist.
+				if !metaConflicts[r.KeyID] {
+					return fmt.Errorf("%w: key %d has no metadata conflict to resolve",
+						ErrBadRequest, r.KeyID)
+				}
 				if err := s.mrs.ResolveMeta(ctx, tx, mrID, r.KeyID, r.Choice, actor); err != nil {
 					return err
 				}
@@ -415,6 +450,10 @@ func (s *Service) Resolve(
 					return fmt.Errorf("%w: unknown locale %q", ErrBadRequest, r.LocaleCode)
 				}
 				return err
+			}
+			if !valueConflicts[valueConflictKey{r.KeyID, locale.ID}] {
+				return fmt.Errorf("%w: (key %d, locale %s) has no conflict to resolve",
+					ErrBadRequest, r.KeyID, r.LocaleCode)
 			}
 			if err := s.mrs.Resolve(ctx, tx, mrID, r.KeyID, locale.ID, r.Choice, actor); err != nil {
 				return err
@@ -480,19 +519,15 @@ func (s *Service) Merge(
 // branchByID resolves a branch from a merge request's foreign key.
 //
 // BranchRepository has no ByID — nothing else needs one, since every branch
-// endpoint keys on the name — so this goes through Summaries, which is one
-// query and also the only place branch counts are computed.
+// endpoint keys on the name — so this goes through SummaryByID, the same one
+// query the detail view uses, scoped to one row rather than fetching every
+// branch in the system to find one.
 func (s *Service) branchByID(ctx context.Context, tx *gorm.DB, branchID int64) (repository.Branch, error) {
-	summaries, err := s.branches.Summaries(ctx, tx, "")
+	summary, err := s.branches.SummaryByID(ctx, tx, branchID)
 	if err != nil {
 		return repository.Branch{}, err
 	}
-	for _, summary := range summaries {
-		if summary.ID == branchID {
-			return summary.Branch, nil
-		}
-	}
-	return repository.Branch{}, fmt.Errorf("branch %d: %w", branchID, repository.ErrNotFound)
+	return summary.Branch, nil
 }
 
 func allows(from []string, status string) bool {

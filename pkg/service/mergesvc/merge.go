@@ -26,6 +26,11 @@ var log = ulog.GetLogger("u-l10n")
 // integer would believe it held the lock while another merge ran concurrently.
 const mergeLockKey int64 = 8_675_309
 
+// MergeLockKey returns the advisory-lock key the merge takes, so a test — or
+// any future second taker — can assert it is contending on the SAME lock. Two
+// callers with different keys would each believe they held it.
+func MergeLockKey() int64 { return mergeLockKey }
+
 var (
 	// ErrStaleApproval means the branch changed after it was approved, so the
 	// diff a reviewer signed off is not the diff being merged.
@@ -41,6 +46,13 @@ var (
 	// same key name. Unlike the other two types this is not resolvable by
 	// choosing a side — one of them has to be renamed first.
 	ErrNameCollision = errors.New("key name collision")
+
+	// ErrConcurrentMasterWrite means a master row moved between the conflict
+	// computation and the apply, with no human decision covering it. The
+	// transaction rolls back and nothing was applied; the merge is safe to
+	// retry, and the retry will surface the new conflict for resolution.
+	ErrConcurrentMasterWrite = errors.New(
+		"a concurrent write to master raced this merge; retry the merge")
 )
 
 // UnresolvedError reports which conflicts blocked a merge.
@@ -163,6 +175,22 @@ func (s *Service) Merge(ctx context.Context, branchName, actor string) (*Result,
 			return fmt.Errorf("lock affected rows: %w", err)
 		}
 
+		// Also lock every `keys` row the branch touches. The lock above only
+		// reaches translations rows that EXIST — a pair the branch created has
+		// no master row to lock, and a metadata delta locks nothing at all —
+		// so a concurrent rename or key edit could otherwise commit between
+		// STEP 4 and STEP 5 and be silently overwritten. Same deterministic
+		// order, same reasoning.
+		if err := tx.Exec(`
+			SELECT k.id
+			  FROM keys k
+			  JOIN branch_keys bk ON bk.key_id = k.id
+			 WHERE bk.branch_id = ?
+			 ORDER BY k.id
+			   FOR UPDATE`, branch.ID).Error; err != nil {
+			return fmt.Errorf("lock affected keys: %w", err)
+		}
+
 		// STEP 4 — every conflict must already have a human decision.
 		//
 		// Auto-resolving means silently choosing one person's words over
@@ -214,9 +242,21 @@ func (s *Service) Merge(ctx context.Context, branchName, actor string) (*Result,
 		// Order matters: a rename must land before values are written against
 		// the key, and a soft delete must not be silently undone by a value
 		// write that follows it.
-		keysApplied, err := s.mrs.ApplyKeyMeta(ctx, tx, mr.ID, branch.ID)
+		//
+		// Every apply statement re-checks the version rule in its own
+		// predicate — a delta lands only while master is still at the delta's
+		// base_master_version, or a human explicitly chose 'mine'. The locks
+		// in STEP 3 make a mid-merge master write nearly impossible, but the
+		// guard here is what makes it IMPOSSIBLE to overwrite one silently: a
+		// delta blocked by a version the conflict check never saw fails the
+		// whole merge with ErrConcurrentMasterWrite and rolls everything back.
+		keysApplied, keysBlocked, err := s.mrs.ApplyKeyMeta(ctx, tx, mr.ID, branch.ID, actor)
 		if err != nil {
 			return err
+		}
+		if keysBlocked > 0 {
+			return fmt.Errorf("%w: %d key metadata delta(s) no longer match master",
+				ErrConcurrentMasterWrite, keysBlocked)
 		}
 
 		applied, err := s.applyDeltas(ctx, tx, mr.ID, branch.ID, actor)
@@ -252,7 +292,13 @@ func (s *Service) Merge(ctx context.Context, branchName, actor string) (*Result,
 
 		// STEP 7 — close out. Merged branches KEEP their deltas as a permanent
 		// read-only record of what this request actually changed.
-		if err := s.mrs.SetStatus(ctx, tx, mr.ID, repository.MRStatusMerged, actor, ""); err != nil {
+		//
+		// The transition is guarded on the approved state read in STEP 2: a
+		// close or reject that slipped in since would otherwise be silently
+		// overwritten by 'merged' — and a miss here means the request is no
+		// longer the one that was validated, so the whole merge rolls back.
+		if err := s.mrs.SetStatus(ctx, tx, mr.ID, repository.MRStatusMerged,
+			[]string{repository.MRStatusApproved}, actor, ""); err != nil {
 			return err
 		}
 		if err := tx.Exec(`
@@ -295,53 +341,122 @@ func (s *Service) Merge(ctx context.Context, branchName, actor string) (*Result,
 
 // applyDeltasSQL folds non-removed deltas into master.
 //
-// Deltas whose conflict was resolved as 'master' are skipped: the reviewer chose
-// master's value, so the branch's is discarded. Unconflicted deltas have no
-// resolution row and are always applied.
+// `eligible` is every delta this merge intends to land. A delta whose conflict
+// was resolved as 'master' is excluded up front: the reviewer chose master's
+// value, so the branch's is discarded — but ONLY while that conflict is still
+// real. A 'master' resolution recorded against a pair whose versions agree is
+// spurious, and honouring it would silently drop a clean delta.
+//
+// `applicable` is the version guard, re-checked in the statement that writes:
+// the delta lands only when master is still at the delta's base_master_version,
+// or a human explicitly chose 'mine'. An eligible delta that is NOT applicable
+// means master moved after STEP 4 checked the conflicts — that is the blocked
+// count, and the caller turns it into ErrConcurrentMasterWrite and rolls back.
+//
+// One statement, one snapshot: eligibility, the write, the history rows and
+// both counts observe the same data, so the counts cannot lie about what was
+// applied. The translation_history insert mirrors what SetTranslation records
+// for a UI write — the post-change value and version, source 'merge', anchored
+// on the branch.
 const applyDeltasSQL = `
-INSERT INTO translations (key_id, locale_id, value, render_hint, version, updated_by, updated_at)
-SELECT bt.key_id, bt.locale_id, bt.value, bt.render_hint, 1, $3, now()
-  FROM branch_translations bt
-  LEFT JOIN merge_conflict_resolutions mcr
-    ON mcr.merge_request_id = $2
-   AND mcr.key_id = bt.key_id
-   AND COALESCE(mcr.locale_id, -1) = bt.locale_id
- WHERE bt.branch_id = $1
-   AND NOT bt.is_removed
-   AND COALESCE(mcr.resolution, 'mine') <> 'master'
-ON CONFLICT (key_id, locale_id) DO UPDATE SET
-    value       = EXCLUDED.value,
-    render_hint = EXCLUDED.render_hint,
-    version     = translations.version + 1,
-    updated_by  = EXCLUDED.updated_by,
-    updated_at  = now()`
+WITH eligible AS (
+    SELECT bt.key_id, bt.locale_id, bt.value, bt.render_hint,
+           (COALESCE(t.version, 0) = bt.base_master_version
+            OR COALESCE(mcr.resolution, '') = 'mine')       AS applicable
+      FROM branch_translations bt
+      LEFT JOIN translations t
+        ON t.key_id = bt.key_id AND t.locale_id = bt.locale_id
+      LEFT JOIN merge_conflict_resolutions mcr
+        ON mcr.merge_request_id = $2
+       AND mcr.key_id = bt.key_id
+       AND COALESCE(mcr.locale_id, -1) = bt.locale_id
+     WHERE bt.branch_id = $1
+       AND NOT bt.is_removed
+       AND NOT (COALESCE(mcr.resolution, '') = 'master'
+                AND COALESCE(t.version, 0) <> bt.base_master_version)
+), applied AS (
+    INSERT INTO translations (key_id, locale_id, value, render_hint, version, updated_by, updated_at)
+    SELECT e.key_id, e.locale_id, e.value, e.render_hint, 1, $3, now()
+      FROM eligible e
+     WHERE e.applicable
+    ON CONFLICT (key_id, locale_id) DO UPDATE SET
+        value       = EXCLUDED.value,
+        render_hint = EXCLUDED.render_hint,
+        version     = translations.version + 1,
+        updated_by  = EXCLUDED.updated_by,
+        updated_at  = now()
+    RETURNING key_id, locale_id, value, render_hint, version
+), recorded AS (
+    INSERT INTO translation_history
+        (key_id, locale_id, value, render_hint, version, source, branch_id, changed_by)
+    SELECT key_id, locale_id, value, render_hint, version, 'merge', $1, $3
+      FROM applied
+)
+SELECT count(*) FILTER (WHERE NOT e.applicable) AS blocked,
+       (SELECT count(*) FROM applied)           AS applied
+  FROM eligible e`
 
 // removeDeltasSQL applies tombstones — deleting the master row rather than
 // blanking it, because removing a translation and setting it to "" are
 // different acts and the three-state rule must survive the merge.
+//
+// Same eligibility and version guard as applyDeltasSQL. The history row
+// follows DeleteTranslation's convention: a NULL value says the pair became
+// UNTRANSLATED rather than blank, and the version recorded is the one the
+// deleted row held — there is no new version to report. A tombstone over a
+// pair master never held is applicable but deletes nothing, which is correct
+// and leaves no history: nothing changed.
 const removeDeltasSQL = `
-DELETE FROM translations t
- USING branch_translations bt
-  LEFT JOIN merge_conflict_resolutions mcr
-    ON mcr.merge_request_id = $2
-   AND mcr.key_id = bt.key_id
-   AND COALESCE(mcr.locale_id, -1) = bt.locale_id
- WHERE bt.branch_id = $1
-   AND bt.is_removed
-   AND COALESCE(mcr.resolution, 'mine') <> 'master'
-   AND t.key_id = bt.key_id
-   AND t.locale_id = bt.locale_id`
+WITH eligible AS (
+    SELECT bt.key_id, bt.locale_id,
+           (COALESCE(t.version, 0) = bt.base_master_version
+            OR COALESCE(mcr.resolution, '') = 'mine')       AS applicable
+      FROM branch_translations bt
+      LEFT JOIN translations t
+        ON t.key_id = bt.key_id AND t.locale_id = bt.locale_id
+      LEFT JOIN merge_conflict_resolutions mcr
+        ON mcr.merge_request_id = $2
+       AND mcr.key_id = bt.key_id
+       AND COALESCE(mcr.locale_id, -1) = bt.locale_id
+     WHERE bt.branch_id = $1
+       AND bt.is_removed
+       AND NOT (COALESCE(mcr.resolution, '') = 'master'
+                AND COALESCE(t.version, 0) <> bt.base_master_version)
+), removed AS (
+    DELETE FROM translations t
+     USING eligible e
+     WHERE e.applicable
+       AND t.key_id = e.key_id AND t.locale_id = e.locale_id
+    RETURNING t.key_id, t.locale_id, t.render_hint, t.version
+), recorded AS (
+    INSERT INTO translation_history
+        (key_id, locale_id, value, render_hint, version, source, branch_id, changed_by)
+    SELECT key_id, locale_id, NULL, render_hint, version, 'merge', $1, $3
+      FROM removed
+)
+SELECT count(*) FILTER (WHERE NOT e.applicable) AS blocked,
+       (SELECT count(*) FROM removed)           AS removed
+  FROM eligible e`
 
 func (s *Service) applyDeltas(ctx context.Context, tx *gorm.DB, mrID, branchID int64, actor string) (int, error) {
-	res := tx.Exec(applyDeltasSQL, branchID, mrID, actor)
-	if res.Error != nil {
-		return 0, fmt.Errorf("apply value deltas: %w", res.Error)
+	var blocked, applied int
+	row := tx.Raw(applyDeltasSQL, branchID, mrID, actor).Row()
+	if err := row.Scan(&blocked, &applied); err != nil {
+		return 0, fmt.Errorf("apply value deltas: %w", err)
 	}
-	applied := int(res.RowsAffected)
+	if blocked > 0 {
+		return 0, fmt.Errorf("%w: %d value delta(s) no longer match master",
+			ErrConcurrentMasterWrite, blocked)
+	}
 
-	res = tx.Exec(removeDeltasSQL, branchID, mrID)
-	if res.Error != nil {
-		return applied, fmt.Errorf("apply removal deltas: %w", res.Error)
+	var removedBlocked, removed int
+	row = tx.Raw(removeDeltasSQL, branchID, mrID, actor).Row()
+	if err := row.Scan(&removedBlocked, &removed); err != nil {
+		return applied, fmt.Errorf("apply removal deltas: %w", err)
 	}
-	return applied + int(res.RowsAffected), nil
+	if removedBlocked > 0 {
+		return applied, fmt.Errorf("%w: %d removal delta(s) no longer match master",
+			ErrConcurrentMasterWrite, removedBlocked)
+	}
+	return applied + removed, nil
 }

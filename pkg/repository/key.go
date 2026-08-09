@@ -405,10 +405,34 @@ func (r *keyRepository) List(ctx context.Context, tx *gorm.DB, f KeyFilter) (Key
 		// literal "100%" does not match every key in the corpus.
 		pattern := "%" + escapeLike(f.Search) + "%"
 		where.WriteString(` AND (k.name ILIKE ? ESCAPE '\'
-             OR k.description ILIKE ? ESCAPE '\'
+             OR k.description ILIKE ? ESCAPE '\'`)
+		args = append(args, pattern, pattern)
+
+		if f.BranchID > 0 {
+			// The value search must apply the SAME resolve rule every read
+			// does: a branch delta wins where one exists, master otherwise. A
+			// master-only search here would make text changed only on the
+			// branch unfindable in the branch's own view — and keep finding a
+			// key by master text the branch has already rewritten or removed.
+			// This is exactly the bug class the doc comment above warns about.
+			where.WriteString(`
+             OR EXISTS (SELECT 1 FROM branch_translations sbt
+                         WHERE sbt.branch_id = ? AND sbt.key_id = k.id
+                           AND NOT sbt.is_removed
+                           AND sbt.value ILIKE ? ESCAPE '\')
+             OR EXISTS (SELECT 1 FROM translations st
+                         WHERE st.key_id = k.id AND st.value ILIKE ? ESCAPE '\'
+                           AND NOT EXISTS (SELECT 1 FROM branch_translations obt
+                                            WHERE obt.branch_id = ?
+                                              AND obt.key_id = st.key_id
+                                              AND obt.locale_id = st.locale_id)))`)
+			args = append(args, f.BranchID, pattern, pattern, f.BranchID)
+		} else {
+			where.WriteString(`
              OR EXISTS (SELECT 1 FROM translations st
                          WHERE st.key_id = k.id AND st.value ILIKE ? ESCAPE '\'))`)
-		args = append(args, pattern, pattern, pattern)
+			args = append(args, pattern)
+		}
 	}
 
 	if f.UntranslatedIn > 0 {

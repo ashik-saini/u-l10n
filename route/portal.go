@@ -232,6 +232,28 @@ func (h *Handler) portalError(w http.ResponseWriter, r *http.Request, op string,
 		render.Status(r, http.StatusConflict)
 		render.JSON(w, r, errorResponse{Error: "live_merge_request_exists", Details: err.Error()})
 
+	// A guarded status transition that matched no row: the request left the
+	// expected state under the caller. mrsvc wraps this into ErrNotLive on its
+	// own paths; this entry is the backstop for the merge transaction's final
+	// approved → merged move, so a lost race stays a 409 and never a 500.
+	case errors.Is(err, repository.ErrStaleMergeRequestStatus):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, errorResponse{Error: "merge_request_not_live", Details: err.Error()})
+
+	// Two simultaneous publishes picked the same version number and the unique
+	// index refused the loser. Retryable by design — the comment on
+	// CreatePublish promises exactly this outcome.
+	case errors.Is(err, repository.ErrReleaseVersionRace):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, errorResponse{Error: "release_version_race", Details: err.Error()})
+
+	// A master write raced the merge between its conflict computation and its
+	// apply. The transaction rolled back whole; retrying the merge surfaces
+	// the new conflict for a human to resolve.
+	case errors.Is(err, mergesvc.ErrConcurrentMasterWrite):
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, errorResponse{Error: "concurrent_master_write", Details: err.Error()})
+
 	// The four merge refusals. Every one is an expected outcome a human must
 	// act on, and answering 500 for any of them would page an engineer because
 	// two translators edited the same string. MergeMergeRequest answers the

@@ -98,6 +98,13 @@ type BranchRepository interface {
 	// and fetching them per row would be three round trips per branch for a page
 	// that is rendered whole.
 	Summaries(ctx context.Context, tx *gorm.DB, status string) ([]BranchSummary, error)
+
+	// SummaryByID reads ONE branch with the same counts Summaries computes.
+	//
+	// The same statement scoped to one row, so a detail view and the list
+	// cannot disagree — and so resolving a merge request's branch does not
+	// fetch every branch in the system to find one.
+	SummaryByID(ctx context.Context, tx *gorm.DB, branchID int64) (BranchSummary, error)
 }
 
 // BranchSummary is a branch plus everything the branch list displays.
@@ -621,7 +628,7 @@ func (r *branchRepository) Changes(ctx context.Context, tx *gorm.DB, branchID in
 	return out, metaRows.Err()
 }
 
-// branchSummariesSQL folds three per-branch questions into one statement.
+// branchSummarySelect folds three per-branch questions into one statement.
 //
 // The subqueries are correlated scalar selects rather than joins with GROUP BY,
 // because a branch with no deltas must still appear — an inner join would hide
@@ -630,7 +637,11 @@ func (r *branchRepository) Changes(ctx context.Context, tx *gorm.DB, branchID in
 // The merge-request subquery repeats ByBranch's "live" predicate: terminal
 // states are excluded so a branch whose request was rejected reads as having
 // none, which is what lets a fresh request be opened against it.
-const branchSummariesSQL = `
+//
+// Shared between Summaries and SummaryByID, which differ only in their WHERE —
+// two copies would be two definitions of "what a branch summary means", and
+// they would drift.
+const branchSummarySelect = `
 SELECT b.id, b.name, b.description, b.status, b.created_by, b.created_at,
        b.last_edited_at, b.merged_at,
        (SELECT count(*) FROM branch_translations bt WHERE bt.branch_id = b.id) AS value_changes,
@@ -639,9 +650,23 @@ SELECT b.id, b.name, b.description, b.status, b.created_by, b.created_at,
   FROM branches b
   LEFT JOIN merge_requests mr
     ON mr.branch_id = b.id
-   AND mr.status NOT IN ('merged', 'closed', 'rejected')
+   AND mr.status NOT IN ('merged', 'closed', 'rejected')`
+
+const branchSummariesSQL = branchSummarySelect + `
  WHERE ($1 = '' OR b.status = $1)
  ORDER BY b.created_at DESC`
+
+const branchSummaryByIDSQL = branchSummarySelect + `
+ WHERE b.id = $1`
+
+func scanBranchSummary(row interface{ Scan(...interface{}) error }) (BranchSummary, error) {
+	var s BranchSummary
+	err := row.Scan(&s.ID, &s.Name, &s.Description, &s.Status,
+		&s.CreatedBy, &s.CreatedAt, &s.LastEditedAt, &s.MergedAt,
+		&s.ValueChanges, &s.MetaChanges,
+		&s.MergeRequestID, &s.MergeRequestStatus)
+	return s, err
+}
 
 func (r *branchRepository) Summaries(ctx context.Context, tx *gorm.DB, status string) ([]BranchSummary, error) {
 	rows, err := r.db(ctx, tx).Raw(branchSummariesSQL, status).Rows()
@@ -652,14 +677,25 @@ func (r *branchRepository) Summaries(ctx context.Context, tx *gorm.DB, status st
 
 	var out []BranchSummary
 	for rows.Next() {
-		var s BranchSummary
-		if err := rows.Scan(&s.ID, &s.Name, &s.Description, &s.Status,
-			&s.CreatedBy, &s.CreatedAt, &s.LastEditedAt, &s.MergedAt,
-			&s.ValueChanges, &s.MetaChanges,
-			&s.MergeRequestID, &s.MergeRequestStatus); err != nil {
+		s, err := scanBranchSummary(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan branch summary: %w", err)
 		}
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+func (r *branchRepository) SummaryByID(ctx context.Context, tx *gorm.DB, branchID int64) (BranchSummary, error) {
+	row := r.db(ctx, tx).Raw(branchSummaryByIDSQL, branchID).Row()
+
+	s, err := scanBranchSummary(row)
+	switch {
+	case err == nil:
+		return s, nil
+	case isNoRows(err):
+		return s, fmt.Errorf("branch %d: %w", branchID, ErrNotFound)
+	default:
+		return s, fmt.Errorf("read branch %d summary: %w", branchID, err)
+	}
 }

@@ -425,6 +425,40 @@ func TestASuccessfulMergeAppliesAndCutsARelease(t *testing.T) {
 		assert.ErrorIs(t, err, mrsvc.ErrNotLive)
 	})
 
+	t.Run("a merged request cannot be closed", func(t *testing.T) {
+		// merged → nothing is the documented invariant. A close that landed
+		// would erase the record that this request shipped a release.
+		_, err := mrs.Review(ctx, mr.ID, mrsvc.ActionClose, "", testActor, "req-1")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, mrsvc.ErrNotLive, "a 409 the caller can act on, not a success")
+
+		var status string
+		require.NoError(t, testDB.QueryRow(
+			`SELECT status FROM merge_requests WHERE id = $1`, mr.ID).Scan(&status))
+		assert.Equal(t, repository.MRStatusMerged, status, "the merged state must survive the attempt")
+	})
+
+	t.Run("the merged key's timeline shows the merge", func(t *testing.T) {
+		// The History endpoint must not lie after a merge: the value this
+		// merge landed is an event on the key's timeline, source 'merge'.
+		_, values, err := keys.History(ctx, key.ID, "en-SG", 10)
+		require.NoError(t, err)
+
+		var mergeEntries []repository.TranslationHistoryEntry
+		for _, e := range values {
+			if e.Source == "merge" {
+				mergeEntries = append(mergeEntries, e)
+			}
+		}
+		require.Len(t, mergeEntries, 1, "one merge, one history row")
+		require.NotNil(t, mergeEntries[0].Value)
+		assert.Equal(t, "shipped copy", *mergeEntries[0].Value)
+		assert.Equal(t, "approver@you.co", mergeEntries[0].ChangedBy,
+			"attributed to the actor who merged, not the branch author")
+		require.NotNil(t, mergeEntries[0].BranchID)
+		assert.Equal(t, branch.ID, *mergeEntries[0].BranchID)
+	})
+
 	t.Run("the merged branch is closed to further edits", func(t *testing.T) {
 		_, err := keys.SetTranslation(ctx, keysvc.SetTranslationRequest{
 			KeyID: key.ID, LocaleCode: "en-SG", Branch: branch.Name, Value: "too late",
@@ -635,6 +669,11 @@ func TestResolutionsRefuseWhatTheyCannotRecord(t *testing.T) {
 		{"no key", []mrsvc.Resolution{{LocaleCode: "en-SG", Choice: "mine"}}},
 		{"unknown choice", []mrsvc.Resolution{{KeyID: key.ID, LocaleCode: "en-SG", Choice: "theirs"}}},
 		{"unknown locale", []mrsvc.Resolution{{KeyID: key.ID, LocaleCode: "fr-FR", Choice: "mine"}}},
+		// The branch edited this pair but master never moved: there is no
+		// conflict to decide. Recording 'master' anyway would make the merge
+		// silently discard a delta nobody disputed.
+		{"value pair not in conflict", []mrsvc.Resolution{{KeyID: key.ID, LocaleCode: "en-SG", Choice: "master"}}},
+		{"metadata not in conflict", []mrsvc.Resolution{{KeyID: key.ID, Choice: "master"}}},
 	}
 
 	for _, tc := range cases {
@@ -644,6 +683,72 @@ func TestResolutionsRefuseWhatTheyCannotRecord(t *testing.T) {
 			assert.ErrorIs(t, err, mrsvc.ErrBadRequest)
 		})
 	}
+
+	// And nothing was recorded by the refused attempts: the resolution set is
+	// all-or-nothing, so a rejected entry must roll the whole call back.
+	var count int
+	require.NoError(t, testDB.QueryRow(
+		`SELECT count(*) FROM merge_conflict_resolutions WHERE merge_request_id = $1`,
+		mr.ID).Scan(&count))
+	assert.Zero(t, count)
+}
+
+// TestSetStatusIsACompareAndSwap pins the repository guard the workflow rests
+// on. The service pre-checks the state, but that read holds no lock — a merge
+// can commit between it and the UPDATE. The state predicate inside SetStatus
+// is what actually stops a racing close from overwriting 'merged', and a miss
+// must surface as the stale-status sentinel, never as a silent success.
+func TestSetStatusIsACompareAndSwap(t *testing.T) {
+	ctx := context.Background()
+	keys := newKeySvc(t)
+	branches := newBranchSvc(t)
+	mrsRepo := repository.ProvideMergeRequestRepository(testGORM(t))
+
+	key := createTestKey(t, keys, uniqueName(t, "cas"))
+	branch := branchWithEdit(t, keys, branches, key.ID, "v1")
+
+	mr, err := mrsRepo.Create(ctx, nil, branch.ID, "cas", testActor)
+	require.NoError(t, err)
+
+	// The merge wins the race: the request is merged now, though the closing
+	// caller still believes it is open.
+	_, err = testDB.Exec(
+		`UPDATE merge_requests SET status = 'merged', merged_at = now() WHERE id = $1`, mr.ID)
+	require.NoError(t, err)
+
+	err = mrsRepo.SetStatus(ctx, nil, mr.ID, repository.MRStatusClosed,
+		[]string{repository.MRStatusOpen, repository.MRStatusApproved, repository.MRStatusChangesRequested},
+		testActor, "")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, repository.ErrStaleMergeRequestStatus)
+
+	var status string
+	require.NoError(t, testDB.QueryRow(
+		`SELECT status FROM merge_requests WHERE id = $1`, mr.ID).Scan(&status))
+	assert.Equal(t, repository.MRStatusMerged, status,
+		"the lost race must not overwrite the merged state")
+
+	// No phantom 'closed' event either: the timeline records what happened.
+	events, err := mrsRepo.Events(ctx, nil, mr.ID)
+	require.NoError(t, err)
+	for _, e := range events {
+		assert.NotEqual(t, "closed", e.Event,
+			"a refused transition must leave no event claiming it happened")
+	}
+
+	t.Run("the matching state still transitions", func(t *testing.T) {
+		branch2 := branchWithEdit(t, keys, branches, key.ID, "v2")
+		ok, err := mrsRepo.Create(ctx, nil, branch2.ID, "cas-ok", testActor)
+		require.NoError(t, err)
+
+		require.NoError(t, mrsRepo.SetStatus(ctx, nil, ok.ID, repository.MRStatusClosed,
+			[]string{repository.MRStatusOpen, repository.MRStatusApproved, repository.MRStatusChangesRequested},
+			testActor, ""))
+		var status string
+		require.NoError(t, testDB.QueryRow(
+			`SELECT status FROM merge_requests WHERE id = $1`, ok.ID).Scan(&status))
+		assert.Equal(t, repository.MRStatusClosed, status)
+	})
 }
 
 // TestMergeRequestOnAClosedBranchIsRefused: reviewing a closed branch would be

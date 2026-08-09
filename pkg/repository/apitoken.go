@@ -97,8 +97,16 @@ func (r *apiTokenRepository) Authenticate(ctx context.Context, tx *gorm.DB, plai
 	// Best-effort audit of use. A failure here must not fail the request — the
 	// caller is legitimately authenticated and losing a timestamp is not worth
 	// a 500.
-	if err := db.Exec(
-		`UPDATE api_tokens SET last_used_at = now() WHERE id = ?`, t.ID).Error; err != nil {
+	//
+	// Throttled to once a minute in the UPDATE's own predicate: last_used_at
+	// answers "is this token still in use?", for which minute precision is
+	// plenty, and a busy script would otherwise turn every authenticated
+	// request into a row write on one hot row.
+	if err := db.Exec(`
+		UPDATE api_tokens SET last_used_at = now()
+		 WHERE id = ?
+		   AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')`,
+		t.ID).Error; err != nil {
 		log.Errore(ctx, "failed to record token use", err, "token_id", t.ID)
 	}
 

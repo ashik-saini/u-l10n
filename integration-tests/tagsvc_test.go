@@ -206,9 +206,13 @@ func TestSetKeyTagsIsAllOrNothing(t *testing.T) {
 	_, err = tags.SetKeyTags(ctx, key.ID, []int16{good.ID}, testActor, "req-1")
 	require.NoError(t, err)
 
-	_, err = tags.SetKeyTags(ctx, key.ID, []int16{good.ID, 32000}, testActor, "req-1")
+	// An unknown tag id is a caller error, and the 400 body names WHICH ids
+	// were wrong — all of them, in one lookup, not just the first typo.
+	_, err = tags.SetKeyTags(ctx, key.ID, []int16{good.ID, 32000, 31999}, testActor, "req-1")
 	require.Error(t, err)
-	assert.ErrorIs(t, err, repository.ErrNotFound)
+	assert.ErrorIs(t, err, tagsvc.ErrBadRequest)
+	assert.Contains(t, err.Error(), "32000")
+	assert.Contains(t, err.Error(), "31999")
 
 	// The original set survives untouched.
 	tagsByKey, err := repository.ProvideTagRepository(testGORM(t)).
@@ -216,6 +220,40 @@ func TestSetKeyTagsIsAllOrNothing(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, tagsByKey[key.ID], 1)
 	assert.Equal(t, good.ID, tagsByKey[key.ID][0].ID)
+}
+
+// TestSetKeyTagsRefusesANonexistentKey.
+//
+// Two failure shapes hid here. With tags attached, the key_tags FK violation
+// surfaced as a 500 for what is a plain 404. With an EMPTY set, nothing
+// touched the key at all: the caller got a success and the audit table gained
+// a row claiming a change to a key that does not exist — an audit trail that
+// lies is worse than none, given that tagsvc exists to write it.
+func TestSetKeyTagsRefusesANonexistentKey(t *testing.T) {
+	ctx := context.Background()
+	tags := newTagSvc(t)
+
+	tag, err := tags.Create(ctx, uniqueTagName(t, "orphan"), "", testActor, "req-1")
+	require.NoError(t, err)
+
+	const noSuchKey = int64(922337203685477)
+
+	t.Run("with tags: a 404, not an FK violation", func(t *testing.T) {
+		_, err := tags.SetKeyTags(ctx, noSuchKey, []int16{tag.ID}, testActor, "req-1")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, repository.ErrNotFound)
+	})
+
+	t.Run("with an empty set: a 404, not a phantom success", func(t *testing.T) {
+		_, err := tags.SetKeyTags(ctx, noSuchKey, nil, testActor, "req-1")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, repository.ErrNotFound)
+	})
+
+	// And no audit row claims either attempt happened: the transaction rolled
+	// back whole.
+	events := auditFor(t, fmt.Sprintf("key:%d", noSuchKey))
+	assert.Empty(t, events, "a refused write must leave no audit trace")
 }
 
 // TestTagsSurviveTheKeyBrowser: the browser reads tags in one query for the

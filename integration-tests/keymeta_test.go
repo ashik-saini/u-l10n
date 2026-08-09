@@ -1,10 +1,13 @@
 package integrationtests
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/yougroupteam/u-l10n/pkg/repository"
 )
 
 // Key-metadata conflicts are the SECOND conflict type — anchored on
@@ -112,29 +115,40 @@ func TestMetaConflictAnchorsOnKeyVersion(t *testing.T) {
 }
 
 // TestSoftDeleteOnBranchMergesAsAStatusChange proves a branch can delete a key
-// and have that reach master through the metadata path.
+// and have that reach master through the metadata path — driven through the
+// REAL ApplyKeyMeta, version guard and all, rather than a mirror of its SQL.
 func TestSoftDeleteOnBranchMergesAsAStatusChange(t *testing.T) {
+	ctx := context.Background()
+	mrs := repository.ProvideMergeRequestRepository(testGORM(t))
+
 	branchID := newBranch(t, "meta-softdelete")
 	mrID := newMR(t, branchID, true)
 	keyID := insertKey(t, "meta_softdelete_case")
 
 	setKeyMeta(t, branchID, keyID, "meta_softdelete_case", "deleted")
 
-	_, err := testDB.Exec(`
-		UPDATE keys k
-		   SET name = bk.name, platforms = bk.platforms, status = bk.status,
-		       version = k.version + 1, updated_at = now()
-		  FROM branch_keys bk
-		  LEFT JOIN merge_conflict_resolutions mcr
-		    ON mcr.merge_request_id = $2 AND mcr.key_id = bk.key_id AND mcr.locale_id IS NULL
-		 WHERE bk.branch_id = $1 AND bk.key_id = k.id
-		   AND COALESCE(mcr.resolution, 'mine') <> 'master'`, branchID, mrID)
+	applied, blocked, err := mrs.ApplyKeyMeta(ctx, nil, mrID, branchID, "merger@you.co")
 	require.NoError(t, err)
+	assert.Zero(t, blocked, "master never moved, so nothing trips the guard")
+	assert.Equal(t, 1, applied)
 
 	var status string
 	require.NoError(t, testDB.QueryRow(
 		`SELECT status FROM keys WHERE id = $1`, keyID).Scan(&status))
 	assert.Equal(t, "deleted", status, "a branch soft delete must reach master")
+
+	// The applied change is on the key's timeline: source 'merge', the
+	// post-change state, attributed to the merging actor.
+	var (
+		histStatus, histSource, histActor string
+	)
+	require.NoError(t, testDB.QueryRow(`
+		SELECT status, source, changed_by FROM key_history
+		 WHERE key_id = $1 ORDER BY id DESC LIMIT 1`, keyID).
+		Scan(&histStatus, &histSource, &histActor))
+	assert.Equal(t, "deleted", histStatus)
+	assert.Equal(t, "merge", histSource)
+	assert.Equal(t, "merger@you.co", histActor)
 
 	// And the name becomes reusable, because the unique index is partial.
 	_, err = testDB.Exec(`
@@ -202,17 +216,54 @@ func TestMetaResolutionMasterDiscardsBranchRename(t *testing.T) {
 		VALUES ($1, $2, NULL, 'master', 'approver@you.co')`, mrID, keyID)
 	require.NoError(t, err)
 
-	_, err = testDB.Exec(`
-		UPDATE keys k SET name = bk.name, version = k.version + 1
-		  FROM branch_keys bk
-		  LEFT JOIN merge_conflict_resolutions mcr
-		    ON mcr.merge_request_id = $2 AND mcr.key_id = bk.key_id AND mcr.locale_id IS NULL
-		 WHERE bk.branch_id = $1 AND bk.key_id = k.id
-		   AND COALESCE(mcr.resolution, 'mine') <> 'master'`, branchID, mrID)
+	applied, blocked, err := repository.ProvideMergeRequestRepository(testGORM(t)).
+		ApplyKeyMeta(context.Background(), nil, mrID, branchID, "merger@you.co")
 	require.NoError(t, err)
+	assert.Zero(t, blocked, "a decided conflict is an intentional skip, not a blocked delta")
+	assert.Zero(t, applied, "the skipped delta must not count as applied")
 
 	var name string
 	require.NoError(t, testDB.QueryRow(`SELECT name FROM keys WHERE id = $1`, keyID).Scan(&name))
 	assert.Equal(t, "meta_resolution_master_name", name,
 		"resolution 'master' must DISCARD the branch rename, not apply it")
+}
+
+// TestApplyKeyMetaRefusesAConcurrentMasterWrite is the metadata half of the
+// lost-update guard: a delta whose keys.version moved past base_master_version
+// with NO resolution row must be counted as blocked and NOT applied, so the
+// merge can refuse with ErrConcurrentMasterWrite instead of silently
+// overwriting a rename somebody just committed.
+func TestApplyKeyMetaRefusesAConcurrentMasterWrite(t *testing.T) {
+	ctx := context.Background()
+	mrs := repository.ProvideMergeRequestRepository(testGORM(t))
+
+	branchID := newBranch(t, "meta-lost-update")
+	mrID := newMR(t, branchID, true)
+	keyID := insertKey(t, "meta_lost_update_original")
+
+	setKeyMeta(t, branchID, keyID, "meta_lost_update_branch_name", "active")
+
+	// A concurrent writer renames the key on master AFTER the branch captured
+	// its base — the write the unguarded UPDATE would have destroyed.
+	_, err := testDB.Exec(`
+		UPDATE keys SET name = 'meta_lost_update_concurrent', version = version + 1
+		 WHERE id = $1`, keyID)
+	require.NoError(t, err)
+
+	applied, blocked, err := mrs.ApplyKeyMeta(ctx, nil, mrID, branchID, "merger@you.co")
+	require.NoError(t, err)
+	assert.Equal(t, 1, blocked, "the raced delta must be counted, so the merge can refuse")
+	assert.Zero(t, applied)
+
+	var name string
+	require.NoError(t, testDB.QueryRow(`SELECT name FROM keys WHERE id = $1`, keyID).Scan(&name))
+	assert.Equal(t, "meta_lost_update_concurrent", name,
+		"the concurrent master rename must survive — overwriting it silently is THE bug")
+
+	// And no history row claims a merge that never applied.
+	var mergeRows int
+	require.NoError(t, testDB.QueryRow(`
+		SELECT count(*) FROM key_history WHERE key_id = $1 AND source = 'merge'`,
+		keyID).Scan(&mergeRows))
+	assert.Zero(t, mergeRows)
 }

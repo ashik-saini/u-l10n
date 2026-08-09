@@ -83,6 +83,43 @@ func TestPresenceDecidesBlankVersusUntranslated(t *testing.T) {
 		"an unknown locale must never default to present")
 }
 
+// TestDedupeTranslationsIsLastWinsAndOrderPreserving.
+//
+// Two Lokalise keys can canonicalise to ONE name — Canonical() falls back
+// Web -> IOS -> Other -> Android — which puts the same (key_id, locale_id)
+// twice into one batch. Undeduplicated, a single INSERT ... ON CONFLICT DO
+// UPDATE touching one row twice is SQLSTATE 21000 and the WHOLE import fails.
+// Last-wins matches the import's iteration order (remote keys sorted by
+// Lokalise id), and first-occurrence order keeps a re-run reproducible.
+func TestDedupeTranslationsIsLastWinsAndOrderPreserving(t *testing.T) {
+	in := []model.Translation{
+		{KeyID: 1, LocaleID: 1, Value: "first"},
+		{KeyID: 2, LocaleID: 1, Value: "other key"},
+		{KeyID: 1, LocaleID: 1, Value: "second wins"},
+		{KeyID: 1, LocaleID: 2, Value: "same key, different locale"},
+	}
+
+	out := dedupeTranslations(in)
+
+	assert.Equal(t, []model.Translation{
+		{KeyID: 1, LocaleID: 1, Value: "second wins"},
+		{KeyID: 2, LocaleID: 1, Value: "other key"},
+		{KeyID: 1, LocaleID: 2, Value: "same key, different locale"},
+	}, out, "last value wins, in the first occurrence's slot; distinct pairs survive")
+
+	t.Run("no duplicates is a no-op", func(t *testing.T) {
+		clean := []model.Translation{
+			{KeyID: 1, LocaleID: 1, Value: "a"},
+			{KeyID: 2, LocaleID: 1, Value: "b"},
+		}
+		assert.Equal(t, clean, dedupeTranslations(clean))
+	})
+
+	t.Run("empty in, empty out", func(t *testing.T) {
+		assert.Empty(t, dedupeTranslations(nil))
+	})
+}
+
 func TestLocaleLookup(t *testing.T) {
 	locales := []model.Locale{
 		{ID: 1, Code: "en-SG", FlutterDir: "en_SG"},

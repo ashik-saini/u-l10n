@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jinzhu/gorm"
+	"github.com/lib/pq"
 
 	"github.com/yougroupteam/u-common-components/database"
 )
@@ -77,7 +78,14 @@ type MergeRequestRepository interface {
 	// because anything checked before the transaction is already stale.
 	InvalidateApprovalIfEdited(ctx context.Context, tx *gorm.DB, branchID int64) (invalidated bool, err error)
 
-	SetStatus(ctx context.Context, tx *gorm.DB, mrID int64, status, actor, comment string) error
+	// SetStatus moves a request to status, and ONLY from one of allowedFrom.
+	//
+	// The predicate is the guard, exactly as in Approve: a pre-check in a
+	// service is stale by the time the UPDATE runs, and without the state
+	// filter a close racing a merge would move a MERGED request to closed —
+	// violating the documented "merged → nothing" invariant. A miss returns
+	// ErrStaleMergeRequestStatus.
+	SetStatus(ctx context.Context, tx *gorm.DB, mrID int64, status string, allowedFrom []string, actor, comment string) error
 
 	// Conflicts computes value conflicts for a branch, with any stored
 	// resolutions attached.
@@ -91,8 +99,15 @@ type MergeRequestRepository interface {
 	// NameCollisions finds branch names an active master key already holds.
 	NameCollisions(ctx context.Context, tx *gorm.DB, branchID int64) ([]NameCollision, error)
 
-	// ApplyKeyMeta folds metadata deltas into master.
-	ApplyKeyMeta(ctx context.Context, tx *gorm.DB, mrID, branchID int64) (int, error)
+	// ApplyKeyMeta folds metadata deltas into master, recording a key_history
+	// row for every key it changes.
+	//
+	// applied is how many keys changed; blocked is how many deltas were
+	// REFUSED by the version guard — master's keys.version moved past
+	// base_master_version with no explicit resolution. A non-zero blocked
+	// means the caller must abort: applying the rest would silently overwrite
+	// a concurrent master write.
+	ApplyKeyMeta(ctx context.Context, tx *gorm.DB, mrID, branchID int64, actor string) (applied, blocked int, err error)
 
 	// ByID reads one request in any state, including the terminal ones. The
 	// portal has to be able to show a rejected request; ByBranch deliberately
@@ -265,13 +280,25 @@ func (r *mergeRequestRepository) InvalidateApprovalIfEdited(
 	return true, nil
 }
 
+// ErrStaleMergeRequestStatus is returned when a guarded status transition
+// matched no row: the request left the expected state under the caller.
+//
+// The canonical race is a close arriving while a merge commits — without the
+// state predicate the close would move a MERGED request to closed, and merged
+// is documented as moving to nothing. A 409 a human resolves, not a fault.
+var ErrStaleMergeRequestStatus = errors.New(
+	"merge request is no longer in a state that allows this transition")
+
 func (r *mergeRequestRepository) SetStatus(
-	ctx context.Context, tx *gorm.DB, mrID int64, status, actor, comment string,
+	ctx context.Context, tx *gorm.DB, mrID int64, status string, allowedFrom []string, actor, comment string,
 ) error {
 	db := r.db(ctx, tx)
 
-	if err := db.Exec(
-		`UPDATE merge_requests SET status = $1 WHERE id = $2`, status, mrID).Error; err != nil {
+	res := db.Exec(`
+		UPDATE merge_requests SET status = $1
+		 WHERE id = $2 AND status = ANY($3)`,
+		status, mrID, pq.Array(allowedFrom))
+	if err := res.Error; err != nil {
 		// Moving OUT of a terminal state can collide with
 		// idx_merge_requests_one_live_per_branch, which permits one live request
 		// per branch. That is a state a human must resolve, so it is classified
@@ -280,6 +307,13 @@ func (r *mergeRequestRepository) SetStatus(
 			return fmt.Errorf("reopen merge request %d: %w", mrID, ErrLiveMergeRequestExists)
 		}
 		return fmt.Errorf("set merge request %d status: %w", mrID, err)
+	}
+	// Zero rows means the request is gone or — far more likely — its status
+	// moved between the caller's read and this write. Approve makes the same
+	// check for the same reason: the predicate is the guard, not the pre-check.
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("merge request %d cannot move to %q: %w",
+			mrID, status, ErrStaleMergeRequestStatus)
 	}
 	return r.event(ctx, db, mrID, statusEvent(status), actor, comment)
 }
@@ -617,37 +651,75 @@ func (r *mergeRequestRepository) NameCollisions(
 // values are written against the key, and a soft delete must not be undone by a
 // value write that follows it.
 //
-// This one UPDATE is also how a key CREATED on a branch reaches master. Such a
-// key already has a `keys` row — inserted at creation with status = 'draft', so
-// it is excluded from every export and every OTA bundle until it lands — and a
-// branch_keys delta carrying status = 'active'. `status = bk.status` promotes
-// it. There is no INSERT branch here and deliberately so: one path by which a
-// key becomes visible on master is one path to get wrong.
+// The UPDATE inside `applied` is also how a key CREATED on a branch reaches
+// master. Such a key already has a `keys` row — inserted at creation with
+// status = 'draft', so it is excluded from every export and every OTA bundle
+// until it lands — and a branch_keys delta carrying status = 'active'.
+// `status = e.status` promotes it. There is no INSERT branch here and
+// deliberately so: one path by which a key becomes visible on master is one
+// path to get wrong.
+//
+// The version guard in `applicable` is the same rule the conflict computation
+// uses, re-checked in the statement that writes: a delta lands only when
+// master's keys.version still equals base_master_version, or a human
+// explicitly chose 'mine'. A 'master' resolution skips the delta only while
+// its conflict is still real — a spurious resolution row recorded against a
+// clean pair must not discard the delta. Deltas that are neither applicable
+// nor an intentional skip are counted as `blocked`: master moved after the
+// conflicts were checked, and the caller must abort rather than half-apply.
+//
+// One statement, one snapshot: eligibility, the write, the history rows and
+// both counts all observe the same data, so the counts cannot lie about what
+// was applied. The key_history insert mirrors keyRepository.RecordHistory —
+// the post-change state, source 'merge', anchored on the branch.
 const applyKeyMetaSQL = `
-UPDATE keys k
-   SET name         = bk.name,
-       description  = bk.description,
-       platforms    = bk.platforms,
-       android_name = bk.android_name,
-       ios_name     = bk.ios_name,
-       status       = bk.status,
-       version      = k.version + 1,
-       updated_at   = now()
-  FROM branch_keys bk
-  LEFT JOIN merge_conflict_resolutions mcr
-    ON mcr.merge_request_id = $2
-   AND mcr.key_id = bk.key_id
-   AND mcr.locale_id IS NULL
- WHERE bk.branch_id = $1
-   AND bk.key_id = k.id
-   AND COALESCE(mcr.resolution, 'mine') <> 'master'`
+WITH eligible AS (
+    SELECT bk.key_id, bk.name, bk.description, bk.platforms,
+           bk.android_name, bk.ios_name, bk.status,
+           (COALESCE(k.version, 0) = bk.base_master_version
+            OR COALESCE(mcr.resolution, '') = 'mine')       AS applicable
+      FROM branch_keys bk
+      JOIN keys k ON k.id = bk.key_id
+      LEFT JOIN merge_conflict_resolutions mcr
+        ON mcr.merge_request_id = $2
+       AND mcr.key_id = bk.key_id
+       AND mcr.locale_id IS NULL
+     WHERE bk.branch_id = $1
+       AND NOT (COALESCE(mcr.resolution, '') = 'master'
+                AND COALESCE(k.version, 0) <> bk.base_master_version)
+), applied AS (
+    UPDATE keys k
+       SET name         = e.name,
+           description  = e.description,
+           platforms    = e.platforms,
+           android_name = e.android_name,
+           ios_name     = e.ios_name,
+           status       = e.status,
+           version      = k.version + 1,
+           updated_at   = now()
+      FROM eligible e
+     WHERE e.applicable
+       AND k.id = e.key_id
+    RETURNING k.id, k.name, k.description, k.platforms, k.android_name,
+              k.ios_name, k.status, k.version
+), recorded AS (
+    INSERT INTO key_history (key_id, name, description, platforms,
+                             android_name, ios_name, status, version,
+                             source, branch_id, changed_by)
+    SELECT id, name, description, platforms, android_name, ios_name,
+           status, version, 'merge', $1, $3
+      FROM applied
+)
+SELECT count(*) FILTER (WHERE NOT e.applicable) AS blocked,
+       (SELECT count(*) FROM applied)           AS applied
+  FROM eligible e`
 
 func (r *mergeRequestRepository) ApplyKeyMeta(
-	ctx context.Context, tx *gorm.DB, mrID, branchID int64,
-) (int, error) {
-	res := r.db(ctx, tx).Exec(applyKeyMetaSQL, branchID, mrID)
-	if res.Error != nil {
-		return 0, fmt.Errorf("apply key metadata: %w", res.Error)
+	ctx context.Context, tx *gorm.DB, mrID, branchID int64, actor string,
+) (applied, blocked int, err error) {
+	row := r.db(ctx, tx).Raw(applyKeyMetaSQL, branchID, mrID, actor).Row()
+	if err := row.Scan(&blocked, &applied); err != nil {
+		return 0, 0, fmt.Errorf("apply key metadata: %w", err)
 	}
-	return int(res.RowsAffected), nil
+	return applied, blocked, nil
 }

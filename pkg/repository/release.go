@@ -2,8 +2,6 @@ package repository
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -145,6 +143,25 @@ func (r *releaseRepository) Create(
 	return rel, nil
 }
 
+// materialiseBundleSQL computes sha256 and byte_size from the SAME bytes the
+// serving path returns.
+//
+// The strings column is JSONB, and the OTA path serves `strings::text` —
+// Postgres's re-serialisation, whose key order and spacing differ from Go's
+// json.Marshal output. A fingerprint computed over the Go bytes would describe
+// bytes no client ever receives: the ETag/304 dance would still work (the sha
+// only has to be stable), but a client checksumming its download against the
+// advertised sha256 would never match. Both derived from the one $3 parameter,
+// in the one statement, so they cannot skew. jsonb's text form is canonical —
+// identical content always re-serialises identically — which is what keeps the
+// sha stable across merges that change nothing.
+const materialiseBundleSQL = `
+INSERT INTO release_bundles (release_id, locale_id, strings, sha256, key_count, byte_size)
+VALUES ($1, $2, $3::jsonb,
+        encode(sha256(convert_to(($3::jsonb)::text, 'UTF8')), 'hex'),
+        $4,
+        octet_length(($3::jsonb)::text))`
+
 func (r *releaseRepository) MaterialiseBundle(
 	ctx context.Context, tx *gorm.DB, releaseID int64, locale model.Locale, rows []ExportRow,
 ) error {
@@ -157,21 +174,13 @@ func (r *releaseRepository) MaterialiseBundle(
 		strings[row.Key] = row.Value
 	}
 
-	// Marshal with sorted keys (encoding/json sorts map keys) so the same
-	// content always produces the same bytes and therefore the same sha256.
-	// A fingerprint that changed without the content changing would break
-	// every client's ETag on every merge.
 	payload, err := json.Marshal(strings)
 	if err != nil {
 		return fmt.Errorf("marshal bundle for %s: %w", locale.Code, err)
 	}
-	sum := sha256.Sum256(payload)
 
-	err = r.db(ctx, tx).Exec(`
-		INSERT INTO release_bundles (release_id, locale_id, strings, sha256, key_count, byte_size)
-		VALUES ($1, $2, $3, $4, $5, $6)`,
-		releaseID, locale.ID, string(payload), hex.EncodeToString(sum[:]),
-		len(strings), len(payload)).Error
+	err = r.db(ctx, tx).Exec(materialiseBundleSQL,
+		releaseID, locale.ID, string(payload), len(strings)).Error
 	if err != nil {
 		return fmt.Errorf("materialise bundle for %s: %w", locale.Code, err)
 	}
@@ -278,12 +287,26 @@ INSERT INTO releases (version, source, notes, min_app_version, created_by)
 VALUES (COALESCE((SELECT max(version) FROM releases), 0) + 1, 'publish', $1, $2, $3)
 RETURNING id, version, source`
 
+// ErrReleaseVersionRace is returned when two simultaneous publishes allocate
+// the same version number and releases_version_unique refuses the loser.
+//
+// An exported sentinel, following ErrLiveMergeRequestExists: this is the
+// retry-shaped outcome the comment above promises, not a fault. The portal
+// answers 409 and the caller simply publishes again — unclassified it would
+// surface as a driver error and page an engineer for a race that resolves
+// itself.
+var ErrReleaseVersionRace = errors.New(
+	"another release took this version number; retry the publish")
+
 func (r *releaseRepository) CreatePublish(
 	ctx context.Context, tx *gorm.DB, notes string, minAppVersion *string, createdBy string,
 ) (Release, error) {
 	var rel Release
 	row := r.db(ctx, tx).Raw(createPublishSQL, notes, minAppVersion, createdBy).Row()
 	if err := row.Scan(&rel.ID, &rel.Version, &rel.Source); err != nil {
+		if isUniqueViolation(err) {
+			return rel, fmt.Errorf("create publish release: %w", ErrReleaseVersionRace)
+		}
 		return rel, fmt.Errorf("create publish release: %w", err)
 	}
 	return rel, nil
