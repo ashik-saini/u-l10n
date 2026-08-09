@@ -62,7 +62,7 @@ sequenceDiagram
         S-->>AP: 409 concurrent_master_write
         AP->>S: re-check conflicts, retry merge
     end
-    Note over S: merged is terminal — every status change is a<br/>compare-and-swap; a close racing a merge loses cleanly
+    Note over S: merged is terminal — every status change is a<br/>compare-and-swap, so a close racing a merge loses cleanly
 ```
 
 ## 3. Mobile app user — strings over the air
