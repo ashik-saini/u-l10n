@@ -100,7 +100,7 @@ sequenceDiagram
 
     OP->>CLI: project create --code --name --actor
     CLI->>PG: projects row + actor's admin grant, ONE transaction
-    Note over PG: platform admin only; the one privilege<br/>with no project to scope it to
+    Note over PG: platform admin only — the one privilege<br/>with no project to scope it to
     OP->>CLI: user grant --email --role [--platform-admin]
     CLI->>PG: users row (viewer < editor < approver < admin)
     Note over PG: a Google login means nothing<br/>until a role exists here
