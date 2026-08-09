@@ -1,5 +1,7 @@
 # u-l10n — how it fits together
 
+The machinery view. For the persona journeys — translator, reviewer, mobile app, operator — see [USER_FLOWS.md](USER_FLOWS.md).
+
 ## 1. Architecture & request flow
 
 ```mermaid
