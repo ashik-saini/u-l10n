@@ -34,6 +34,7 @@ var ErrOptimisticLock = errors.New("optimistic lock conflict: the row was modifi
 var ErrNotFound = errors.New("not found")
 
 var WireSet = wire.NewSet(
+	ProvideProjectRepository,
 	ProvideLocaleRepository,
 	ProvideKeyRepository,
 	ProvideTranslationRepository,

@@ -30,6 +30,18 @@ const (
 	RenderHintCDATA RenderHint = "cdata"
 )
 
+// Project is the root of the ownership tree. Every key, locale, branch and
+// release belongs to exactly one. Codes appear in URLs, so they are slugs.
+type Project struct {
+	ID                int16
+	Code              string
+	Name              string
+	Status            string
+	LokaliseProjectID string // empty when the project has no Lokalise source
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+}
+
 // Locale is one language/region, and owns its export directory naming so the
 // serializers stay table-driven.
 type Locale struct {
