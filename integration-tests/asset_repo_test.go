@@ -30,7 +30,7 @@ func createAsset(t *testing.T, sha, filename string, bytes int) (id int64, inser
 	err := testDB.QueryRow(`
 		INSERT INTO assets (s3_key, sha256, filename, content_type, bytes, width, height, uploaded_by)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (sha256) DO NOTHING
+		ON CONFLICT (project_id, sha256) DO NOTHING
 		RETURNING id`,
 		"screenshots/"+sha[0:2]+"/"+sha[2:4]+"/"+sha, sha, filename, "image/png",
 		bytes, nil, nil, "token:test").Scan(&id)

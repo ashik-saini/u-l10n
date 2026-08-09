@@ -497,6 +497,16 @@ func (s *Service) Detach(ctx context.Context, keyID, assetID int64, actor, reque
 // be guessed or searched for before the object could be HEADed, and it encodes
 // nothing the object's own Content-Type header and assets.content_type do not
 // already hold.
+//
+// TODO(plan-2): this key carries no project component either, and V1.12's
+// header says it should. Two projects uploading identical bytes today produce
+// two `assets` rows — correctly distinguished by V1.12's project-scoped unique
+// indexes — that both compute this SAME key, so both point at ONE S3 object:
+// deleting one project's asset deletes the other's underlying bytes too. Do
+// not fix this alone: prefixing the key without also scoping
+// AssetRepository.BySHA256 (see its TODO(plan-2)) is half a fix, since the
+// dedupe lookup would then miss a real cross-project collision it currently
+// (wrongly) finds. Both belong together in the next plan.
 // hashHex returns the lowercase hex SHA-256 of b — the same canonical form
 // assets_sha256_format_check enforces, so a comparison against a stored sum
 // can never miss on encoding.
