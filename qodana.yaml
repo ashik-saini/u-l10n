@@ -1,0 +1,76 @@
+#-------------------------------------------------------------------------------#
+#               Qodana analysis is configured by qodana.yaml file               #
+#             https://www.jetbrains.com/help/qodana/qodana-yaml.html            #
+#-------------------------------------------------------------------------------#
+version: "1.0"
+
+profile:
+  name: qodana.starter
+
+# Disabled inspections, with the reason each is noise here rather than signal.
+#
+# The SQL family analyses the SQL embedded in Go string literals against a live
+# database connection. This service has no datasource configured for the IDE —
+# and could not usefully have one, since the schema only exists after Flyway
+# runs — so the analyser cannot resolve our own tables, columns or functions,
+# and its Postgres dialect parser cannot follow parameter casts like
+# `$1::text[]` or set-returning functions like `unnest(...)`. The result is
+# ~460 false positives across pkg/repository, every one a correct query the
+# analyser simply cannot see the schema for. Correctness of the SQL is proven
+# instead by the integration tests, which run every statement against a real
+# PostgreSQL (see integration-tests/ and `make db-migrate`).
+exclude:
+  - name: SqlNoDataSourceInspection   # "No data source configured" — by design
+  - name: SqlResolve                  # unresolved table/column/function/symbol
+  - name: SqlDialectInspection        # dialect parser choking on $1::text[], unnest()
+  - name: SqlCurrentSchemaInspection  # schema unknown without a datasource
+  - name: SqlUnused                   # cannot judge usage without the schema
+
+  # Prose inspections. Useful in docs, but they flag domain vocabulary
+  # (Lokalise, sha256, unnest, en-SG, printf verbs) as misspellings and every
+  # comment fragment as a grammar note — ~410 findings, all noise here. Leave
+  # them off in CI; a human still reads prose in review.
+  - name: SpellCheckingInspection
+  - name: GrazieInspection
+  - name: GrazieStyle
+
+  # Idiomatic deferred Close on read paths. Every one of the 47 hits is a
+  # `defer rows.Close()` or `resp.Body.Close()` where the query has already
+  # succeeded and a close error is nothing a caller can act on. The inspection
+  # cannot be scoped to a method, and the only way to satisfy it — wrapping each
+  # in `defer func() { _ = rows.Close() }()` — is uglier and less readable than
+  # the finding it removes. Genuinely swallowed errors are caught by go vet and
+  # review; this rule, in this codebase, only fires on the accepted idiom.
+  - name: GoUnhandledErrorResult
+
+  # Style modernizers and micro-nits — advisory `note` severity, never a defect.
+  # Suggestions like "use any over interface{}", "for i := range n", the builtin
+  # min/max, &T{} over new(T), slices.Sort, strings.Builder. Nice in review,
+  # wrong as a merge gate: none changes behaviour, and several would churn files
+  # for zero correctness gain. A developer who wants them can enable them in the
+  # IDE; they should not fail CI.
+  - name: GoFixAny
+  - name: GoFixRangeInt
+  - name: GoFixMinMax
+  - name: GoFixNewExpr
+  - name: GoFixSlicesSort
+  - name: GoFixSlicesContains
+  - name: GoFixStringsBuilder
+  - name: GoFixStringsSeq
+  - name: GoCommentStart          # "comment should start with the name" nit
+  - name: GoPreferNilSlice
+  - name: GoRedundantConversion
+  - name: GoRedundantImportAlias  # e.g. storage "…/storage/v4" — a deliberate, readable alias
+  - name: DuplicatedCode          # flags the near-identical handler error-mapping boilerplate
+  - name: MarkdownIncorrectTableFormatting
+
+  # Everything under .code-review-graph/ is a GENERATED artifact — the
+  # code-review-graph tool's own HTML/JS/CSS graph visualisation. It is
+  # gitignored and not ours to lint; analysing it produced ~300 findings
+  # (JSUnresolvedReference, ES6ConvertVarToLetConst, CssUnusedSymbol) that say
+  # nothing about this service. Excluded by path across all inspections.
+  - name: All
+    paths:
+      - .code-review-graph
+
+linter: jetbrains/qodana-go:2026.2
