@@ -59,27 +59,31 @@ func scanProject(row interface{ Scan(...interface{}) error }) (model.Project, er
 func (r *projectRepository) ByCode(ctx context.Context, tx *gorm.DB, code string) (model.Project, error) {
 	row := r.db(ctx, tx).Raw(
 		`SELECT `+projectColumns+` FROM projects WHERE code = ?`, code).Row()
+
 	p, err := scanProject(row)
-	if isNoRows(err) {
-		return model.Project{}, ErrNotFound
+	switch {
+	case err == nil:
+		return p, nil
+	case isNoRows(err):
+		return model.Project{}, fmt.Errorf("project %q: %w", code, ErrNotFound)
+	default:
+		return model.Project{}, fmt.Errorf("read project %q: %w", code, err)
 	}
-	if err != nil {
-		return model.Project{}, fmt.Errorf("project by code: %w", err)
-	}
-	return p, nil
 }
 
 func (r *projectRepository) ByID(ctx context.Context, tx *gorm.DB, id int16) (model.Project, error) {
 	row := r.db(ctx, tx).Raw(
 		`SELECT `+projectColumns+` FROM projects WHERE id = ?`, id).Row()
+
 	p, err := scanProject(row)
-	if isNoRows(err) {
-		return model.Project{}, ErrNotFound
+	switch {
+	case err == nil:
+		return p, nil
+	case isNoRows(err):
+		return model.Project{}, fmt.Errorf("project %d: %w", id, ErrNotFound)
+	default:
+		return model.Project{}, fmt.Errorf("read project %d: %w", id, err)
 	}
-	if err != nil {
-		return model.Project{}, fmt.Errorf("project by id: %w", err)
-	}
-	return p, nil
 }
 
 func (r *projectRepository) List(ctx context.Context, tx *gorm.DB, includeArchived bool) ([]model.Project, error) {
@@ -119,14 +123,15 @@ func (r *projectRepository) Create(ctx context.Context, tx *gorm.DB, p model.Pro
 		p.Code, p.Name, status, p.LokaliseProjectID).Row()
 
 	created, err := scanProject(row)
-	if isNoRows(err) {
+	switch {
+	case err == nil:
+		return created, nil
+	case isNoRows(err):
 		// DO NOTHING returned no row: the code is taken.
-		return model.Project{}, ErrProjectCodeTaken
+		return model.Project{}, fmt.Errorf("create project %q: %w", p.Code, ErrProjectCodeTaken)
+	default:
+		return model.Project{}, fmt.Errorf("create project %q: %w", p.Code, err)
 	}
-	if err != nil {
-		return model.Project{}, fmt.Errorf("create project: %w", err)
-	}
-	return created, nil
 }
 
 func (r *projectRepository) Update(ctx context.Context, tx *gorm.DB, id int16, name, status, lokaliseProjectID string) (model.Project, error) {
@@ -139,11 +144,12 @@ func (r *projectRepository) Update(ctx context.Context, tx *gorm.DB, id int16, n
 		name, status, lokaliseProjectID, id).Row()
 
 	updated, err := scanProject(row)
-	if isNoRows(err) {
-		return model.Project{}, ErrNotFound
+	switch {
+	case err == nil:
+		return updated, nil
+	case isNoRows(err):
+		return model.Project{}, fmt.Errorf("project %d: %w", id, ErrNotFound)
+	default:
+		return model.Project{}, fmt.Errorf("update project %d: %w", id, err)
 	}
-	if err != nil {
-		return model.Project{}, fmt.Errorf("update project: %w", err)
-	}
-	return updated, nil
 }
