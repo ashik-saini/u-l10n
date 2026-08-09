@@ -1,55 +1,176 @@
 package integrationtests
 
 import (
+	"database/sql"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+// scopeIdentityScratchCounter gives each scratch database a unique name, so a
+// -count>1 or repeated local run never collides with a database a previous
+// run failed to clean up.
+var scopeIdentityScratchCounter int64
+
+// scopeIdentityScratchDB creates a throwaway database on the same server
+// testDB is connected to, returns a handle to it, and registers cleanup that
+// closes the handle and drops the database. It exists so
+// TestExistingOperatorsKeepTheirAccessOnYouTrip can observe V1.13's backfill
+// running against a `users` table seeded BEFORE the migration applies —
+// something the shared, already-migrated testDB cannot do, since TestMain
+// applies every migration once, up front, against an empty schema.
+func scopeIdentityScratchDB(t *testing.T) *sql.DB {
+	t.Helper()
+
+	u, err := url.Parse(testDSN)
+	require.NoError(t, err)
+	name := fmt.Sprintf("scope_identity_scratch_%d", atomic.AddInt64(&scopeIdentityScratchCounter, 1))
+
+	admin := *u
+	admin.Path = "/postgres"
+	adminDB, err := sql.Open("postgres", admin.String())
+	require.NoError(t, err)
+	defer adminDB.Close()
+
+	_, err = adminDB.Exec(`CREATE DATABASE ` + name)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		dropDB, dropErr := sql.Open("postgres", admin.String())
+		if dropErr != nil {
+			return
+		}
+		defer dropDB.Close()
+		// WITH (FORCE) disconnects any lingering session on the scratch
+		// database first; without it a connection this test forgot to close
+		// would make the DROP fail silently-if-ignored.
+		_, _ = dropDB.Exec(`DROP DATABASE IF EXISTS ` + name + ` WITH (FORCE)`)
+	})
+
+	scratch := *u
+	scratch.Path = "/" + name
+	db, err := sql.Open("postgres", scratch.String())
+	require.NoError(t, err)
+	require.NoError(t, db.Ping())
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// scopeIdentityApplyMigrationsExcept replays every .db/V*.sql file in version
+// order into db, skipping the named file. Used to bring a scratch database up
+// to "everything before V1.13", the state the real migration is meant to run
+// against.
+func scopeIdentityApplyMigrationsExcept(t *testing.T, db *sql.DB, exclude string) {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join("..", ".db", "V*.sql"))
+	require.NoError(t, err)
+	sort.Strings(paths)
+	require.NotEmpty(t, paths, "no migrations found in ../.db")
+
+	for _, path := range paths {
+		if filepath.Base(path) == exclude {
+			continue
+		}
+		stmt, err := os.ReadFile(path)
+		require.NoError(t, err)
+		_, err = db.Exec(string(stmt))
+		require.NoError(t, err, "applying %s", filepath.Base(path))
+	}
+}
+
+// scopeIdentityApplyMigrationFile reads and executes exactly one .db/V*.sql
+// file against db, returning whatever error Postgres gives back rather than
+// asserting — callers that need to prove a mutated migration fails want the
+// raw error, not a require.NoError that would abort the test before it can
+// inspect it.
+func scopeIdentityApplyMigrationFile(t *testing.T, db *sql.DB, name string) error {
+	t.Helper()
+	stmt, err := os.ReadFile(filepath.Join("..", ".db", name))
+	require.NoError(t, err)
+	_, err = db.Exec(string(stmt))
+	return err
+}
+
 // TestExistingOperatorsKeepTheirAccessOnYouTrip proves the V1.13 backfill
 // moved every role across rather than silently dropping people.
 //
-// The original form of this test compared count(users) to
-// count(user_project_roles WHERE project_id = 1) directly. That comparison is
-// unsound in this package: TestMain applies every migration ONCE, against an
-// empty `users` table, so V1.13's backfill INSERT ... SELECT ... FROM users
-// has nothing to select — the counts start at zero and zero. Any other test
-// in this package that later inserts a user without cleaning it up (e.g.
-// schema_test.go's TestEmailIsCaseInsensitive, which leaves
-// 'Ashik.Saini@you.co' behind) breaks the equality through no fault of the
-// migration: that user was never eligible for the one-time backfill, so it
-// legitimately has no grant. Confirmed empirically — the original assertion
-// passes when this file's tests are run alone and fails
-// (expected 1, actual 0) under the full suite.
+// This test used to compare count(users) to
+// count(user_project_roles WHERE project_id = 1) on the shared testDB
+// directly. Review caught two problems with that, both confirmed by hand:
 //
-// This version drives the backfill's actual SQL directly — the exact
-// statement V1.13 runs, re-executed against a user this test controls — which
-// proves the logic without depending on what state other files left behind.
+//  1. TestMain applies every migration ONCE, against an empty `users` table
+//     — no migration seeds a user — so V1.13's backfill INSERT selects zero
+//     rows in that run. The original assertion was 0 == 0: vacuously true,
+//     not a proof the backfill does anything.
+//  2. A later rewrite replaced the comparison with an INLINE COPY of the
+//     backfill statement, executed directly against a user the test itself
+//     inserted. That made the assertion non-vacuous but stopped it from
+//     testing the migration at all: deleting the backfill from V1.13
+//     entirely, retargeting it at the wrong project, or hardcoding a role
+//     would not change this test's result, because the test never reads
+//     what V1.13 did — only what its own duplicate SQL did.
+//
+// This version seeds `users` with varied roles in a throwaway database
+// BEFORE applying `.db/V1.13__scope_identity.sql` FROM DISK, then asserts on
+// what that real file produced. Deleting or breaking the backfill in the
+// actual migration file now changes this test's outcome — see the
+// mutation-check evidence in the task report.
 func TestExistingOperatorsKeepTheirAccessOnYouTrip(t *testing.T) {
-	email := "scope-backfill@you.co"
-	_, err := testDB.Exec(`INSERT INTO users (email, role) VALUES ($1, 'approver')`, email)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_, _ = testDB.Exec(`DELETE FROM users WHERE email = $1`, email)
-	})
+	scratch := scopeIdentityScratchDB(t)
+	scopeIdentityApplyMigrationsExcept(t, scratch, "V1.13__scope_identity.sql")
 
-	_, err = testDB.Exec(`
-		INSERT INTO user_project_roles (email, project_id, role, granted_by)
-		SELECT email, 1, role, 'migration:V1.13' FROM users
-		ON CONFLICT (email, project_id) DO NOTHING`)
-	require.NoError(t, err)
+	// Varied roles, including an admin (must become a platform admin) and a
+	// mixed-case CITEXT address (the backfill's SELECT must not silently
+	// drop or duplicate it under case folding).
+	seeded := []struct {
+		email             string
+		role              string
+		wantPlatformAdmin bool
+	}{
+		{"Backfill.Admin@you.co", "admin", true},
+		{"backfill.editor@you.co", "editor", false},
+		{"BACKFILL.VIEWER@you.co", "viewer", false},
+	}
+	for _, s := range seeded {
+		_, err := scratch.Exec(`INSERT INTO users (email, role) VALUES ($1, $2)`, s.email, s.role)
+		require.NoError(t, err)
+	}
 
-	var role string
-	err = testDB.QueryRow(
-		`SELECT role FROM user_project_roles WHERE email = $1 AND project_id = 1`, email).
-		Scan(&role)
-	require.NoError(t, err, "the backfill must grant every existing operator a YouTrip role")
-	assert.Equal(t, "approver", role, "the grant must carry the role the user already had")
+	require.NoError(t, scopeIdentityApplyMigrationFile(t, scratch, "V1.13__scope_identity.sql"))
+
+	for _, s := range seeded {
+		t.Run(s.email, func(t *testing.T) {
+			var role string
+			var platformAdmin bool
+			err := scratch.QueryRow(`
+				SELECT r.role, u.is_platform_admin
+				  FROM users u
+				  JOIN user_project_roles r ON r.email = u.email AND r.project_id = 1
+				 WHERE u.email = $1`, s.email).Scan(&role, &platformAdmin)
+			require.NoError(t, err, "the backfill must grant every seeded operator a YouTrip role")
+			assert.Equal(t, s.role, role, "the grant must carry the role the user already had")
+			assert.Equal(t, s.wantPlatformAdmin, platformAdmin,
+				"only an existing admin becomes a platform admin")
+		})
+	}
+
+	var users, grants int
+	require.NoError(t, scratch.QueryRow(`SELECT count(*) FROM users`).Scan(&users))
+	require.NoError(t, scratch.QueryRow(
+		`SELECT count(*) FROM user_project_roles WHERE project_id = 1`).Scan(&grants))
+	assert.Equal(t, users, grants,
+		"every seeded user must hold a YouTrip grant — this scratch database has no "+
+			"other test's leftovers to pollute the count, unlike the shared testDB")
 
 	var mismatched int
-	require.NoError(t, testDB.QueryRow(`
+	require.NoError(t, scratch.QueryRow(`
 		SELECT count(*) FROM users u
 		  JOIN user_project_roles r ON r.email = u.email AND r.project_id = 1
 		 WHERE r.role <> u.role`).Scan(&mismatched))
@@ -138,9 +259,13 @@ func TestHistoryCrossProjectPairingIsRefused(t *testing.T) {
 		_, cleanupErr := testDB.Exec(`DELETE FROM keys WHERE id = $1`, youtripKey)
 		require.NoError(t, cleanupErr)
 	})
-	enSG := localeID(t, "en-SG")
 
 	t.Run("translation_history: YouTrip key with another project's locale", func(t *testing.T) {
+		// project_id=1 matches youtripKey's project, so translation_history_key_fkey
+		// is satisfied; (project_id, locale_id) = (1, otherLocale) is not a row in
+		// locales, since otherLocale belongs to otherProject — only
+		// translation_history_locale_fkey can be the one refusing this row.
+		//
 		// All NOT NULL columns with no default supplied (key_id, locale_id,
 		// version, source, changed_by) so the row reaches the FK rather than
 		// being rejected at tuple formation for an unrelated reason.
@@ -151,9 +276,29 @@ func TestHistoryCrossProjectPairingIsRefused(t *testing.T) {
 	})
 
 	t.Run("translation_history: another project claiming a YouTrip key", func(t *testing.T) {
+		// (project_id, locale_id) = (otherProject, otherLocale) IS a real row in
+		// locales, so translation_history_locale_fkey is satisfied here.
+		// (project_id, key_id) = (otherProject, youtripKey) is not — youtripKey
+		// belongs to project 1 — so only translation_history_key_fkey can be the
+		// one refusing this row.
+		//
+		// Using localeID(t, "en-SG") here instead of otherLocale was the original,
+		// wrong form: that helper is unscoped (SELECT id FROM locales WHERE
+		// code = $1, no project filter), and by this point in the test there are
+		// TWO rows named 'en-SG' — YouTrip's own and the one this test just
+		// inserted for otherProject. Whichever one it happened to return, the row
+		// below would end up violating the locale_fkey as well as the key_fkey
+		// (either the locale itself belongs to project 1, contradicting
+		// project_id=otherProject, or — if it returned otherProject's own en-SG —
+		// only the key mismatch would fire, which by luck happened to still be a
+		// rejection). Dropping ONLY translation_history_key_fkey and leaving
+		// translation_history_locale_fkey in place therefore still passed this
+		// subtest, because the locale_fkey was quietly doing the rejecting
+		// instead. otherLocale removes the ambiguity: it is unconditionally a
+		// real row for otherProject, so this row can violate one and only one FK.
 		_, err := testDB.Exec(
 			`INSERT INTO translation_history (project_id, key_id, locale_id, version, source, changed_by)
-			 VALUES ($1, $2, $3, 1, 'ui', 'test@you.co')`, otherProject, youtripKey, enSG)
+			 VALUES ($1, $2, $3, 1, 'ui', 'test@you.co')`, otherProject, youtripKey, otherLocale)
 		requireRejected(t, err, "another project's translation_history row claiming a YouTrip key")
 	})
 
