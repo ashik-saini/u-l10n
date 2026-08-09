@@ -201,7 +201,7 @@ func scanBranch(row interface{ Scan(...interface{}) error }) (Branch, error) {
 	return b, err
 }
 
-// ErrBranchNameTaken is returned when Create hits branches_name_unique.
+// ErrBranchNameTaken is returned when Create hits branches_project_name_unique.
 //
 // An exported sentinel, following ErrTagNameTaken: the portal turns it into a
 // 409 with a body a human can act on, rather than a 500 carrying a driver
@@ -211,10 +211,17 @@ var ErrBranchNameTaken = errors.New("a branch with that name already exists")
 // createBranchSQL uses DO NOTHING so a taken name comes back as a missing row
 // rather than a driver error to pattern-match — the same move as createTagSQL,
 // and race-free in a way a pre-check is not.
+//
+// The conflict target is (project_id, name), following V1.11: project_id is
+// not yet in the column list — this repository does not pass a project scope
+// explicitly — but it is present with its DEFAULT 1, and the ON CONFLICT
+// target must name the constraint that actually exists or Postgres refuses
+// the statement outright, exactly the way upsertKeySQL and createTagSQL
+// already had to move to (project_id, name) in V1.10.
 const createBranchSQL = `
 INSERT INTO branches (name, description, created_by)
 VALUES ($1, $2, $3)
-ON CONFLICT (name) DO NOTHING
+ON CONFLICT (project_id, name) DO NOTHING
 RETURNING ` + branchColumns
 
 func (r *branchRepository) Create(ctx context.Context, tx *gorm.DB, name, description, createdBy string) (Branch, error) {
