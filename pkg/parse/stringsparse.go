@@ -2,7 +2,9 @@ package parse
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
+	"unicode/utf16"
 )
 
 // Strings parses an iOS Localizable.strings file.
@@ -148,14 +150,37 @@ func scanQuoted(s string, pos int) (value string, next int, err error) {
 			case '\\':
 				b.WriteByte('\\')
 			case 'U', 'u':
-				// \UXXXX — four hex digits, as emitted for control characters.
-				if pos+4 >= len(s) {
-					return "", 0, fmt.Errorf("truncated unicode escape")
+				// \UXXXX — EXACTLY four hex digits. Anything shorter, or with
+				// a non-hex byte, is not a unicode escape and is preserved
+				// verbatim like any other unrecognised escape. (The old
+				// Sscanf("%04x") accepted "12G4" as 0x12 and silently
+				// swallowed the "G4".)
+				r, ok := hex4(s, pos+1)
+				if !ok {
+					b.WriteByte('\\')
+					b.WriteByte(e)
+					break
 				}
-				var r rune
-				if _, err := fmt.Sscanf(s[pos+1:pos+5], "%04x", &r); err != nil {
-					return "", 0, fmt.Errorf("malformed unicode escape %q: %w",
-						s[pos-1:pos+5], err)
+				if utf16.IsSurrogate(r) {
+					// The corpus writes emoji as UTF-16 surrogate PAIRS —
+					// four chained \uXXXX escapes make up the MY flag. A
+					// surrogate half is not a valid rune, so WriteRune would
+					// emit U+FFFD and corrupt the copy.
+					if lo, ok := pairedLowSurrogate(s, pos+5, r); ok {
+						b.WriteRune(lo)
+						// Consume this escape's 4 hex digits plus the whole
+						// following \uXXXX (6 bytes); the shared pos++ below
+						// takes the final hex digit.
+						pos += 4 + 6
+						break
+					}
+					// Unpaired surrogate: preserve the escape text verbatim
+					// rather than emitting U+FFFD.
+					b.WriteByte('\\')
+					b.WriteByte(e)
+					b.WriteString(s[pos+1 : pos+5])
+					pos += 4
+					break
 				}
 				b.WriteRune(r)
 				pos += 4
@@ -173,4 +198,43 @@ func scanQuoted(s string, pos int) (value string, next int, err error) {
 		}
 	}
 	return "", 0, fmt.Errorf("unterminated string")
+}
+
+// hex4 decodes exactly four hex digit bytes at s[pos:pos+4]. It reports false
+// when fewer than four bytes remain or any of them is not a hex digit — the
+// caller then treats the whole thing as an unrecognised escape.
+func hex4(s string, pos int) (rune, bool) {
+	if pos+4 > len(s) {
+		return 0, false
+	}
+	for i := pos; i < pos+4; i++ {
+		c := s[i]
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F') {
+			return 0, false
+		}
+	}
+	v, err := strconv.ParseUint(s[pos:pos+4], 16, 32)
+	if err != nil {
+		return 0, false
+	}
+	return rune(v), true
+}
+
+// pairedLowSurrogate reads a \uXXXX escape starting at s[pos] and, when it
+// decodes to the LOW half completing the high surrogate hi, returns the
+// combined rune. Any other shape — no escape, malformed hex, not a low
+// surrogate — reports false and consumes nothing.
+func pairedLowSurrogate(s string, pos int, hi rune) (rune, bool) {
+	if pos+1 >= len(s) || s[pos] != '\\' || (s[pos+1] != 'u' && s[pos+1] != 'U') {
+		return 0, false
+	}
+	lo, ok := hex4(s, pos+2)
+	if !ok {
+		return 0, false
+	}
+	combined := utf16.DecodeRune(hi, lo)
+	if combined == 0xFFFD {
+		return 0, false // hi/lo is not a valid high/low pair
+	}
+	return combined, true
 }

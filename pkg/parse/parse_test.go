@@ -218,6 +218,170 @@ func TestStringsRejectsMalformedInput(t *testing.T) {
 	}
 }
 
+// TestStringsSurrogatePairEscapes covers the \uXXXX form the corpus actually
+// uses for emoji: UTF-16 surrogate PAIRS. Four committed files (Base.lproj,
+// en-MY.lproj, en-AU.lproj, ms.lproj) carry the MY flag emoji as the escape
+// text backslash-uD83C-uDDF2-uD83C-uDDFE. Decoding each half with WriteRune
+// yields U+FFFD runs — surrogate code points are not valid runes — which
+// silently corrupts the copy.
+func TestStringsSurrogatePairEscapes(t *testing.T) {
+	t.Run("corpus pair decodes to the emoji", func(t *testing.T) {
+		// The exact sequence committed in the corpus statements.
+		file, err := Strings([]byte(`"k" = "Refer your \uD83C\uDDF2\uD83C\uDDFE kakis to get";`))
+		require.NoError(t, err)
+
+		got, ok := file.Lookup("k")
+		require.True(t, ok)
+		assert.Equal(t, "Refer your \U0001F1F2\U0001F1FE kakis to get", got)
+		assert.NotContains(t, got, "�", "surrogate halves must never decode to U+FFFD")
+	})
+
+	t.Run("uppercase U pairs too", func(t *testing.T) {
+		file, err := Strings([]byte(`"k" = "\UD83C\UDDF2";`))
+		require.NoError(t, err)
+		got, _ := file.Lookup("k")
+		assert.Equal(t, "\U0001F1F2", got)
+	})
+
+	t.Run("unpaired high surrogate stays verbatim", func(t *testing.T) {
+		// An unpaired surrogate cannot be a rune. Per the file's
+		// unknown-escapes-verbatim doctrine it is preserved as text, never
+		// turned into U+FFFD.
+		file, err := Strings([]byte(`"k" = "a\uD83Cb";`))
+		require.NoError(t, err)
+		got, _ := file.Lookup("k")
+		assert.Equal(t, `a\uD83Cb`, got)
+		assert.NotContains(t, got, "�")
+	})
+
+	t.Run("high surrogate followed by a non-low escape stays verbatim", func(t *testing.T) {
+		file, err := Strings([]byte(`"k" = "\uD83CA";`))
+		require.NoError(t, err)
+		got, _ := file.Lookup("k")
+		assert.Equal(t, `\uD83C`+"A", got)
+	})
+
+	t.Run("lone low surrogate stays verbatim", func(t *testing.T) {
+		file, err := Strings([]byte(`"k" = "\uDDF2";`))
+		require.NoError(t, err)
+		got, _ := file.Lookup("k")
+		assert.Equal(t, `\uDDF2`, got)
+	})
+}
+
+// TestStringsUnicodeEscapeValidation pins the escape scanner to EXACTLY four
+// hex digits. The old fmt.Sscanf("%04x") accepted "\U12G4" by parsing 0x12 and
+// silently swallowing "G4", and accepted short input.
+func TestStringsUnicodeEscapeValidation(t *testing.T) {
+	t.Run("valid escape still decodes", func(t *testing.T) {
+		file, err := Strings([]byte(`"k" = "\U0041";`))
+		require.NoError(t, err)
+		got, _ := file.Lookup("k")
+		assert.Equal(t, "A", got)
+	})
+
+	t.Run("non-hex digit makes it an unrecognised escape", func(t *testing.T) {
+		file, err := Strings([]byte(`"k" = "\U12G4";`))
+		require.NoError(t, err)
+		got, _ := file.Lookup("k")
+		assert.Equal(t, `\U12G4`, got,
+			"must not parse 0x12 and swallow G4; the whole thing is verbatim text")
+	})
+
+	t.Run("short input makes it an unrecognised escape", func(t *testing.T) {
+		file, err := Strings([]byte(`"k" = "\U1";`))
+		require.NoError(t, err)
+		got, _ := file.Lookup("k")
+		assert.Equal(t, `\U1`, got)
+	})
+}
+
+// TestXMLNumericCharacterReferences covers &#dd; and &#xhh; forms, which the
+// doc comment always claimed and the code only honoured for &#39; and &#34;.
+func TestXMLNumericCharacterReferences(t *testing.T) {
+	file, err := XMLBytes([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+<resources>
+  <string name="dec">a&#8230;b</string>
+  <string name="hex">a&#x1F600;b</string>
+  <string name="apos_dec">Don&#39;t</string>
+  <string name="quot_dec">say &#34;hi&#34;</string>
+  <string name="amp_last">a&amp;#8230;b</string>
+  <string name="surrogate">a&#xD800;b</string>
+</resources>`))
+	require.NoError(t, err)
+
+	for _, tc := range []struct{ key, want string }{
+		{"dec", "a…b"},
+		{"hex", "a\U0001F600b"},
+		{"apos_dec", "Don't"},
+		{"quot_dec", `say "hi"`},
+		// &amp; resolves LAST, so &amp;#8230; is a literal "&#8230;" in the
+		// copy, not an ellipsis.
+		{"amp_last", "a&#8230;b"},
+		// Surrogate code points are not characters; leave the reference
+		// literal rather than emitting U+FFFD.
+		{"surrogate", "a&#xD800;b"},
+	} {
+		got, ok := file.Lookup(tc.key)
+		require.True(t, ok, tc.key)
+		assert.Equal(t, tc.want, got, tc.key)
+	}
+
+	// Structurally malformed or out-of-range references never reach this
+	// package's decoder: encoding/xml's tokeniser rejects them while scanning
+	// the document, which is a loud failure and therefore fine. Pinned here
+	// so a stdlib behaviour change would surface. (The checks in
+	// resolveNumericCharRefs still guard what the tokeniser lets through,
+	// e.g. the surrogate above.)
+	for name, ref := range map[string]string{
+		"too_big":      "&#1114112;",
+		"no_digits":    "&#;",
+		"unterminated": "&#8230",
+	} {
+		_, err := XMLBytes([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+<resources>
+  <string name="x">a` + ref + `b</string>
+</resources>`))
+		require.Error(t, err, name)
+	}
+}
+
+// TestJSONRejectsTrailingContent: {"a":"1"}{"b":"2"} used to parse as the
+// first object, silently dropping the second. Failing loudly beats that.
+func TestJSONRejectsTrailingContent(t *testing.T) {
+	_, err := JSONBytes([]byte(`{"a":"1"}{"b":"2"}`))
+	require.Error(t, err, "a second object after the close must not be silently ignored")
+
+	_, err = JSONBytes([]byte(`{"a":"1"} x`))
+	require.Error(t, err)
+
+	_, err = JSONBytes([]byte("{\"a\":\"1\"}\n\t "))
+	require.NoError(t, err, "trailing whitespace is fine")
+}
+
+// TestXMLRejectsPartialCDATA: the single-wrapper check used to be fooled by
+// values where CDATA markers appear beyond a full wrap, producing garbled
+// output ("a]]>b<![CDATA[c") or keeping "<![CDATA[" as literal copy.
+func TestXMLRejectsPartialCDATA(t *testing.T) {
+	t.Run("two CDATA sections", func(t *testing.T) {
+		_, err := XMLBytes([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+<resources>
+  <string name="a"><![CDATA[a]]>b<![CDATA[c]]></string>
+</resources>`))
+		require.Error(t, err, "multiple CDATA sections must fail loudly, not garble")
+		assert.Contains(t, err.Error(), `"a"`)
+	})
+
+	t.Run("CDATA after leading text", func(t *testing.T) {
+		_, err := XMLBytes([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+<resources>
+  <string name="b">text<![CDATA[a]]></string>
+</resources>`))
+		require.Error(t, err, "a CDATA section not spanning the whole value must fail loudly")
+		assert.Contains(t, err.Error(), `"b"`)
+	})
+}
+
 // TestUnescapeIsSinglePass guards the specific bug a chained-ReplaceAll
 // implementation would introduce: resolving backslash-backslash before
 // backslash-n turns a literal backslash-n into a real newline.

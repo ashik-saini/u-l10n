@@ -70,6 +70,16 @@ func JSON(r io.Reader) (*File, error) {
 		return nil, fmt.Errorf("expected object close, got %v", tok)
 	}
 
+	// The file must END at the closing brace. Without this check,
+	// {"a":"1"}{"b":"2"} parses as the first object and the second is
+	// silently dropped.
+	if tok, err = dec.Token(); err != io.EOF {
+		if err != nil {
+			return nil, fmt.Errorf("read past object close: %w", err)
+		}
+		return nil, fmt.Errorf("unexpected content after the closing brace: %v", tok)
+	}
+
 	return file, nil
 }
 

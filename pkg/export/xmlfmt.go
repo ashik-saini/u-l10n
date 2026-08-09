@@ -26,7 +26,11 @@ func XML(entries []Entry) []byte {
 
 	for _, e := range entries {
 		b.WriteString(`  <string name="`)
-		b.WriteString(e.Key)
+		// The key sits inside a double-quoted attribute, so '&', '"' and '<'
+		// must be entity-escaped or the document is not well-formed. (Corpus
+		// keys are all [A-Za-z0-9_], so this is a guard, not a behaviour
+		// change; CheckAndroidNames is the gate that keeps it that way.)
+		b.WriteString(escapeXMLAttr(e.Key))
 		b.WriteString(`">`)
 		if e.CDATA {
 			b.WriteString("<![CDATA[")
@@ -71,13 +75,35 @@ func writeAndroidValue(b *bytes.Buffer, s string) {
 // Order is critical and mirrors unescapeAndroid in pkg/parse: a literal
 // backslash must become a double backslash BEFORE apostrophes and newlines are
 // escaped, or the backslash introduced by those escapes would itself be
-// doubled on a later pass.
+// doubled on a later pass. The scan is single-pass with lookahead for the same
+// reason the parser's is.
+//
+// Two aapt behaviours shape the edges:
+//
+//   - \u followed by EXACTLY four hex digits is an escape aapt itself
+//     resolves. The parser's default branch keeps it verbatim in memory
+//     (eight corpus statements carry emoji this way), so it is copied through
+//     verbatim here; doubling the backslash would make aapt render the escape
+//     as literal text.
+//   - a string whose FIRST character is '@' or '?' is a resource reference to
+//     aapt, so that one position is escaped. This applies to CDATA values
+//     too: CDATA is XML-level quoting only, and aapt inspects the string
+//     value after the XML parse, where the wrapper is transparent. The parser
+//     unescapes \@ and \? in both paths, so both round-trip.
 func escapeAndroidBackslashes(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
+	if len(s) > 0 && (s[0] == '@' || s[0] == '?') {
+		b.WriteByte('\\')
+	}
 	for i := 0; i < len(s); i++ {
 		switch c := s[i]; c {
 		case '\\':
+			if i+5 < len(s) && s[i+1] == 'u' && isHex4(s[i+2:i+6]) {
+				b.WriteString(s[i : i+6])
+				i += 5
+				continue
+			}
 			b.WriteString(`\\`)
 		case '\'':
 			b.WriteString(`\'`)
@@ -94,6 +120,20 @@ func escapeAndroidBackslashes(s string) string {
 	return b.String()
 }
 
+// isHex4 reports whether s is exactly four hex digit bytes.
+func isHex4(s string) bool {
+	if len(s) != 4 {
+		return false
+	}
+	for i := 0; i < 4; i++ {
+		c := s[i]
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
 // escapeXMLEntities escapes the characters that would otherwise be markup.
 //
 // '&' is escaped FIRST — the mirror image of the parser resolving it last —
@@ -106,6 +146,20 @@ func escapeXMLEntities(s string) string {
 	s = strings.ReplaceAll(s, "&", "&amp;")
 	s = strings.ReplaceAll(s, "<", "&lt;")
 	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
+// escapeXMLAttr escapes a value for a double-quoted XML attribute.
+//
+// '&' is escaped FIRST for the same reason as in escapeXMLEntities: escaping
+// it after the others would double-escape the entities they introduce.
+func escapeXMLAttr(s string) string {
+	if !strings.ContainsAny(s, `&"<`) {
+		return s
+	}
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, `"`, "&quot;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
 	return s
 }
 
@@ -141,6 +195,12 @@ func CheckAndroidNames(keys []string) error {
 	byName := make(map[string]string, len(keys))
 	for _, key := range keys {
 		name := AndroidName(key)
+		// AndroidName strips leading digits, so an all-digit key produces the
+		// empty string — and XML() would emit name="", a file the parser
+		// itself refuses to read back. Refuse it here, at the gate.
+		if name == "" {
+			return fmt.Errorf("key %q produces an empty android name", key)
+		}
 		// A repeated canonical key is a DUPLICATE, not a collision — the
 		// committed corpus has 23 of them in en-SG alone. Only two DIFFERENT
 		// canonical keys mapping to one Android name can silently overwrite

@@ -221,7 +221,10 @@ func TestGateR2_SerializerIsIdempotent(t *testing.T) {
 	})
 
 	t.Run("xml", func(t *testing.T) {
-		for _, dir := range []string{"values", "values-en-rMY"} {
+		// values-th is included for its known bare-quote value
+		// (TopUpMaxInfoMsg), the one Android body that carries an unescaped
+		// '"' in the committed tree.
+		for _, dir := range []string{"values", "values-en-rMY", "values-th"} {
 			raw, err := os.ReadFile(filepath.Join(
 				root, "android", "app", "src", "main", "res", dir, "strings.xml"))
 			require.NoError(t, err)

@@ -3,6 +3,7 @@ package parse
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -44,13 +45,18 @@ func TestCorpusFlutterJSON(t *testing.T) {
 	// The empty count is per STATEMENT, so a duplicated empty key counts twice.
 	// entries > unique means the file contains duplicate keys; see
 	// TestCorpusDuplicateKeys.
+	// Re-measured 2026-08-09 (python json.load with object_pairs_hook, which
+	// keeps duplicate statements) after the u-mobile checkout moved to
+	// 0e2fe9190: only the six Flutter files changed; the Android and iOS
+	// counts below were unaffected, and the duplicate-key counts in
+	// TestCorpusDuplicateKeys still match.
 	want := map[string]struct{ entries, unique, empty int }{
-		"en-SG": {5977, 5954, 339},
-		"en-MY": {6490, 6488, 3670},
-		"en-AU": {6186, 6174, 3110},
-		"ms-MY": {6427, 6427, 3669},
-		"th-TH": {5415, 5415, 3858},
-		"en-TH": {5414, 5414, 3832},
+		"en-SG": {5940, 5917, 339},
+		"en-MY": {6456, 6454, 3649},
+		"en-AU": {6154, 6142, 3078},
+		"ms-MY": {6393, 6393, 3642},
+		"th-TH": {5383, 5383, 3826},
+		"en-TH": {5382, 5382, 3800},
 	}
 
 	for locale, w := range want {
@@ -218,6 +224,162 @@ func TestCorpusIOSStrings(t *testing.T) {
 			assert.Equal(t, w.unique, file.UniqueLen(), "distinct keys")
 		})
 	}
+}
+
+// TestCorpusIOSSurrogatePairEmoji is the live proof for the surrogate-pair
+// decoder: the committed corpus really does carry emoji as paired \uXXXX
+// escapes, and they must decode to the flag, never to U+FFFD runs.
+func TestCorpusIOSSurrogatePairEmoji(t *testing.T) {
+	root := uMobileRoot(t)
+
+	for rel, key := range map[string]string{
+		"Base.lproj/Localizable.strings":  "CrossMarketReferralCarouselBannerMsg",
+		"en-AU.lproj/Localizable.strings": "CrossMarketReferralCarouselBannerMsg",
+		"en-MY.lproj/Localizable.strings": "nudge_referralmy_desc",
+		"ms.lproj/Localizable.strings":    "nudge_referralmy_desc",
+	} {
+		t.Run(rel, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join(root, "ios", "Runner", rel))
+			require.NoError(t, err)
+
+			file, err := Strings(data)
+			require.NoError(t, err)
+
+			got, ok := file.Lookup(key)
+			require.True(t, ok, key)
+			assert.Contains(t, got, "\U0001F1F2\U0001F1FE",
+				"the escaped surrogate pairs must decode to the MY flag emoji")
+			assert.NotContains(t, got, string(rune(0xFFFD)),
+				"a surrogate half must never become U+FFFD")
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Raw-text tripwires.
+//
+// The parser makes silent assumptions about what the Android corpus can
+// contain — encoding/xml and the hand-rolled entity decoding would not fail
+// loudly if they were violated. These tests turn each assumption into a
+// verified, pinned fact about the committed files. When one fails after a
+// corpus re-pull, re-measure and update the pinned facts in the same commit
+// that explains why they moved.
+// ---------------------------------------------------------------------------
+
+// androidCorpusDirs lists the eight committed Android resource directories.
+var androidCorpusDirs = []string{
+	"values", "values-ab", "values-am", "values-au",
+	"values-en", "values-en-rMY", "values-ms", "values-th",
+}
+
+func readAndroidCorpus(t *testing.T, root string) map[string]string {
+	t.Helper()
+	files := make(map[string]string, len(androidCorpusDirs))
+	for _, dir := range androidCorpusDirs {
+		data, err := os.ReadFile(filepath.Join(
+			root, "android", "app", "src", "main", "res", dir, "strings.xml"))
+		require.NoError(t, err)
+		files[dir] = string(data)
+	}
+	return files
+}
+
+var corpusCDATASection = regexp.MustCompile(`(?s)<!\[CDATA\[.*?\]\]>`)
+
+// TestCorpusAndroidRawTripwires scans the raw file text — deliberately not the
+// parser's output, which cannot distinguish an escaped quote from a bare one
+// once unescaping has run.
+func TestCorpusAndroidRawTripwires(t *testing.T) {
+	root := uMobileRoot(t)
+	files := readAndroidCorpus(t, root)
+
+	t.Run("no escaped inline markup", func(t *testing.T) {
+		// &lt;b&gt; as TEXT would mean the copy carries markup one escaping
+		// layer deeper than the parser's carve-out for raw <b>/<u>. Zero
+		// occurrences today.
+		re := regexp.MustCompile(`&lt;/?[bu]&gt;`)
+		for dir, data := range files {
+			assert.Empty(t, re.FindAllString(data, -1), "%s", dir)
+		}
+	})
+
+	t.Run("non-b/u inline tags appear only inside CDATA", func(t *testing.T) {
+		// The plain-path exporter only carves out <b> and <u>; every other
+		// inline tag the corpus holds (<link>, <A>, <B>) lives inside CDATA,
+		// where no escaping applies. A non-b/u tag OUTSIDE CDATA would be
+		// re-escaped on export and change what the app renders.
+		tag := regexp.MustCompile(`</?[A-Za-z][^>]*>`)
+		stringOpen := regexp.MustCompile(`^<string name="[^"]*">$`)
+		allowed := map[string]bool{
+			"<resources>": true, "</resources>": true, "</string>": true,
+			"<b>": true, "</b>": true, "<u>": true, "</u>": true,
+		}
+		for dir, data := range files {
+			outside := corpusCDATASection.ReplaceAllString(data, "")
+			for _, m := range tag.FindAllString(outside, -1) {
+				if !allowed[m] && !stringOpen.MatchString(m) {
+					t.Errorf("%s: unexpected tag %q outside CDATA", dir, m)
+				}
+			}
+		}
+
+		// Pin the tags that DO exist, so this test is known to be looking at
+		// real data rather than vacuously passing.
+		inCDATA := map[string]int{}
+		for _, data := range files {
+			for _, section := range corpusCDATASection.FindAllString(data, -1) {
+				for _, m := range tag.FindAllString(section, -1) {
+					if !allowed[m] {
+						inCDATA[m]++
+					}
+				}
+			}
+		}
+		assert.Equal(t, map[string]int{
+			"<link>": 3, "</link>": 3, "<A>": 4, "<B>": 4,
+		}, inCDATA, "the non-b/u inline tags, all inside CDATA")
+	})
+
+	t.Run("bare quotes pinned to the one known instance", func(t *testing.T) {
+		// aapt gives an unescaped '"' quote-section semantics (whitespace
+		// inside is preserved, the quotes themselves vanish). The corpus has
+		// exactly ONE value relying on that — a DATA question deliberately
+		// not handled in code — so a second instance must trip this wire
+		// before it ships.
+		body := regexp.MustCompile(`(?s)<string name="([^"]+)">(.*?)</string>`)
+		type hit struct {
+			dir, key string
+			count    int
+		}
+		var hits []hit
+		for dir, data := range files {
+			for _, m := range body.FindAllStringSubmatch(data, -1) {
+				key, text := m[1], corpusCDATASection.ReplaceAllString(m[2], "")
+				var bare int
+				for i := 0; i < len(text); i++ {
+					if text[i] == '"' && (i == 0 || text[i-1] != '\\') {
+						bare++
+					}
+				}
+				if bare > 0 {
+					hits = append(hits, hit{dir, key, bare})
+				}
+			}
+		}
+		assert.Equal(t, []hit{{"values-th", "TopUpMaxInfoMsg", 2}}, hits,
+			"exactly one value in the whole Android corpus contains bare quotes")
+	})
+
+	t.Run("no numeric character references", func(t *testing.T) {
+		// The entity decoder resolves &#dd; and &#xhh; — but the committed
+		// corpus contains ZERO numeric references of any kind, not even the
+		// &#39;/&#34; forms the decoder originally special-cased. If one
+		// appears, decoding becomes load-bearing: re-verify it round-trips.
+		re := regexp.MustCompile(`&#[0-9]+;|&#[xX][0-9a-fA-F]+;`)
+		for dir, data := range files {
+			assert.Empty(t, re.FindAllString(data, -1), "%s", dir)
+		}
+	})
 }
 
 // TestCorpusIOSLineEndingsAreMixed records the state of the tree, because it

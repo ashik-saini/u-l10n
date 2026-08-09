@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 )
 
@@ -84,16 +85,31 @@ func decodeAndroidValue(inner string) (string, RenderHint, error) {
 			return "", "", fmt.Errorf("unterminated CDATA section")
 		}
 		raw := trimmed[len(cdataOpen) : len(trimmed)-len(cdataClose)]
+		// A prefix+suffix check alone is fooled by <![CDATA[a]]>b<![CDATA[c]]>,
+		// which would garble into "a]]>b<![CDATA[c". Only a SINGLE wrapper
+		// spanning the whole value is representable; refuse anything else.
+		if strings.Contains(raw, cdataOpen) || strings.Contains(raw, cdataClose) {
+			return "", "", fmt.Errorf("multiple CDATA sections in one value are not supported")
+		}
 		// CDATA content is literal by definition — no XML unescaping — but
 		// Android's own backslash escapes still apply.
 		return unescapeAndroid(raw), RenderHintCDATA, nil
 	}
 
+	// A CDATA section that does not span the whole value — text<![CDATA[a]]>
+	// — reaches here and would keep the markers as literal copy. Fail loudly
+	// instead.
+	if strings.Contains(inner, cdataOpen) || strings.Contains(inner, cdataClose) {
+		return "", "", fmt.Errorf("CDATA section does not span the whole value")
+	}
+
 	return unescapeAndroid(unescapeXMLEntities(inner)), RenderHintPlain, nil
 }
 
-// unescapeXMLEntities resolves the five predefined XML entities plus numeric
-// character references.
+// unescapeXMLEntities resolves the five predefined XML entities plus decimal
+// (&#39;) and hexadecimal (&#x1F600;) numeric character references. A
+// reference that is malformed, names a surrogate code point, or exceeds
+// U+10FFFF is not a character and is left literal.
 //
 // encoding/xml would do this for chardata, but InnerXML is deliberately raw so
 // that CDATA and inline markup survive; the cost is doing this by hand.
@@ -102,15 +118,71 @@ func unescapeXMLEntities(s string) string {
 		return s
 	}
 	// Order matters: &amp; must be resolved LAST, or "&amp;lt;" — a literal
-	// "&lt;" in the copy — would decode to "<" instead of "&lt;".
+	// "&lt;" in the copy — would decode to "<" instead of "&lt;". The same
+	// ordering keeps "&amp;#8230;" a literal "&#8230;" rather than an
+	// ellipsis, which is why the numeric pass runs before it.
 	s = strings.ReplaceAll(s, "&lt;", "<")
 	s = strings.ReplaceAll(s, "&gt;", ">")
 	s = strings.ReplaceAll(s, "&quot;", `"`)
 	s = strings.ReplaceAll(s, "&apos;", "'")
-	s = strings.ReplaceAll(s, "&#39;", "'")
-	s = strings.ReplaceAll(s, "&#34;", `"`)
+	s = resolveNumericCharRefs(s)
 	s = strings.ReplaceAll(s, "&amp;", "&")
 	return s
+}
+
+// resolveNumericCharRefs decodes &#dd; and &#xhh; references in a single
+// left-to-right pass. Anything that is not a well-formed reference to a real
+// character — missing ';', no digits, a surrogate code point, a value past
+// U+10FFFF — is copied through literally rather than half-decoded.
+func resolveNumericCharRefs(s string) string {
+	if !strings.Contains(s, "&#") {
+		return s
+	}
+
+	var b strings.Builder
+	b.Grow(len(s))
+
+	for i := 0; i < len(s); {
+		if s[i] != '&' || i+1 >= len(s) || s[i+1] != '#' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+
+		j := i + 2
+		base := 10
+		if j < len(s) && s[j] == 'x' {
+			base = 16
+			j++
+		}
+		start := j
+		for j < len(s) && isCharRefDigit(s[j], base) {
+			j++
+		}
+		if j == start || j >= len(s) || s[j] != ';' {
+			b.WriteByte(s[i]) // not a reference; the '&' is literal
+			i++
+			continue
+		}
+
+		v, err := strconv.ParseUint(s[start:j], base, 32)
+		if err != nil || v > 0x10FFFF || (0xD800 <= v && v <= 0xDFFF) {
+			b.WriteByte(s[i]) // not a character; leave the reference literal
+			i++
+			continue
+		}
+
+		b.WriteRune(rune(v))
+		i = j + 1
+	}
+	return b.String()
+}
+
+func isCharRefDigit(c byte, base int) bool {
+	if '0' <= c && c <= '9' {
+		return true
+	}
+	return base == 16 && ('a' <= c && c <= 'f' || 'A' <= c && c <= 'F')
 }
 
 // unescapeAndroid resolves Android's backslash escapes.
