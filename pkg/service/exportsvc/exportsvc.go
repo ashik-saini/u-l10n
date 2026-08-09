@@ -15,8 +15,6 @@ import (
 	"path"
 	"sort"
 
-	"github.com/jinzhu/gorm"
-
 	"github.com/yougroupteam/u-l10n/pkg/export"
 	"github.com/yougroupteam/u-l10n/pkg/model"
 	"github.com/yougroupteam/u-l10n/pkg/repository"
@@ -72,19 +70,15 @@ type Request struct {
 
 // Service builds export archives.
 type Service struct {
-	locales      repository.LocaleRepository
-	keys         repository.KeyRepository
-	translations repository.TranslationRepository
-	rows         repository.ExportRowReader
+	locales repository.LocaleRepository
+	rows    repository.ExportRowReader
 }
 
 func ProvideService(
 	locales repository.LocaleRepository,
-	keys repository.KeyRepository,
-	translations repository.TranslationRepository,
 	rows repository.ExportRowReader,
 ) *Service {
-	return &Service{locales: locales, keys: keys, translations: translations, rows: rows}
+	return &Service{locales: locales, rows: rows}
 }
 
 // Zip renders the requested format for every selected locale into a zip.
@@ -126,8 +120,11 @@ func (s *Service) Zip(ctx context.Context, req Request) ([]byte, error) {
 			for i, e := range entries {
 				names[i] = e.Key
 			}
+			// Wrapped in ErrBadRequest: a collision is the caller's data — two
+			// keys they own transforming to one resource name — and the handler
+			// classifies by sentinel, never by message text.
 			if err := export.CheckAndroidNames(names); err != nil {
-				return nil, fmt.Errorf("locale %s: %w", locale.Code, err)
+				return nil, fmt.Errorf("%w: locale %s: %v", ErrBadRequest, locale.Code, err)
 			}
 		}
 
@@ -217,12 +214,19 @@ func (s *Service) selectLocales(ctx context.Context, codes []string) ([]model.Lo
 
 	out := make([]model.Locale, 0, len(codes))
 	var unknown []string
+	// seen deduplicates repeated codes — ?locales=en_SG&locales=en_SG must not
+	// write two archive entries under one path, leaving unzip to pick a winner.
+	seen := make(map[string]bool, len(codes))
 	for _, code := range codes {
 		l, ok := byCode[code]
 		if !ok {
 			unknown = append(unknown, code)
 			continue
 		}
+		if seen[code] {
+			continue
+		}
+		seen[code] = true
 		out = append(out, l)
 	}
 	if len(unknown) > 0 {
@@ -239,5 +243,3 @@ func (s *Service) selectLocales(ctx context.Context, codes []string) ([]model.Lo
 // ErrBadRequest marks a caller error so the handler can map it to 400 rather
 // than 500.
 var ErrBadRequest = errors.New("bad request")
-
-var _ = gorm.DB{}

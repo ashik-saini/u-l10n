@@ -231,7 +231,7 @@ func TestTranslationConflictBodyCarriesBothValues(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPut, "/api/v1/keys/12/translations/en-SG", nil)
 
-	h.translationError(rec, r, "set translation", &keysvc.ConflictError{
+	h.translationError(rec, r, "set translation", true, &keysvc.ConflictError{
 		KeyID:           12,
 		Locale:          "en-SG",
 		Mine:            "my late edit",
@@ -270,7 +270,7 @@ func TestTranslationConflictDistinguishesDeletedFromBlanked(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPut, "/api/v1/keys/12/translations/en-SG", nil)
 
-	h.translationError(rec, r, "set translation", &keysvc.ConflictError{
+	h.translationError(rec, r, "set translation", true, &keysvc.ConflictError{
 		KeyID: 12, Locale: "en-SG", Mine: "mine", ExpectedVersion: 4,
 		Theirs: repository.Cell{Found: false},
 	})
@@ -416,4 +416,19 @@ func TestBrowseLimitIsCapped(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Greater(t, maxBrowseLimit, 6300, "the whole corpus must fit in one page")
+}
+
+// TestKeyHistoryLimitIsCapped: the history limit reaches the database verbatim,
+// so an unbounded one is a caller-chosen query cost. Same rule as the browser's
+// maxBrowseLimit — refuse rather than truncate.
+func TestKeyHistoryLimitIsCapped(t *testing.T) {
+	router := portalRouter(t, "v@you.co", repository.RoleViewer)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/keys/1/history?limit=2000000000", nil)
+	r.Header.Set("Authorization", "Bearer ya29.good")
+	router.ServeHTTP(rec, r)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "limit")
 }

@@ -1,6 +1,7 @@
 package route
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -134,6 +135,126 @@ func TestLimiterPrunesFullBuckets(t *testing.T) {
 	l.mu.Unlock()
 	assert.Less(t, size, 10,
 		"the sweep must drop refilled buckets; %d survivors means it is not bounding memory", size)
+}
+
+// TestClientIPDerivation pins how the limiter key is derived.
+//
+// The key must be something the client cannot choose. X-Forwarded-For is
+// walked right to left — the rightmost entries are the ones OUR proxies
+// appended, and Envoy appends without stripping what the client sent — so the
+// first public IP from the right is the client as the edge saw it, and
+// anything left of that is client-supplied fiction.
+func TestClientIPDerivation(t *testing.T) {
+	build := func(socketAddr, rewrittenRemoteAddr, xff, realIP string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/keys", nil)
+		r.RemoteAddr = rewrittenRemoteAddr
+		if socketAddr != "" {
+			r = r.WithContext(context.WithValue(r.Context(), ctxKeySocketAddr{}, socketAddr))
+		}
+		if xff != "" {
+			r.Header.Set("X-Forwarded-For", xff)
+		}
+		if realIP != "" {
+			r.Header.Set("X-Real-IP", realIP)
+		}
+		return r
+	}
+
+	t.Run("spoofed leftmost XFF entries share one bucket", func(t *testing.T) {
+		// Same real client (198.51.100.9, appended by the edge, then a private
+		// mesh hop), different spoofed prefixes — the key must not move.
+		a := clientIP(build("203.0.113.7:1000", "1.1.1.1:0", "1.1.1.1, 198.51.100.9, 10.1.2.3", ""))
+		b := clientIP(build("203.0.113.7:1000", "2.2.2.2:0", "2.2.2.2, 9.9.9.9, 198.51.100.9, 10.7.7.7", ""))
+		assert.Equal(t, "198.51.100.9", a)
+		assert.Equal(t, a, b, "a fresh spoofed prefix must not buy a fresh bucket")
+	})
+
+	t.Run("X-Real-IP never influences the key", func(t *testing.T) {
+		a := clientIP(build("203.0.113.7:1000", "6.6.6.6:0", "", "6.6.6.6"))
+		b := clientIP(build("203.0.113.7:1000", "7.7.7.7:0", "", "7.7.7.7"))
+		assert.Equal(t, "203.0.113.7", a,
+			"with no forwarded chain the socket address is the client")
+		assert.Equal(t, a, b)
+	})
+
+	t.Run("a private-only XFF falls back to the socket address", func(t *testing.T) {
+		got := clientIP(build("203.0.113.7:1000", "10.0.0.1:0", "10.0.0.1, 192.168.1.1", ""))
+		assert.Equal(t, "203.0.113.7", got)
+	})
+
+	t.Run("junk in the XFF falls back to the socket address", func(t *testing.T) {
+		got := clientIP(build("203.0.113.7:1000", "203.0.113.7:1000", "8.8.8.8, not-an-ip", ""))
+		assert.Equal(t, "203.0.113.7", got,
+			"an unparseable entry ends the walk; the spoofable remainder must not be consulted")
+	})
+
+	t.Run("the original socket address outranks the rewritten RemoteAddr", func(t *testing.T) {
+		// middleware.RealIP has already rewritten RemoteAddr by the time the
+		// limiter runs; the captured socket address is the one that counts.
+		got := clientIP(build("203.0.113.7:1000", "6.6.6.6:0", "", ""))
+		assert.Equal(t, "203.0.113.7", got)
+	})
+
+	t.Run("an unparseable key lands in the shared sentinel bucket", func(t *testing.T) {
+		a := clientIP(build("@", "@", "", ""))
+		b := clientIP(build("garbage", "garbage", "", ""))
+		assert.Equal(t, rateLimitUnknownClient, a)
+		assert.Equal(t, a, b, "garbage must not mint per-value buckets")
+	})
+
+	t.Run("no captured socket address falls back to RemoteAddr", func(t *testing.T) {
+		// The limiter exercised outside ProvideRoutes' chain — unit tests, or a
+		// future mounting mistake — must still key on something real.
+		got := clientIP(build("", "203.0.113.9:4444", "", ""))
+		assert.Equal(t, "203.0.113.9", got)
+	})
+}
+
+// TestLimiterKeyCannotBeSpoofedThroughTheRouter drives the real middleware
+// chain, because the bug this guards lived in the chain: middleware.RealIP
+// rewrites RemoteAddr from client-controlled headers BEFORE the limiter runs,
+// and a limiter keyed on that gets a fresh bucket per request — the limit
+// never fires and the bucket map grows without bound.
+func TestLimiterKeyCannotBeSpoofedThroughTheRouter(t *testing.T) {
+	newRouter := func() http.Handler {
+		handler := identityHandler(&stubVerifier{err: googleauth.ErrInvalidToken}, &stubUsers{})
+		handler.cnf = &config.Config{
+			RequestTimeout:     time.Minute,
+			RateLimitEnable:    true,
+			RateLimitPerMinute: 60,
+			RateLimitBurst:     2,
+		}
+		return ProvideRoutes(&apm.ApmConfig{}, handler.cnf, handler)
+	}
+
+	send := func(router http.Handler, xff, realIP string) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
+		req.RemoteAddr = "203.0.113.7:40000"
+		if xff != "" {
+			req.Header.Set("X-Forwarded-For", xff)
+		}
+		if realIP != "" {
+			req.Header.Set("X-Real-IP", realIP)
+		}
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	t.Run("rotating spoofed XFF prefixes still exhaust one bucket", func(t *testing.T) {
+		router := newRouter()
+		require.Equal(t, http.StatusUnauthorized, send(router, "1.1.1.1, 198.51.100.9, 10.1.2.3", ""))
+		require.Equal(t, http.StatusUnauthorized, send(router, "2.2.2.2, 198.51.100.9, 10.9.9.9", ""))
+		assert.Equal(t, http.StatusTooManyRequests, send(router, "3.3.3.3, 198.51.100.9, 10.4.4.4", ""),
+			"the third request from the same real client must be limited, whatever it claims")
+	})
+
+	t.Run("rotating X-Real-IP still exhausts one bucket", func(t *testing.T) {
+		router := newRouter()
+		require.Equal(t, http.StatusUnauthorized, send(router, "", "6.6.6.1"))
+		require.Equal(t, http.StatusUnauthorized, send(router, "", "6.6.6.2"))
+		assert.Equal(t, http.StatusTooManyRequests, send(router, "", "6.6.6.3"))
+	})
 }
 
 // TestRateLimitMountedBeforeAuth is the property that makes the limiter worth

@@ -1,6 +1,7 @@
 package route
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"net"
@@ -30,10 +31,16 @@ import (
 // gateway and CDN in front remain the first line; this is the line that exists
 // even when a caller reaches the service directly.
 //
-// The client key is the IP that middleware.RealIP resolved, which trusts
-// X-Forwarded-For. Behind Istio that header is set by the mesh; if this
-// service were ever exposed without a trusted proxy, RealIP — not this
-// limiter — is the thing that would need revisiting.
+// The client key is derived by clientIP, deliberately NOT from r.RemoteAddr:
+// by the time the limiter runs, middleware.RealIP has rewritten RemoteAddr
+// from X-Real-IP or the LEFTMOST X-Forwarded-For entry — both of which the
+// client chooses. Envoy and Istio APPEND the peer address to X-Forwarded-For;
+// they do not strip client-supplied leading entries, so a limiter keyed on
+// RealIP's answer hands every request a fresh bucket: the limit never fires
+// and the bucket map grows without bound. clientIP instead walks
+// X-Forwarded-For right to left past the mesh's own private hops, and falls
+// back to the socket address captured before RealIP ran. RealIP itself stays
+// mounted — its answer is fine for logs and traces, just not for a budget.
 type ipRateLimiter struct {
 	enabled   bool
 	perSecond float64
@@ -130,13 +137,73 @@ func (l *ipRateLimiter) prune(now time.Time) {
 	}
 }
 
-// clientIP returns the host part of RemoteAddr, which middleware.RealIP has
-// already resolved from the proxy headers. The port is stripped because it
-// changes per connection and would give every request its own bucket.
+// ctxKeySocketAddr carries the RemoteAddr of the underlying connection,
+// captured before middleware.RealIP rewrites it from client-chosen headers.
+type ctxKeySocketAddr struct{}
+
+// captureSocketAddr stores the socket's RemoteAddr in the request context.
+// It is mounted BEFORE middleware.RealIP in ProvideRoutes — after RealIP runs
+// the original address is gone, and it is the only per-request fact the
+// client cannot forge.
+func captureSocketAddr(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(
+			context.WithValue(r.Context(), ctxKeySocketAddr{}, r.RemoteAddr)))
+	})
+}
+
+// rateLimitUnknownClient is the bucket for every request whose client cannot
+// be derived at all. One shared key rather than one per garbage value, so
+// unparseable input cannot grow the map.
+const rateLimitUnknownClient = "unknown-client"
+
+// clientIP derives the limiter key. In order:
+//
+//  1. Walk X-Forwarded-For RIGHT to LEFT. The rightmost entries are the ones
+//     our own infrastructure appended — Envoy appends the peer address and
+//     never strips what the client sent — so loopback, private and link-local
+//     hops are skipped as trusted infra, and the first public IP is the
+//     client as the edge saw it. Everything left of that is client-supplied
+//     and is never consulted; an entry that does not parse ends the walk for
+//     the same reason.
+//  2. Otherwise, the host part of the ORIGINAL socket RemoteAddr, captured by
+//     captureSocketAddr before middleware.RealIP rewrote it.
+//  3. A key that still does not parse as an IP lands in the shared sentinel
+//     bucket, which bounds memory under garbage input.
+//
+// Assumption: every hop between the client and this service sits on private
+// address space. A trusted proxy with a public address would be taken for the
+// client and throttled on its aggregate traffic — a safe failure, unlike the
+// reverse, which was the bug: trusting a client-chosen entry means no limit
+// at all.
 func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		entries := splitAndTrim(xff, ',')
+		for i := len(entries) - 1; i >= 0; i-- {
+			ip := net.ParseIP(entries[i])
+			if ip == nil {
+				break
+			}
+			if ip.IsLoopback() || ip.IsPrivate() ||
+				ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+				continue
+			}
+			return ip.String()
+		}
 	}
-	return host
+
+	raw, _ := r.Context().Value(ctxKeySocketAddr{}).(string)
+	if raw == "" {
+		// Only reachable when the limiter runs outside ProvideRoutes' chain —
+		// unit tests — where RemoteAddr has not been rewritten.
+		raw = r.RemoteAddr
+	}
+	host, _, err := net.SplitHostPort(raw)
+	if err != nil {
+		host = raw
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String()
+	}
+	return rateLimitUnknownClient
 }

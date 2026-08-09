@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 
 	"github.com/go-chi/chi"
 	"github.com/go-chi/render"
@@ -19,6 +20,20 @@ import (
 // itself nearly free, so a short max-age costs little.
 const otaMaxAge = 300
 
+// otaNegativeMaxAge is the TTL on the 404 and 410 answers. Without an explicit
+// header the CDN's negative caching is whatever its defaults say —
+// nondeterministic across CDNs and config edits. One minute keeps a miss storm
+// off the origin while a fresh locale or release still appears quickly.
+const otaNegativeMaxAge = 60
+
+// otaAppVersionPattern is the same three-numeric-components rule
+// releasesvc.validateMinAppVersion enforces at publish time, applied to the
+// client's side of the comparison. servableBundleSQL casts the header to a
+// Postgres int[]; a value like "4.12.0-beta" or "4.12.0 (1234)" fails that
+// cast at READ time and would 500 the unauthenticated hot path for that
+// client once any release carries a floor.
+var otaAppVersionPattern = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
+
 // OTABundle serves the current string bundle for a locale.
 //
 //	GET /ota/v1/bundles/en-SG
@@ -30,11 +45,25 @@ const otaMaxAge = 300
 // for no security gain. The real controls are rate limiting, CDN caching, and
 // the by-construction rule that no PII may enter a bundle.
 func (h *Handler) OTABundle(w http.ResponseWriter, r *http.Request) {
+	if err := rejectUnknownParams(r); err != nil {
+		h.badRequest(w, r, err)
+		return
+	}
 	code := chi.URLParam(r, "locale")
+
+	// The header is client input on its way into an int[] cast. Anything that
+	// is not a strict N.N.N is treated as absent, which the repository reads as
+	// 0.0.0 — the conservative floor, so an odd client build string only ever
+	// costs that client the releases with a version floor, never a 500.
+	appVersion := r.Header.Get("X-App-Version")
+	if !otaAppVersionPattern.MatchString(appVersion) {
+		appVersion = ""
+	}
 
 	locale, err := h.locales.ByCode(r.Context(), nil, code)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
+			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", otaNegativeMaxAge))
 			render.Status(r, http.StatusNotFound)
 			render.JSON(w, r, errorResponse{Error: "unknown_locale"})
 			return
@@ -45,9 +74,13 @@ func (h *Handler) OTABundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	bundle, err := h.releases.ServableBundle(r.Context(), nil, locale.ID, r.Header.Get("X-App-Version"))
+	bundle, err := h.releases.ServableBundle(r.Context(), nil, locale.ID, appVersion)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
+			// Both negative answers carry a short explicit TTL so CDN negative
+			// caching is a decision rather than a default. Short, because a 404
+			// flips to a 200 on the very next publish.
+			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", otaNegativeMaxAge))
 			if bundle.KillSwitched {
 				// 410 Gone is the kill switch. It tells the client to DELETE
 				// its cache and fall back to the strings bundled in the binary

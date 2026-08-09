@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi"
@@ -57,6 +58,38 @@ func TestUserErrorDoesNotLeakInternalDetail(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 	assert.NotContains(t, w.Body.String(), "hunter2")
 	assert.NotContains(t, w.Body.String(), "db.internal")
+}
+
+// TestUserRoutesRejectUnknownQueryParameters: these routes take no query
+// parameters at all, and a stray one is a caller mistake to report, not
+// ignore. The user service is nil, so a request that got past the check would
+// panic rather than quietly pass.
+func TestUserRoutesRejectUnknownQueryParameters(t *testing.T) {
+	t.Run("GET /me", func(t *testing.T) {
+		router := portalRouter(t, "v@you.co", repository.RoleViewer)
+
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/me?verbose=1", nil)
+		r.Header.Set("Authorization", "Bearer ya29.good")
+		router.ServeHTTP(rec, r)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "unknown query parameter")
+	})
+
+	t.Run("PATCH /admin/users/{email}/role", func(t *testing.T) {
+		router := portalRouter(t, "a@you.co", repository.RoleAdmin)
+
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPatch,
+			"/api/v1/admin/users/x@you.co/role?force=1",
+			strings.NewReader(`{"role":"viewer"}`))
+		r.Header.Set("Authorization", "Bearer ya29.good")
+		router.ServeHTTP(rec, r)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "unknown query parameter")
+	})
 }
 
 func TestPathEmail(t *testing.T) {

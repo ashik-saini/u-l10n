@@ -63,10 +63,8 @@ func injectService(ctx context.Context) (*Service, error) {
 		return nil, err
 	}
 	localeRepository := repository.ProvideLocaleRepository(gormConnector)
-	keyRepository := repository.ProvideKeyRepository(gormConnector)
-	translationRepository := repository.ProvideTranslationRepository(gormConnector)
 	exportRowReader := repository.ProvideExportRowReader(gormConnector)
-	service := exportsvc.ProvideService(localeRepository, keyRepository, translationRepository, exportRowReader)
+	service := exportsvc.ProvideService(localeRepository, exportRowReader)
 	apiTokenRepository := repository.ProvideAPITokenRepository(gormConnector)
 	releaseRepository := repository.ProvideReleaseRepository(gormConnector)
 	transactional := database.ProvideTransactional(gormConnector)
@@ -90,6 +88,8 @@ func injectService(ctx context.Context) (*Service, error) {
 	verifier := googleauth.ProvideVerifier(configConfig)
 	userRepository := repository.ProvideUserRepository(gormConnector)
 	usersvcService := usersvc.ProvideService(transactional, userRepository, auditRepository)
+	keyRepository := repository.ProvideKeyRepository(gormConnector)
+	translationRepository := repository.ProvideTranslationRepository(gormConnector)
 	branchRepository := repository.ProvideBranchRepository(gormConnector)
 	tagRepository := repository.ProvideTagRepository(gormConnector)
 	mergeRequestRepository := repository.ProvideMergeRequestRepository(gormConnector)

@@ -79,6 +79,11 @@ type urlResponse struct {
 //	POST /api/v1/assets/presign
 //	{"filename":"cart.png","content_type":"image/png","bytes":81234,"sha256":"<hex>"}
 func (h *Handler) AssetPresign(w http.ResponseWriter, r *http.Request) {
+	if err := rejectUnknownParams(r); err != nil {
+		h.badRequest(w, r, err)
+		return
+	}
+
 	var body presignRequest
 	if err := decodeJSON(w, r, &body); err != nil {
 		h.badRequest(w, r, err)
@@ -121,6 +126,11 @@ func (h *Handler) AssetPresign(w http.ResponseWriter, r *http.Request) {
 // object's own metadata, which S3 enforced against the signed policy, so there
 // is no second client declaration that could disagree with the first.
 func (h *Handler) AssetConfirm(w http.ResponseWriter, r *http.Request) {
+	if err := rejectUnknownParams(r); err != nil {
+		h.badRequest(w, r, err)
+		return
+	}
+
 	var body confirmRequest
 	if err := decodeJSON(w, r, &body); err != nil {
 		h.badRequest(w, r, err)
@@ -142,6 +152,10 @@ func (h *Handler) AssetConfirm(w http.ResponseWriter, r *http.Request) {
 //
 //	GET /api/v1/assets/{id}/url
 func (h *Handler) AssetURL(w http.ResponseWriter, r *http.Request) {
+	if err := rejectUnknownParams(r); err != nil {
+		h.badRequest(w, r, err)
+		return
+	}
 	id, err := pathID(r, "id")
 	if err != nil {
 		h.badRequest(w, r, err)
@@ -169,6 +183,10 @@ func (h *Handler) AssetURL(w http.ResponseWriter, r *http.Request) {
 // PUT rather than POST because attaching is idempotent: repeating it with a
 // different note amends the note rather than creating a second link.
 func (h *Handler) AssetAttach(w http.ResponseWriter, r *http.Request) {
+	if err := rejectUnknownParams(r); err != nil {
+		h.badRequest(w, r, err)
+		return
+	}
 	keyID, err := pathID(r, "id")
 	if err != nil {
 		h.badRequest(w, r, err)
@@ -202,6 +220,10 @@ func (h *Handler) AssetAttach(w http.ResponseWriter, r *http.Request) {
 // The asset itself survives: the bytes are content-addressed and another key
 // may still reference them.
 func (h *Handler) AssetDetach(w http.ResponseWriter, r *http.Request) {
+	if err := rejectUnknownParams(r); err != nil {
+		h.badRequest(w, r, err)
+		return
+	}
 	keyID, err := pathID(r, "id")
 	if err != nil {
 		h.badRequest(w, r, err)

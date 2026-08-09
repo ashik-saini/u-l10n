@@ -209,6 +209,38 @@ func TestAssetRoutesRequireAToken(t *testing.T) {
 	assert.Equal(t, len(routes), tokens.called, "every route must reach the token check")
 }
 
+// TestAssetHandlersRejectUnknownQueryParameters.
+//
+// None of these routes takes a query parameter, so any at all is a caller
+// mistake to report. The Handler carries no services: the refusal must happen
+// before anything else, or the test panics rather than quietly passing.
+func TestAssetHandlersRejectUnknownQueryParameters(t *testing.T) {
+	h := &Handler{}
+
+	cases := []struct {
+		name   string
+		method string
+		target string
+		call   func(http.ResponseWriter, *http.Request)
+	}{
+		{"presign", http.MethodPost, "/api/v1/assets/presign?dedupe=1", h.AssetPresign},
+		{"confirm", http.MethodPost, "/api/v1/assets/confirm?wait=true", h.AssetConfirm},
+		{"url", http.MethodGet, "/api/v1/assets/5/url?ttl=60", h.AssetURL},
+		{"attach", http.MethodPut, "/api/v1/keys/1/assets?note=x", h.AssetAttach},
+		{"detach", http.MethodDelete, "/api/v1/keys/1/assets/5?force=1", h.AssetDetach},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			tc.call(rec, httptest.NewRequest(tc.method, tc.target, strings.NewReader("{}")))
+
+			assert.Equal(t, http.StatusBadRequest, rec.Code)
+			assert.Contains(t, rec.Body.String(), "unknown query parameter")
+		})
+	}
+}
+
 // TestActorFromContext: uploaded_by and audit_events.actor are NOT NULL, and
 // an audit trail whose actor is blank answers nothing.
 func TestActorFromContext(t *testing.T) {

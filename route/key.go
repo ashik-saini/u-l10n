@@ -21,6 +21,12 @@ import (
 // caller asking for a number so large the response cannot be assembled.
 const maxBrowseLimit = 20000
 
+// maxHistoryLimit caps one history page, for the same reason maxBrowseLimit
+// caps the browser: the limit reaches the database verbatim, and a caller
+// asking for two billion rows must be refused rather than obeyed. It sits
+// well above DefaultHistoryLimit so no legitimate portal fetch ever meets it.
+const maxHistoryLimit = 1000
+
 // --- response shapes --------------------------------------------------------
 
 // cellResponse is one (key, locale) value, and it is where the three-state rule
@@ -498,7 +504,7 @@ func (h *Handler) PutTranslation(w http.ResponseWriter, r *http.Request) {
 		BaseVersion: body.BaseVersion,
 	}, identityActor(r.Context()), middleware.GetReqID(r.Context()))
 	if err != nil {
-		h.translationError(w, r, "set translation", err)
+		h.translationError(w, r, "set translation", true, err)
 		return
 	}
 
@@ -540,7 +546,8 @@ func (h *Handler) DeleteTranslation(w http.ResponseWriter, r *http.Request) {
 		r.URL.Query().Get("branch"), baseVersion,
 		identityActor(r.Context()), middleware.GetReqID(r.Context()))
 	if err != nil {
-		h.translationError(w, r, "delete translation", err)
+		// includeMine=false: a delete carries no attempted value to echo back.
+		h.translationError(w, r, "delete translation", false, err)
 		return
 	}
 
@@ -566,6 +573,10 @@ func (h *Handler) KeyHistory(w http.ResponseWriter, r *http.Request) {
 	limit, err := queryInt(r, "limit", keysvc.DefaultHistoryLimit)
 	if err != nil {
 		h.badRequest(w, r, err)
+		return
+	}
+	if limit > maxHistoryLimit {
+		h.badRequest(w, r, errors.New("limit must be at most 1000"))
 		return
 	}
 
@@ -659,7 +670,14 @@ func newTranslationHistoryResponses(entries []repository.TranslationHistoryEntry
 // a message alone, so it gets a body carrying both values. Everything else
 // falls through to portalError, so the two paths cannot disagree about what a
 // 404 or a 400 looks like.
-func (h *Handler) translationError(w http.ResponseWriter, r *http.Request, op string, err error) {
+//
+// includeMine says whether the caller had a value to lose: a write carries the
+// text the caller tried to store, a delete has nothing to echo back. It is an
+// explicit parameter rather than an inference from the log-label string, which
+// existed to be read by humans, not compared by code.
+func (h *Handler) translationError(
+	w http.ResponseWriter, r *http.Request, op string, includeMine bool, err error,
+) {
 	var conflict *keysvc.ConflictError
 	if errors.As(err, &conflict) {
 		body := conflictResponse{
@@ -670,7 +688,7 @@ func (h *Handler) translationError(w http.ResponseWriter, r *http.Request, op st
 			BaseVersion: conflict.ExpectedVersion,
 			Theirs:      newCellResponse(conflict.Theirs),
 		}
-		if op != "delete translation" {
+		if includeMine {
 			mine := conflict.Mine
 			body.Mine = &mine
 		}

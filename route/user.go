@@ -34,6 +34,11 @@ type setRoleRequest struct {
 // database twice for the same answer on the busiest endpoint in the service
 // would be a self-inflicted cost.
 func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
+	if err := rejectUnknownParams(r); err != nil {
+		h.badRequest(w, r, err)
+		return
+	}
+
 	user, ok := IdentityFromContext(r.Context())
 	if !ok {
 		// Only reachable if this route is ever mounted outside RequireIdentity.
@@ -60,6 +65,10 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 // user is the `user grant` CLI command's job; see main.go for why that cannot
 // be an API call.
 func (h *Handler) SetUserRole(w http.ResponseWriter, r *http.Request) {
+	if err := rejectUnknownParams(r); err != nil {
+		h.badRequest(w, r, err)
+		return
+	}
 	email, err := pathEmail(r)
 	if err != nil {
 		h.badRequest(w, r, err)

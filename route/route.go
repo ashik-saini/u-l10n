@@ -124,6 +124,10 @@ func ProvideRoutes(apmConfig *apm.ApmConfig, cnf *config.Config, handler *Handle
 	if apmConfig.Enable {
 		r.Use(apmchi.Middleware())
 	}
+	// The socket address must be captured BEFORE RealIP overwrites RemoteAddr
+	// with client-chosen headers: the rate limiter keys on it (see clientIP),
+	// and after RealIP runs it is unrecoverable. RealIP stays for logging.
+	r.Use(captureSocketAddr)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.RequestID)
 	r.Use(render.SetContentType(render.ContentTypeJSON))

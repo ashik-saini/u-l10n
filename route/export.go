@@ -30,8 +30,9 @@ func (h *Handler) Export(w http.ResponseWriter, r *http.Request) {
 	archive, err := h.exports.Zip(r.Context(), req)
 	if err != nil {
 		// A collision or an unknown locale is the caller's problem; anything
-		// else is ours.
-		if errors.Is(err, exportsvc.ErrBadRequest) || strings.Contains(err.Error(), "collision") {
+		// else is ours. The service marks every caller mistake with the
+		// sentinel — classification is by errors.Is, never by message text.
+		if errors.Is(err, exportsvc.ErrBadRequest) {
 			h.badRequest(w, r, err)
 			return
 		}
