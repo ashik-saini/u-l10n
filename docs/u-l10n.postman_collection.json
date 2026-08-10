@@ -1,0 +1,1951 @@
+{
+  "info": {
+    "name": "u-l10n API",
+    "description": "HTTP API of **u-l10n**, the in-house localization service. Generated from the route\ntable in `route/route.go` and the handler code in `route/`; mirrors\n`docs/API.md`, with the handlers winning where they disagree.\n\nHTTP only, on `:8080`. Every response is JSON except the export zip and the OTA\n304. Timestamps always leave the service as UTC `YYYY-MM-DDTHH:MM:SSZ`.\n\n## Two auth schemes\n\n- **Humans** authenticate with the portal's Google access token:\n  `Authorization: Bearer {{googleToken}}`. Two facts are established in order —\n  Google answers WHO (failure is 401, re-authenticating might help), then this\n  service's own `users` table answers WHAT (failure is 403, re-authenticating\n  never helps). Roles are ordered `viewer < editor < approver < admin`, each\n  route states its minimum, and an unknown role satisfies nothing — it fails\n  closed. `is_platform_admin` is a separate flag, not a fifth role. The\n  `x-yp-role` header the portal also sends is ignored entirely; the portal must\n  gate its UI on `GET /api/v1/me`.\n- **Scripts and CI** authenticate with `X-Api-Token: {{apiToken}}`. Scopes are\n  ordered `read_export < read_write`. Export needs `read_export`; every asset\n  route needs `read_write`, including the presigned GET, because the screenshots\n  carry customer PII.\n\nAuth is set at the FOLDER level here and inherited: collection auth is `none`,\nthe Google folders carry bearer auth, Export and Assets carry the `X-Api-Token`\nheader, and Health and OTA send nothing.\n\nThere are no HTTP routes for managing API tokens or creating users — both are\nCLI commands (`token`, `user grant`), on purpose.\n\n## Strict inputs\n\n**Unknown query parameters are REJECTED with 400, not ignored** — a client that\nmisspells `untranslated_in` must be told, not handed an unfiltered page. Every\noptional parameter in this collection is therefore present but **disabled**, so\nit cannot fire by accident. Unknown JSON body fields are refused the same way\n(`DisallowUnknownFields`), the body must be exactly one JSON object, and it is\nsize-capped: 64 KiB on portal routes, 8 KiB on asset routes. Booleans accept\nexactly `true`/`false`; integers must be non-negative, and a present-but-\nunparseable value is a 400 rather than a silent default.\n\n## The three-state translation rule\n\nA `(key, locale)` pair has THREE states, not two, and they are different\neverywhere they appear — cells, history, branch diffs and merge conflicts:\n\n```json\n{\"translated\": false}                     // no row: UNTRANSLATED, omitted from exports under skip_empty\n{\"translated\": true,  \"value\": \"\"}        // a row holding \"\": DELIBERATELY BLANK, exported as \"\"\n{\"translated\": true,  \"value\": \"Top up\"}  // translated\n```\n\n`PUT .../translations/{locale}` with `\"\"` writes a deliberate blank; making a\npair untranslated is `DELETE`, never `null`. Collapsing the two states adds ~430\nspurious keys to en-SG or deletes 3,664 intentional blanks from ms-MY.\n\nTranslation and key writes take an optimistic-concurrency `base_version`, and a\nlost race answers 409 `version_conflict` whose body carries BOTH `mine` and\n`theirs` so the portal needs no second round trip.\n\n## Project scoping (route move is PLANNED, not done)\n\n`/projects` and `/projects/{project}/locales*` are project-addressed today.\n**Every other route in this collection is NOT project-prefixed yet** — keys,\nbranches, merge requests, releases, tags, export and OTA all resolve against\nproject id 1 (YouTrip), hardcoded and marked `TODO(plan-2)` in the handlers and\nservices. Moving them under an explicit project prefix is planned; treat the\n`{{project}}` variable as applying only to the Platform admin folder for now.\n\n## Rate limiting\n\nOne in-process token bucket per client IP, shared across `/api/v1` and `/ota/v1`,\nrunning BEFORE authentication because the expensive paths are pre-auth. Over\nbudget: 429 `rate_limited` with `Retry-After` in whole seconds. Defaults are 300\nrequests/minute sustained, burst 60. `/healthz` and `/readyz` are exempt by\nMOUNTING, not configuration — a kubelet that gets 429 from a liveness check\nrestarts a healthy pod.\n\n## Error envelope\n\n`{\"error\": \"<machine_code>\", \"details\": \"<human message>\"}`; `details` is omitted\nwhen empty, and a 500 body is always just `{\"error\":\"internal_error\"}` — the\nreason goes to the log, not the wire. 400 = the caller sent something wrong,\n404 = the thing addressed does not exist, 409 = the caller's view of the world is\nout of date (always an expected workflow outcome, never a fault), 500 = a\ngenuinely unrecognised failure.\n\n## Variables\n\nSet `baseUrl`, `googleToken` and `apiToken` first; the id-shaped variables\n(`keyId`, `mrId`, `tagId`, `assetId`, `releaseVersion`, `branchName`,\n`userEmail`) are placeholders to fill in as you go.\n",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "noauth"
+  },
+  "item": [
+    {
+      "name": "Health",
+      "description": "Probe endpoints. No auth and NOT rate-limited: the kubelet presents no credentials, and a probe that can fail for auth or budget reasons is a probe that reports the wrong thing.",
+      "auth": {
+        "type": "noauth"
+      },
+      "item": [
+        {
+          "name": "GET /healthz — liveness",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/healthz",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "healthz"
+              ]
+            },
+            "description": "**No auth. Not rate-limited** (a 429 on a liveness probe would restart a healthy pod).\n\nReports process liveness and deliberately touches no dependency — it answers \"is this process wedged?\" and nothing else.\n\n200 `{\"status\":\"ok\",\"service\":\"u-l10n\"}`. There is no error path: a database outage must NOT fail this probe."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /readyz — readiness",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/readyz",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "readyz"
+              ]
+            },
+            "description": "**No auth. Not rate-limited.**\n\nPings the database and reports whether this instance can serve traffic now. Kubernetes removes a failing pod from the Service endpoints but leaves it running — the correct response to an unreachable database.\n\n200 `{\"status\":\"ready\",\"checks\":{\"database\":\"ok\"}}`.\n503 `{\"status\":\"unavailable\",\"checks\":{\"database\":\"unreachable\"}}` when the ping fails."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Export",
+      "description": "`X-Api-Token`, minimum scope `read_export`. Auth is inherited from this folder.",
+      "auth": {
+        "type": "apikey",
+        "apikey": [
+          {
+            "key": "key",
+            "value": "X-Api-Token",
+            "type": "string"
+          },
+          {
+            "key": "value",
+            "value": "{{apiToken}}",
+            "type": "string"
+          },
+          {
+            "key": "in",
+            "value": "header",
+            "type": "string"
+          }
+        ]
+      },
+      "item": [
+        {
+          "name": "GET /api/v1/export — download the zip",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/export?format=json&locales=en-SG,ms-MY&empty_mode=include&line_ending=lf",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "export"
+              ],
+              "query": [
+                {
+                  "key": "format",
+                  "value": "json",
+                  "description": "REQUIRED. `json` (Flutter), `xml` (Android) or `strings` (iOS)."
+                },
+                {
+                  "key": "locales",
+                  "value": "en-SG,ms-MY",
+                  "description": "Comma-separated locale codes; absent = every active locale. Empty elements and a trailing comma are dropped, not errors.",
+                  "disabled": true
+                },
+                {
+                  "key": "empty_mode",
+                  "value": "include",
+                  "description": "`include` (default — emit the key with an empty value) or `skip_empty` (omit the key entirely). Anything else is 400.",
+                  "disabled": true
+                },
+                {
+                  "key": "line_ending",
+                  "value": "lf",
+                  "description": "`lf` (default) or `crlf`. Anything else is 400.",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "**`X-Api-Token`, minimum scope `read_export`** (`read_write` also satisfies it).\n\nRenders the requested format for the requested locales and returns the archive synchronously — the response body IS the zip, there is no job to poll.\n\n200 `Content-Type: application/zip`, `Content-Disposition: attachment; filename=\"u-l10n-<format>-<UTC timestamp>.zip\"`, `Cache-Control: no-store` (the archive reflects mutable state).\n\n**Parameters** — only `format`, `locales`, `empty_mode`, `line_ending` are accepted; anything else is 400 `bad_request` naming the parameter. `format` is REQUIRED.\n\n**`locales` is one comma-separated parameter, not a repeatable one.** The handler reads it with `Query().Get`, so a second `locales=` occurrence is silently ignored rather than merged — send `locales=en-SG,ms-MY`.\n\nErrors: 400 `bad_request` (missing/unknown `format`, unknown parameter, unknown locale, export-name collision, bad `empty_mode` or `line_ending`); 500 `export_failed` for anything else. Auth errors: 401 `missing_token` (with `WWW-Authenticate: X-Api-Token realm=\"u-l10n\"`), 401 `invalid_token` (wrong, revoked and expired are indistinguishable on purpose), 403 `insufficient_scope`, 429 `rate_limited`."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Assets",
+      "description": "`X-Api-Token`, scope `read_write` on every route — including the presigned GET, because these context screenshots carry customer PII and a token issued only to pull translations has no business reading them. Three-step flow: presign -> the browser POSTs the bytes straight to S3 -> confirm. The image bytes never pass through this service. Auth is inherited from this folder.",
+      "auth": {
+        "type": "apikey",
+        "apikey": [
+          {
+            "key": "key",
+            "value": "X-Api-Token",
+            "type": "string"
+          },
+          {
+            "key": "value",
+            "value": "{{apiToken}}",
+            "type": "string"
+          },
+          {
+            "key": "in",
+            "value": "header",
+            "type": "string"
+          }
+        ]
+      },
+      "item": [
+        {
+          "name": "POST /api/v1/assets/presign",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/assets/presign",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "assets",
+                "presign"
+              ]
+            },
+            "description": "**`X-Api-Token`, scope `read_write`** — every asset route needs `read_write`, including the presigned GET, because these screenshots carry customer PII.\n\nValidates a declaration and returns a signed multipart/form-data upload target, or the existing asset when these exact bytes are already stored.\n\n200 with either `{\"deduplicated\":true,\"asset\":{...}}` (skip the upload) or `{\"deduplicated\":false,\"upload\":{\"url\",\"fields\":{...},\"s3_key\"}}`. Every field must be POSTed to S3 verbatim — they are signed, and S3 rejects an altered or omitted one. The URL and fields are credentials and are never logged.\n\nBody rules: `content_type` must be `image/png` or `image/jpeg`; `bytes` must be 1..10485760 (10 MiB); `sha256` is the hex digest of the bytes; `filename` is cosmetic and truncated to 200 chars. Bodies on the asset routes are capped at 8 KiB.\n\nErrors: 400 `bad_request` (validation failure, unknown JSON field, oversized body). Auth errors: 401 `missing_token` (with `WWW-Authenticate: X-Api-Token realm=\"u-l10n\"`), 401 `invalid_token` (wrong, revoked and expired are indistinguishable on purpose), 403 `insufficient_scope`, 429 `rate_limited`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"filename\": \"cart_top_up.png\",\n  \"content_type\": \"image/png\",\n  \"bytes\": 81234,\n  \"sha256\": \"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/v1/assets/confirm",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/assets/confirm",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "assets",
+                "confirm"
+              ]
+            },
+            "description": "**`X-Api-Token`, scope `read_write`.**\n\nRecords the asset after verifying the object really landed in S3. The body is ONLY the hash on purpose: everything else is read back from the object's own metadata, which S3 enforced against the signed policy, so there is no second client declaration that could disagree with the first.\n\n201 `{\"id\",\"sha256\",\"filename\",\"content_type\",\"bytes\",\"uploaded_by\",\"created_at\"}`. `uploaded_by` is `token:<name>`.\n\nErrors: 409 `upload_not_found` — no uploaded object for that hash (409 and not 404: the endpoint is fine, the state the client believes in is not); 409 `upload_mismatch` — the object does not match, or does not carry, its declaration; 400 `bad_request`. Auth errors: 401 `missing_token` (with `WWW-Authenticate: X-Api-Token realm=\"u-l10n\"`), 401 `invalid_token` (wrong, revoked and expired are indistinguishable on purpose), 403 `insufficient_scope`, 429 `rate_limited`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sha256\": \"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/v1/assets/{id}/url",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/assets/{{assetId}}/url",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "assets",
+                "{{assetId}}",
+                "url"
+              ]
+            },
+            "description": "**`X-Api-Token`, scope `read_write`.**\n\nIssues a short-lived presigned GET for one asset.\n\n200 `{\"url\":\"<presigned GET>\"}` with `Cache-Control: no-store` — the URL is a bearer credential for customer PII and must not be cached anywhere.\n\nErrors: 400 `bad_request` when `{id}` is not a positive integer; 404 `not_found` for an unknown asset. Auth errors: 401 `missing_token` (with `WWW-Authenticate: X-Api-Token realm=\"u-l10n\"`), 401 `invalid_token` (wrong, revoked and expired are indistinguishable on purpose), 403 `insufficient_scope`, 429 `rate_limited`."
+          },
+          "response": []
+        },
+        {
+          "name": "PUT /api/v1/keys/{id}/assets — attach",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/keys/{{keyId}}/assets",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "keys",
+                "{{keyId}}",
+                "assets"
+              ]
+            },
+            "description": "**`X-Api-Token`, scope `read_write`.**\n\nLinks an existing asset to a key. PUT rather than POST because attaching is idempotent: repeating it with a different note amends the note rather than creating a second link.\n\n204 No Content on success.\n\nErrors: 400 `bad_request` when `{id}` is not a positive integer or `asset_id` is missing/non-positive; 404 `not_found` for an unknown key or asset. Auth errors: 401 `missing_token` (with `WWW-Authenticate: X-Api-Token realm=\"u-l10n\"`), 401 `invalid_token` (wrong, revoked and expired are indistinguishable on purpose), 403 `insufficient_scope`, 429 `rate_limited`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"asset_id\": 88,\n  \"note\": \"truncates past 18 characters on the top-up sheet\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "DELETE /api/v1/keys/{id}/assets/{assetId} — detach",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/keys/{{keyId}}/assets/{{assetId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "keys",
+                "{{keyId}}",
+                "assets",
+                "{{assetId}}"
+              ]
+            },
+            "description": "**`X-Api-Token`, scope `read_write`.**\n\nRemoves the link between a key and an asset. The asset itself survives — the bytes are content-addressed and another key may still reference them.\n\n204 No Content on success.\n\nErrors: 400 `bad_request` when either path id is not a positive integer; 404 `not_found`. Auth errors: 401 `missing_token` (with `WWW-Authenticate: X-Api-Token realm=\"u-l10n\"`), 401 `invalid_token` (wrong, revoked and expired are indistinguishable on purpose), 403 `insufficient_scope`, 429 `rate_limited`."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Identity",
+      "description": "Google access token, minimum role `viewer`. Auth is inherited from this folder.",
+      "auth": {
+        "type": "bearer",
+        "bearer": [
+          {
+            "key": "token",
+            "value": "{{googleToken}}",
+            "type": "string"
+          }
+        ]
+      },
+      "item": [
+        {
+          "name": "GET /api/v1/me",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/me",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "me"
+              ]
+            },
+            "description": "**Google token, minimum role `viewer`.**\n\nReturns the caller's identity and role — `{\"email\":\"a@you.co\",\"role\":\"editor\"}`. This is what the portal must gate its UI on; the `x-yp-role` header the portal also sends is ignored entirely (it describes YouPortal's group model and arrives from the client, which makes it a request, not a fact).\n\nNothing is queried — the middleware already read the row.\n\nNo query parameters: any parameter is 400 `bad_request`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Read",
+      "description": "Reading the corpus. Google access token, minimum role `viewer` — seeing the copy that ships in the app is the least a provisioned operator can do, and a translator who cannot read the existing strings cannot write consistent ones. Auth is inherited from this folder.",
+      "auth": {
+        "type": "bearer",
+        "bearer": [
+          {
+            "key": "token",
+            "value": "{{googleToken}}",
+            "type": "string"
+          }
+        ]
+      },
+      "item": [
+        {
+          "name": "GET /api/v1/keys — key browser",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/keys?branch={{branchName}}&locales={{locale}}&platform=flutter&tag=needs-review&search=top up&untranslated_in=th-TH&include_deleted=false&limit=200&offset=0",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "keys"
+              ],
+              "query": [
+                {
+                  "key": "branch",
+                  "value": "{{branchName}}",
+                  "description": "View the corpus as this branch sees it; absent = master.",
+                  "disabled": true
+                },
+                {
+                  "key": "locales",
+                  "value": "{{locale}}",
+                  "description": "Comma-separated locale codes to include; absent = every active locale. Unknown code is 400.",
+                  "disabled": true
+                },
+                {
+                  "key": "platform",
+                  "value": "flutter",
+                  "description": "`flutter`, `android` or `ios`. Anything else is 400.",
+                  "disabled": true
+                },
+                {
+                  "key": "tag",
+                  "value": "needs-review",
+                  "description": "Only keys carrying this tag name.",
+                  "disabled": true
+                },
+                {
+                  "key": "search",
+                  "value": "top up",
+                  "description": "Text search over key name/description/values.",
+                  "disabled": true
+                },
+                {
+                  "key": "untranslated_in",
+                  "value": "th-TH",
+                  "description": "Only keys with NO row for this locale (absent, not blank).",
+                  "disabled": true
+                },
+                {
+                  "key": "include_deleted",
+                  "value": "false",
+                  "description": "Strictly `true` or `false`; anything else is 400.",
+                  "disabled": true
+                },
+                {
+                  "key": "limit",
+                  "value": "200",
+                  "description": "Non-negative integer, capped at 20000 (400 above that). 0 or absent = no limit applied by the handler.",
+                  "disabled": true
+                },
+                {
+                  "key": "offset",
+                  "value": "0",
+                  "description": "Non-negative integer.",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "**Google token, minimum role `viewer`.**\n\nBulk fetch behind the key browser. Every parameter is optional, and unknown ones are refused with 400 rather than ignored — a portal that misspells `untranslated_in` must be told, not handed the unfiltered corpus.\n\n200 `{\"keys\":[...],\"total\":N,\"limit\":N,\"offset\":N,\"locales\":[...],\"branch\":null|\"name\"}`. `total` is the whole matching set, not the page; `branch` is null on master. Each key carries `id`, `name`, `description`, `platforms`, `android_name`/`ios_name` (null = derive from the key name), `status`, `version`, `sort_index`, `tags` (always an array), `values` keyed by locale code with an entry per requested locale, `branch_modified`, timestamps.\n\nEach cell obeys the three-state rule: `{\"translated\":false}` = untranslated, `{\"translated\":true,\"value\":\"\"}` = deliberately blank, otherwise translated. `version` is MASTER's version and is what you send back as `base_version`.\n\nErrors: 400 `bad_request` for an unknown parameter, `limit`/`offset` that is not a non-negative integer, `limit` above **20000**, `include_deleted` that is not exactly `true`/`false`, an unknown `platform`, or an unknown locale code in `locales`/`untranslated_in`; 404 `not_found` for an unknown `branch`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/v1/keys/{id}",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/keys/{{keyId}}?branch={{branchName}}&locales={{locale}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "keys",
+                "{{keyId}}"
+              ],
+              "query": [
+                {
+                  "key": "branch",
+                  "value": "{{branchName}}",
+                  "description": "Resolve the key as this branch sees it; absent = master.",
+                  "disabled": true
+                },
+                {
+                  "key": "locales",
+                  "value": "{{locale}}",
+                  "description": "Comma-separated locale codes; absent = every active locale.",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "**Google token, minimum role `viewer`.**\n\nReturns one key with its values, in the same shape as a row of the browser list.\n\n200 the key object.\n\nErrors: 400 `bad_request` when `{id}` is not a positive integer, or for an unknown query parameter (only `branch` and `locales` are accepted); 404 `not_found` for an unknown key or branch. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/v1/keys/{id}/history",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/keys/{{keyId}}/history?locale={{locale}}&limit=200",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "keys",
+                "{{keyId}}",
+                "history"
+              ],
+              "query": [
+                {
+                  "key": "locale",
+                  "value": "{{locale}}",
+                  "description": "Restrict the value timeline to one locale.",
+                  "disabled": true
+                },
+                {
+                  "key": "limit",
+                  "value": "200",
+                  "description": "Default 200, capped at 1000 (400 above that).",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "**Google token, minimum role `viewer`.**\n\nReturns the key's metadata and value timelines. Both tables are insert-only: a rollback appears as a new forward entry, never as a deletion.\n\n200 `{\"key\":[...],\"translations\":[...]}`. Translation entries carry the same three-state `translated`/`value` pair — a null value in history means the pair BECAME untranslated, which is a different event from becoming blank. `branch_id` is null for a change made on master.\n\nErrors: 400 `bad_request` for an unknown parameter (only `locale` and `limit`), a non-integer/negative `limit`, `limit` above **1000**, or a non-positive `{id}`; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/v1/branches",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/branches?status=open",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "branches"
+              ],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "open",
+                  "description": "`open`, `merged` or `closed`; absent = all. Anything else is 400.",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "**Google token, minimum role `viewer`** — seeing what work is in flight is reading, not writing.\n\nReturns every branch with its delta counts.\n\n200 `{\"branches\":[...]}`. Each branch carries `id`, `name`, `description`, `status`, `created_by`, `created_at`, `last_edited_at` (null until the first write — this is what invalidates an approval), `merged_at`, `value_changes` / `meta_changes`, `merge_request_id` (null when there is no LIVE request) and `merge_request_status`.\n\nErrors: 400 `bad_request` for an unknown parameter or a `status` outside `open`/`merged`/`closed`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/v1/branches/{name}",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/branches/{{branchName}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "branches",
+                "{{branchName}}"
+              ]
+            },
+            "description": "**Google token, minimum role `viewer`.**\n\nReturns one branch with its delta counts.\n\n200 the branch object.\n\nErrors: 400 `bad_request` for an empty name or ANY query parameter (this route accepts none); 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/v1/branches/{name}/changes — diff vs master",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/branches/{{branchName}}/changes",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "branches",
+                "{{branchName}}",
+                "changes"
+              ]
+            },
+            "description": "**Google token, minimum role `viewer`.**\n\nReturns the branch's diff against master. Every row carries a `conflict` flag computed with the merge's OWN version comparison — a diff that disagreed with the merge would have a reviewer approve a clean-looking change and watch the merge refuse it.\n\n200 `{\"branch\",\"status\",\"values\":[...],\"meta\":[...],\"conflicts\":N}`. Value rows carry both sides in three-state form: `removed` = the branch tombstones the pair (the merge DELETEs master's row rather than blanking it), `master_translated:false` = master has no row at all. `conflicts` counts the flagged rows across both lists.\n\nErrors: 400 `bad_request` for any query parameter or an empty name; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/v1/merge-requests",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/merge-requests?status=open",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "merge-requests"
+              ],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "open",
+                  "description": "One of `open`, `approved`, `changes_requested`, `rejected`, `merged`, `closed`; absent = all.",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "**Google token, minimum role `viewer`.**\n\nLists merge requests, newest first.\n\n200 `{\"merge_requests\":[...]}`. Each carries `id`, `title`, `status`, `branch_id`, `branch`, `created_by`, `created_at`, `approved_by`/`approved_at` (null until approved, and RESET to null when a later branch edit invalidates the approval) and `merged_at`.\n\nErrors: 400 `bad_request` for an unknown parameter or a `status` outside the six known values. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/v1/merge-requests/{id}",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/merge-requests/{{mrId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "merge-requests",
+                "{{mrId}}"
+              ]
+            },
+            "description": "**Google token, minimum role `viewer`.**\n\nReturns one request with its branch, timeline and conflicts. The conflicts travel with it deliberately: a review screen that fetched them separately would render \"ready to merge\" for the moment before the second request answered, and that moment is when somebody clicks.\n\n200 `{\"merge_request\":{...},\"branch\":{...},\"events\":[...],\"conflicts\":{...}}`. Event `actor` is `\"system\"` for automatic transitions, such as an approval invalidated by a later branch edit.\n\nErrors: 400 `bad_request` for any query parameter or a non-positive `{id}`; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/v1/merge-requests/{id}/conflicts",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/merge-requests/{{mrId}}/conflicts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "merge-requests",
+                "{{mrId}}",
+                "conflicts"
+              ]
+            },
+            "description": "**Google token, minimum role `viewer`.**\n\nReturns everything blocking the merge, in all three kinds.\n\n200 `{\"values\":[...],\"metadata\":[...],\"name_collisions\":[...],\"unresolved\":N,\"mergeable\":bool}`. Value and metadata conflicts are resolved by choosing a side (`resolution` is `mine`, `master`, or empty while undecided). **Name collisions carry no resolution field** — both sides independently claimed a name and one key has to be renamed; choosing a side cannot fix it, so they are excluded from `unresolved`.\n\n`mergeable` is **ADVISORY**: the merge recomputes all of this inside its own transaction under an advisory lock, and that answer is the one that counts.\n\nErrors: 400 `bad_request` for any query parameter or a non-positive `{id}`; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/v1/tags",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/tags",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "tags"
+              ]
+            },
+            "description": "**Google token, minimum role `viewer`.**\n\nReturns every tag with its usage count, in one query — the tag manager renders the whole list, and a count per row would be one round trip per row.\n\n200 `{\"tags\":[{\"id\",\"name\",\"colour\",\"key_count\",\"created_at\"}]}`.\n\nErrors: 400 `bad_request` for ANY query parameter (this route accepts none). Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/v1/releases",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/releases?limit=50&offset=0",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "releases"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "50",
+                  "description": "Default 50 when absent or 0. Maximum 500 — above that is 400 `bad_request`.",
+                  "disabled": true
+                },
+                {
+                  "key": "offset",
+                  "value": "0",
+                  "description": "Non-negative integer.",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "**Google token, minimum role `viewer`** — knowing what shipped is reading; changing what ships is not.\n\nReturns release history, newest first.\n\n200 `{\"releases\":[...],\"limit\",\"offset\"}`. Each release carries `id`, `version`, `source`, `notes`, `merge_request_id` (null for a manual publish or an import — the difference between \"somebody approved this\" and \"somebody pushed it\"), `min_app_version` (null = every client eligible), `created_by`, `created_at`, `rolled_back`/`rolled_back_at`/`rolled_back_by`, `locale_count`, `key_count`.\n\nErrors: 400 `bad_request` for an unknown parameter, a non-integer or negative `limit`/`offset`, or **`limit` above 500** (`releasesvc.maxListLimit`; note docs/API.md documents the default but not this cap). Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/v1/releases/{version}",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/releases/{{releaseVersion}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "releases",
+                "{{releaseVersion}}"
+              ]
+            },
+            "description": "**Google token, minimum role `viewer`.**\n\nReturns one release. Releases are addressed by their human-facing VERSION rather than their row id — that is the number in the incident channel when somebody says \"roll back 41\".\n\n200 the release object.\n\nErrors: 400 `bad_request` when `{version}` is not a positive integer, or for any query parameter; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/v1/releases/{version}/bundles/{locale}",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/releases/{{releaseVersion}}/bundles/{{locale}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "releases",
+                "{{releaseVersion}}",
+                "bundles",
+                "{{locale}}"
+              ]
+            },
+            "description": "**Google token, minimum role `viewer`.**\n\nReturns exactly what a release shipped for one locale, read from the MATERIALISED bundle rather than re-derived from master — the whole point of materialising at merge time is that the answer cannot drift afterwards.\n\n200 `{\"version\",\"locale\",\"sha256\",\"key_count\",\"byte_size\",\"strings\":{...}}` with `Cache-Control: private, max-age=300` — private because it sits behind an identity, and caching it in a shared proxy would serve one operator's authenticated response to another. `sha256` is the same fingerprint that doubles as the OTA ETag.\n\nErrors: 400 `bad_request` for a non-positive `{version}`, an empty or unknown `{locale}`, or any query parameter; 404 `not_found` when the release has no bundle for that locale. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "GET /api/v1/projects",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/projects",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "projects"
+              ]
+            },
+            "description": "**Google token, minimum role `viewer`** — knowing which projects exist is reading, not administering one. Creating or reconfiguring a project needs `is_platform_admin` (see the Platform admin folder).\n\nReturns every live project; archived projects are excluded.\n\n200 `{\"projects\":[{\"id\",\"code\",\"name\",\"status\",\"lokalise_project_id\",\"created_at\",\"updated_at\"}]}`. `lokalise_project_id` is OMITTED, not sent as `\"\"`, when the project has no Lokalise source at all.\n\nErrors: 400 `bad_request` for ANY query parameter (this route accepts none). Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Write",
+      "description": "Writing the corpus. Google access token, minimum role `editor`, and no higher: writing to a BRANCH is the safe act by construction — nothing reaches an app until a merge, and a merge needs an approver. Auth is inherited from this folder.",
+      "auth": {
+        "type": "bearer",
+        "bearer": [
+          {
+            "key": "token",
+            "value": "{{googleToken}}",
+            "type": "string"
+          }
+        ]
+      },
+      "item": [
+        {
+          "name": "POST /api/v1/keys — create key",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/keys?branch={{branchName}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "keys"
+              ],
+              "query": [
+                {
+                  "key": "branch",
+                  "value": "{{branchName}}",
+                  "description": "Write to this branch as a copy-on-write delta; absent = write master directly. The branch must be open (409 `branch_not_open` otherwise).",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "**Google token, minimum role `editor`.**\n\nAdds a key. With `?branch=` it is created as a draft on master plus a branch delta the merge promotes — until then it is invisible to every export and every OTA bundle.\n\n201 the created key.\n\nBody rules: `name` required, <= 255 chars, no leading/trailing whitespace, no control characters; `description` <= 2000 chars; `platforms` required and non-empty, each of `flutter`/`android`/`ios`; `android_name`/`ios_name` are optional export-name overrides (null = derive from the key name).\n\nErrors: 400 `bad_request` (validation, unknown JSON field, unknown query parameter — only `branch` is accepted); 409 `name_taken` when an active key already claims the name; 409 `branch_not_open`; 404 `not_found` for an unknown branch. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"wallet_top_up_cta\",\n  \"description\": \"Primary button on the top-up sheet\",\n  \"platforms\": [\n    \"flutter\",\n    \"android\",\n    \"ios\"\n  ],\n  \"android_name\": null,\n  \"ios_name\": null\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "PATCH /api/v1/keys/{id} — update metadata",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/keys/{{keyId}}?branch={{branchName}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "keys",
+                "{{keyId}}"
+              ],
+              "query": [
+                {
+                  "key": "branch",
+                  "value": "{{branchName}}",
+                  "description": "Write to this branch as a copy-on-write delta; absent = write master directly. The branch must be open (409 `branch_not_open` otherwise).",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "**Google token, minimum role `editor`.**\n\nPARTIAL update of a key's metadata: an absent field is left alone. With `?branch=` the change is written as a copy-on-write delta and master is untouched.\n\n200 the updated key.\n\n`android_name` and `ios_name` are THREE-STATE: absent = leave alone, `null` = clear the override so the export name is derived from the key name again, a string = use it. `base_version` is the optimistic-lock precondition (send the `version` you were shown).\n\nErrors: 400 `bad_request` (validation, unknown JSON field, non-positive `{id}`); 409 `version_conflict` on a stale `base_version`; 409 `name_taken`; 409 `branch_not_open`; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"description\": \"Shown on the top-up sheet, above the amount field\",\n  \"platforms\": [\n    \"flutter\",\n    \"android\",\n    \"ios\"\n  ],\n  \"base_version\": 3\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "DELETE /api/v1/keys/{id} — soft delete",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/keys/{{keyId}}?branch={{branchName}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "keys",
+                "{{keyId}}"
+              ],
+              "query": [
+                {
+                  "key": "branch",
+                  "value": "{{branchName}}",
+                  "description": "Write to this branch as a copy-on-write delta; absent = write master directly. The branch must be open (409 `branch_not_open` otherwise).",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "**Google token, minimum role `editor`.**\n\nSoft-deletes a key. The row survives with status `deleted` — history references it — and because `idx_keys_name_active` is partial, the NAME becomes reusable rather than reserved forever.\n\n204 No Content on success.\n\nThe optional `base_version` travels in a BODY rather than a query parameter because it is a precondition on the entity, not a selector. An EMPTY body is the common case and is accepted; a malformed body is a 400 and is never silently dropped, because that would turn a guarded delete into an unguarded one. `base_version` is enforced only when positive.\n\nErrors: 400 `bad_request` (malformed body, unknown JSON field, non-positive `{id}`); 409 `version_conflict`; 409 `branch_not_open`; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"base_version\": 3\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "PUT /api/v1/keys/{id}/translations/{locale} — set a cell",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/keys/{{keyId}}/translations/{{locale}}?branch={{branchName}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "keys",
+                "{{keyId}}",
+                "translations",
+                "{{locale}}"
+              ],
+              "query": [
+                {
+                  "key": "branch",
+                  "value": "{{branchName}}",
+                  "description": "Write to this branch as a copy-on-write delta; absent = write master directly. The branch must be open (409 `branch_not_open` otherwise).",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "**Google token, minimum role `editor`.**\n\nThe inline cell edit.\n\n200 the new cell.\n\n**Three-state discipline.** `value` is REQUIRED (a pointer in the decode struct, so an omitted field is a 400 rather than a silent `\"\"`). `\"\"` means \"deliberately blank\" and exports as `\"\"`; to make the pair UNTRANSLATED use DELETE, not null. `render_hint` is `plain` or `cdata` (empty defaults to `plain`). `value` <= 20000 chars.\n\n**Optimistic concurrency.** `base_version` is REQUIRED on master — send the `version` you were shown, or `0` if the value was untranslated — and MUST BE ABSENT on a branch (400 otherwise): branch edits are reconciled against master once, at merge, so accepting the field there and ignoring it would sell the portal concurrency control that does not exist.\n\nLosing the race answers **409 `version_conflict` carrying BOTH sides**, so the portal needs no second round trip:\n```json\n{\"error\":\"version_conflict\",\"details\":\"...\",\"key_id\":12,\"locale\":\"en-SG\",\"base_version\":4,\"mine\":\"what I tried to write\",\"theirs\":{\"translated\":true,\"value\":\"what won\",\"version\":5}}\n```\n`theirs` is a full cell, so \"somebody deleted it\" and \"somebody blanked it\" stay different answers.\n\nErrors: 400 `bad_request` (missing `value`, bad `render_hint`, oversized value, unknown JSON field, `base_version` on a branch, missing `base_version` on master, deleted key, unknown locale); 409 `version_conflict`; 409 `branch_not_open`; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"value\": \"Top up\",\n  \"render_hint\": \"plain\",\n  \"base_version\": 4\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "DELETE /api/v1/keys/{id}/translations/{locale} — make untranslated",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/keys/{{keyId}}/translations/{{locale}}?branch={{branchName}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "keys",
+                "{{keyId}}",
+                "translations",
+                "{{locale}}"
+              ],
+              "query": [
+                {
+                  "key": "branch",
+                  "value": "{{branchName}}",
+                  "description": "Write to this branch as a copy-on-write delta; absent = write master directly. The branch must be open (409 `branch_not_open` otherwise).",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "**Google token, minimum role `editor`.**\n\nMakes a `(key, locale)` pair UNTRANSLATED: it removes the row, it does NOT write `\"\"`. An absent row is omitted from the export under `skip_empty` and means \"nobody has translated this yet\"; a row holding `\"\"` is a deliberate blank that exports as `\"\"`.\n\n204 No Content on success.\n\n**Optimistic concurrency.** The optional body `{\"base_version\": N}` is a precondition and is enforced only when positive; an empty body is normal, a malformed one is a 400. On a branch `base_version` must be ABSENT (400 otherwise) — the delete becomes a tombstone the merge applies. A lost race answers the same 409 `version_conflict` body **minus `mine`**: a delete carries no attempted value to echo back, but `theirs` is still the full surviving cell.\n\nErrors: 400 `bad_request`; 409 `version_conflict`; 409 `branch_not_open`; 404 `not_found` (unknown key, or the pair is already untranslated). Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"base_version\": 5\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/v1/branches — open a workspace",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/branches",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "branches"
+              ]
+            },
+            "description": "**Google token, minimum role `editor`.**\n\nOpens a branch. A branch stores only deltas, so this is one INSERT and costs nothing — which is what makes \"branch first, review later\" a reasonable default.\n\n201 the branch, **without** `value_changes`/`meta_changes`: the write path has not counted, and omitting the fields is a different claim from asserting zero.\n\nBody rules: `name` required, <= 100 chars, only letters, digits, `-`, `_` and `.` — a branch called `release/4.12` would be creatable and then unreachable as a URL path segment, so it is refused at creation. `description` <= 2000 chars.\n\nErrors: 400 `bad_request` (validation, unknown JSON field, any query parameter); 409 `name_taken`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"q3-campaign-copy\",\n  \"description\": \"Q3 campaign copy refresh\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/v1/branches/{name}/close",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/branches/{{branchName}}/close",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "branches",
+                "{{branchName}}",
+                "close"
+              ]
+            },
+            "description": "**Google token, minimum role `editor`.**\n\nAbandons a branch without merging it. The deltas SURVIVE: a closed branch records a decision not to ship those changes, and deleting it would make that decision unauditable.\n\n200 the branch.\n\nErrors: 400 `bad_request` for an empty name or any query parameter; 409 `branch_not_open` when the branch is already merged; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/v1/branches/{name}/reopen",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/branches/{{branchName}}/reopen",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "branches",
+                "{{branchName}}",
+                "reopen"
+              ]
+            },
+            "description": "**Google token, minimum role `editor`.**\n\nReturns a closed branch to editable.\n\n200 the branch.\n\nErrors: 409 `branch_not_open` for a MERGED branch — its deltas are the permanent record of what the merge applied; 400 `bad_request` for an empty name or any query parameter; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/v1/merge-requests — ask for review",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/merge-requests",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "merge-requests"
+              ]
+            },
+            "description": "**Google token, minimum role `editor`** — asking for review is not approving.\n\nOpens a review on a branch.\n\n201 the merge request.\n\nBody rules: `branch` required; `title` required, <= 200 chars.\n\nErrors: 400 `bad_request` (missing `branch`/`title`, over-long title, unknown JSON field, any query parameter); 409 `live_merge_request_exists` when the branch already has a live request; 409 `branch_not_open` for a closed or merged branch; 404 `not_found` for an unknown branch. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"branch\": \"q3-campaign-copy\",\n  \"title\": \"Q3 campaign copy refresh\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/v1/merge-requests/{id}/reopen",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/merge-requests/{{mrId}}/reopen",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "merge-requests",
+                "{{mrId}}",
+                "reopen"
+              ]
+            },
+            "description": "**Google token, minimum role `editor`** — reopening asks for review again, it does not grant one.\n\nMoves a rejected or closed request back to `open`. Optional body `{\"comment\":\"...\"}` (<= 4000 chars); an empty body is normal, a malformed one is a 400.\n\n200 the moved request.\n\nErrors: 409 `merge_request_not_live` when the request is not in `rejected` or `closed`; 409 `live_merge_request_exists` if another live request appeared on the branch; 400 `bad_request`; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"comment\": \"reworked the Thai string, please take another look\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/v1/merge-requests/{id}/close",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/merge-requests/{{mrId}}/close",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "merge-requests",
+                "{{mrId}}",
+                "close"
+              ]
+            },
+            "description": "**Google token, minimum role `editor`** — withdrawing your own proposal is not a review decision.\n\nWithdraws the request (from `open`, `approved` or `changes_requested`). Optional body `{\"comment\":\"...\"}` (<= 4000 chars).\n\n200 the moved request.\n\nErrors: 409 `merge_request_not_live` from any other state; 400 `bad_request` (malformed body, unknown JSON field, non-positive `{id}`, any query parameter); 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"comment\": \"superseded by the Q4 copy branch\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "PUT /api/v1/merge-requests/{id}/resolutions",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/merge-requests/{{mrId}}/resolutions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "merge-requests",
+                "{{mrId}}",
+                "resolutions"
+              ]
+            },
+            "description": "**Google token, minimum role `editor`** — recording which side of a conflict wins is an authoring act; deciding whether the result ships is not.\n\nRecords human decisions about conflicts. The whole set lands in ONE transaction and the recomputed conflict list comes back, so a reviewer sees what is left without a second request that could observe a different world.\n\n200 the recomputed conflicts object (same shape as GET .../conflicts).\n\nBody rules: `resolution` must be `mine` or `master`. A resolution with NO `locale` decides a key-METADATA conflict, which has no locale dimension — sending one there would record the decision against a locale the conflict does not have. Name collisions cannot be resolved this way at all.\n\nErrors: 400 `bad_request` (unknown `resolution`, unknown JSON field, a (key, locale) pair that is not in conflict, non-positive `{id}`, any query parameter); 409 `merge_request_not_live`; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"resolutions\": [\n    {\n      \"key_id\": 12,\n      \"locale\": \"en-SG\",\n      \"resolution\": \"mine\"\n    },\n    {\n      \"key_id\": 13,\n      \"resolution\": \"master\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/v1/tags — create tag",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/tags",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "tags"
+              ]
+            },
+            "description": "**Google token, minimum role `editor`.**\n\nAdds a workflow label. Tags are GLOBAL per key rather than branch-scoped: no tag route takes `?branch=` and tag changes never enter a merge.\n\n201 `{\"id\",\"name\",\"colour\"}`.\n\nBody rules: `name` required, <= 64 chars, no surrounding whitespace, no control characters; `colour` is empty or `#rrggbb`.\n\nErrors: 400 `bad_request` (validation, unknown JSON field, any query parameter); 409 `name_taken`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"needs-review\",\n  \"colour\": \"#f0a000\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "PUT /api/v1/tags/{id} — rename or recolour",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/tags/{{tagId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "tags",
+                "{{tagId}}"
+              ]
+            },
+            "description": "**Google token, minimum role `editor`.**\n\nFull replace of both fields — a tag has only two, and a partial update of two fields is ceremony without benefit. A rename rewrites what every key carrying the tag appears to claim, so the audit row records the previous name.\n\n200 `{\"id\",\"name\",\"colour\"}`.\n\nErrors: 400 `bad_request` — including a `{id}` outside 1..32767, because `tags.id` is a SMALLSERIAL and a larger value would overflow silently and address a different tag; 409 `name_taken`; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"reviewed\",\n  \"colour\": \"#00a000\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "DELETE /api/v1/tags/{id}",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/tags/{{tagId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "tags",
+                "{{tagId}}"
+              ]
+            },
+            "description": "**Google token, minimum role `editor`.**\n\n**DESTRUCTIVE BEYOND THE ROW ADDRESSED:** `key_tags.tag_id` cascades and `key_tags` has no history table, so the fact that any key ever carried this tag disappears with it. The audit row records the affected key ids first, inside the same transaction, which is the only thing that makes the deletion reconstructable.\n\n200 `{\"detached_keys\": N}` rather than a bare 204 — \"deleted the tag\" and \"deleted the tag and detached it from 812 keys\" are very different outcomes for the person who clicked.\n\nErrors: 400 `bad_request` (id outside 1..32767, any query parameter); 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/v1/tags/{id}/keys — bulk assign",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/tags/{{tagId}}/keys",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "tags",
+                "{{tagId}}",
+                "keys"
+              ]
+            },
+            "description": "**Google token, minimum role `editor`.**\n\nAttaches one tag to many keys. Idempotent (`ON CONFLICT DO NOTHING`): keys already carrying the tag keep their original `created_at` rather than looking newly tagged.\n\n200 `{\"tag\":{...},\"requested\":N}`. There is deliberately no \"added\" count — a retried request would report 0 and read as a failure.\n\nBody rules: `key_ids` required and non-empty, every id positive, at most 20000 ids.\n\nErrors: 400 `bad_request` (empty or over-long `key_ids`, non-positive id, unknown JSON field, id outside 1..32767, any query parameter); 404 `not_found` for an unknown tag or key. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"key_ids\": [\n    12,\n    13,\n    14\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "DELETE /api/v1/tags/{id}/keys — bulk unassign",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/tags/{{tagId}}/keys",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "tags",
+                "{{tagId}}",
+                "keys"
+              ]
+            },
+            "description": "**Google token, minimum role `editor`.**\n\nDetaches one tag from many keys.\n\n200 `{\"tag\":{...},\"requested\":N,\"removed\":M}`. `removed` is routinely BELOW `requested` — the caller selected a page of keys and not all of them carried the tag — and the portal shows that difference.\n\nBody rules: same as bulk assign — `key_ids` required, non-empty, positive, <= 20000.\n\nErrors: 400 `bad_request`; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"key_ids\": [\n    12,\n    13,\n    14\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "PUT /api/v1/keys/{id}/tags — replace a key's tag set",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/keys/{{keyId}}/tags",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "keys",
+                "{{keyId}}",
+                "tags"
+              ]
+            },
+            "description": "**Google token, minimum role `editor`.**\n\nReplaces a key's COMPLETE tag set. The body is what the key should END UP with, not a diff.\n\n200 `{\"key_id\":N,\"tags\":[...]}`.\n\n`tag_ids` is required: `[]` is the documented way to remove every tag, and an OMITTED field is refused with 400 rather than silently read as \"clear everything\".\n\nErrors: 400 `bad_request` (missing `tag_ids`, unknown tag ids, non-positive `{id}`, unknown JSON field, any query parameter); 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tag_ids\": [\n    1,\n    4\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Approve",
+      "description": "Approving, merging and publishing. Google access token, minimum role `approver`. This is the boundary where copy stops being a proposal and starts being what customers read. Auth is inherited from this folder.",
+      "auth": {
+        "type": "bearer",
+        "bearer": [
+          {
+            "key": "token",
+            "value": "{{googleToken}}",
+            "type": "string"
+          }
+        ]
+      },
+      "item": [
+        {
+          "name": "POST /api/v1/merge-requests/{id}/approve",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/merge-requests/{{mrId}}/approve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "merge-requests",
+                "{{mrId}}",
+                "approve"
+              ]
+            },
+            "description": "**Google token, minimum role `approver`.**\n\nSigns off the diff (from `open` or `changes_requested`). The approval records WHO and WHEN, and any later edit to the branch re-opens the request automatically — you cannot get a diff approved and then quietly change it.\n\n200 the moved request. Optional body `{\"comment\":\"...\"}` (<= 4000 chars); an empty body is normal, a malformed one is a 400.\n\nErrors: 409 `merge_request_not_live` from any other state; 400 `bad_request`; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"comment\": \"reads well, ship it\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/v1/merge-requests/{id}/request-changes",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/merge-requests/{{mrId}}/request-changes",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "merge-requests",
+                "{{mrId}}",
+                "request-changes"
+              ]
+            },
+            "description": "**Google token, minimum role `approver`.**\n\nSends the work back with a reason (from `open` or `approved`).\n\n200 the moved request.\n\n**The comment is REQUIRED here** — 400 `bad_request` without one. Sending work back without saying what is wrong is not a review. <= 4000 chars.\n\nErrors: 400 `bad_request` (missing comment, malformed body); 409 `merge_request_not_live`; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"comment\": \"the Thai string overflows the button at 320dp\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/v1/merge-requests/{id}/reject",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/merge-requests/{{mrId}}/reject",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "merge-requests",
+                "{{mrId}}",
+                "reject"
+              ]
+            },
+            "description": "**Google token, minimum role `approver`.**\n\nRefuses the change (from `open`, `approved` or `changes_requested`). Terminal — but the branch survives and a fresh request can be opened against it, which is what the partial unique index's exclusion of terminal states is for.\n\n200 the moved request. Optional body `{\"comment\":\"...\"}` (<= 4000 chars).\n\nErrors: 409 `merge_request_not_live`; 400 `bad_request`; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"comment\": \"we are not shipping this campaign\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/v1/merge-requests/{id}/merge",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/merge-requests/{{mrId}}/merge",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "merge-requests",
+                "{{mrId}}",
+                "merge"
+              ]
+            },
+            "description": "**Google token, minimum role `approver`** — this is the act that puts copy in front of customers.\n\nFolds the branch into master and cuts a release, all in one transaction under an advisory lock.\n\n200 `{\"release_id\":41,\"release_version\":41,\"values_applied\":12,\"keys_applied\":2,\"bundles_written\":6}`.\n\n**Every refusal is a 409 carrying enough to act on** — none of them is a fault, and answering 500 for any would page an engineer because two translators edited the same string:\n- `not_approved` — the request is not in `approved`\n- `stale_approval` — the branch was edited after approval; re-review\n- `unresolved_conflicts` — body also carries `values` and `metadata`, the conflicting ROWS rather than a count\n- `name_collision` — body also carries `name_collisions`; rename one of the two keys first, choosing a side cannot fix it\n- `concurrent_master_write` — a master write raced the merge between conflict computation and apply; the transaction rolled back WHOLE, so retry and the new conflict surfaces for a human\n- `merge_request_not_live` — the final approved -> merged move lost a race\n\nAlso: 400 `bad_request` for a non-positive `{id}` or any query parameter; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/v1/releases — manual publish",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/releases",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "releases"
+              ]
+            },
+            "description": "**Google token, minimum role `approver`** — this ships master to every app with NO diff reviewed.\n\nCuts a release from master's current state. It exists because master can be correct while no merge request is open (after an import, or a direct fix), and because a rollback needs something to roll forward to. The release row and every locale bundle land in ONE transaction: a release that became servable a moment before its bundles existed would hand an OTA client an empty document behind an ETag, and the client would cache it and stop asking.\n\n201 the release. The body is optional — an empty body is accepted.\n\nBody rules: `notes` free text (<= 4000 chars); `min_app_version` empty (no floor) or **exactly three numeric components** — `4.12` is refused with 400, because Postgres compares the floor as an int[] element-wise then by length, so `ARRAY[4,12]` < `ARRAY[4,12,0]` would silently admit clients the publisher meant to exclude, and a value like `4.12.0-beta` would fail the cast at READ time on the unauthenticated OTA path.\n\nErrors: 400 `bad_request`; 409 `release_version_race` when two simultaneous publishes pick the same version number — retryable by design. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"notes\": \"typo fix in the top-up sheet\",\n  \"min_app_version\": \"4.12.0\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/v1/releases/{version}/rollback — OTA kill switch",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/releases/{{releaseVersion}}/rollback",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "releases",
+                "{{releaseVersion}}",
+                "rollback"
+              ]
+            },
+            "description": "**Google token, minimum role `approver`** — this withdraws shipped copy from every client.\n\nWithholds the release from serving. Clients fall back to the newest earlier eligible release, or — when there is none — receive **410 `release_rolled_back`** from OTA and use the strings compiled into the app binary.\n\nIt does NOT undo the values: master keeps whatever the merge applied and only the SERVED bundle changes. Undoing the data is a separate act, because a rollback happens in a hurry and must not also rewrite the corpus.\n\n200 the release, with `rolled_back`, `rolled_back_at` and `rolled_back_by` set.\n\nErrors: 409 `already_rolled_back` — rolling back twice is refused rather than repeated, because a second write would replace `rolled_back_by` with whoever pressed the button last; 400 `bad_request` for a non-positive `{version}` or any query parameter; 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Admin",
+      "description": "Google access token, minimum role `admin` — granting privileges requires holding them. Auth is inherited from this folder.",
+      "auth": {
+        "type": "bearer",
+        "bearer": [
+          {
+            "key": "token",
+            "value": "{{googleToken}}",
+            "type": "string"
+          }
+        ]
+      },
+      "item": [
+        {
+          "name": "PATCH /api/v1/admin/users/{email}/role",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/admin/users/{{userEmail}}/role",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "admin",
+                "users",
+                "{{userEmail}}",
+                "role"
+              ]
+            },
+            "description": "**Google token, minimum role `admin`** — granting privileges requires holding them.\n\nChanges an operator's role, and audits it: who may edit and approve customer-facing copy is exactly the kind of fact that has to be reconstructable months later.\n\n200 `{\"email\",\"role\"}`.\n\n`role` must be one of `viewer`, `editor`, `approver`, `admin` (they are ordered, and an unknown value in the database satisfies nothing, not even viewer). The `{email}` path segment may be percent-encoded; a segment that fails decoding is a 400.\n\n**It changes an existing user and never creates one** — a typo'd address is a 404, not a new account for a person who does not exist. Creating the first user is the `user grant` CLI command's job.\n\nErrors: 400 `bad_request` (unknown role, undecodable email, unknown JSON field, any query parameter); 404 `not_found`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"role\": \"approver\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Platform admin",
+      "description": "Google access token PLUS the `users.is_platform_admin` flag, checked by `requirePlatformAdmin` after `RequireIdentity`. Minting a project — and adding the locale dimension a brand-new project translates into — is the one privilege that cannot be scoped to a project, because no per-project role can apply to a project that does not exist yet. Failing the gate is 403 `forbidden`. Auth is inherited from this folder.",
+      "auth": {
+        "type": "bearer",
+        "bearer": [
+          {
+            "key": "token",
+            "value": "{{googleToken}}",
+            "type": "string"
+          }
+        ]
+      },
+      "item": [
+        {
+          "name": "POST /api/v1/projects — mint a project",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/projects",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "projects"
+              ]
+            },
+            "description": "**Google token + `users.is_platform_admin`** (checked by `requirePlatformAdmin`, which runs after `RequireIdentity` at the viewer floor and reads the flag already loaded). This is the one privilege that is NOT scoped to a project — no per-project role can apply to a project that does not exist yet.\n\nCreates the project. The creator receives the project's first grant, `admin`, in the SAME transaction that creates the row — a project whose creator holds no role on it is a project nobody could ever configure.\n\n201 the created project.\n\nBody rules: `code` required and matching `^[a-z][a-z0-9-]{1,31}$` — it appears in every subsequent path segment under this project; `name` required; `lokalise_project_id` optional.\n\nErrors: 403 `forbidden` when the caller is not a platform admin (no `WWW-Authenticate` — they already proved who they are); 400 `bad_request` (bad code, missing name, unknown JSON field, any query parameter); 409 `project_code_taken`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"youbiz\",\n  \"name\": \"YouBiz\",\n  \"lokalise_project_id\": \"\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "PATCH /api/v1/projects/{project}",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/projects/{{project}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "projects",
+                "{{project}}"
+              ]
+            },
+            "description": "**Google token + `is_platform_admin`.**\n\nChanges a project's name, status or Lokalise linkage.\n\n200 the updated project.\n\n**All three body fields are required on every call** — there is no partial-update sentinel here, because `ProjectRepository.Update` takes a full replacement, not a diff. `status` must be `active` or `archived`.\n\nErrors: 403 `forbidden`; 400 `bad_request` (missing name, bad status, unknown JSON field, any query parameter); 404 `not_found` for an unknown project code; 409 `project_code_taken`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"YouBiz\",\n  \"status\": \"active\",\n  \"lokalise_project_id\": \"\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "POST /api/v1/projects/{project}/locales — add a locale",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/projects/{{project}}/locales",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "projects",
+                "{{project}}",
+                "locales"
+              ]
+            },
+            "description": "**Google token + `is_platform_admin`** — minting a locale administers the project's dimension, it does not translate within it. Locales are admin-managed data now, not migration-seeded reference data.\n\nAdds a locale to a project. Adding one writes **no translation rows** — absent means untranslated — so a seventh locale is cheap by construction, and if it turns out to be a mistake it is reversible by archiving, never by deleting.\n\n201 the created locale (`{\"id\",\"project_id\",\"code\",\"flutter_dir\",\"android_values_dir\",\"ios_lproj\",\"sort_order\",\"status\"}`), `status` always `active`.\n\nBody rules: `code` required, matching `^[a-z]{2}(-[A-Z]{2})?$`; `flutter_dir`, `android_values_dir` and `ios_lproj` all required and non-empty — these are the export directory names u-mobile's `run.sh` expects; `sort_order` is display order.\n\nErrors: 403 `forbidden`; 400 `bad_request`; 404 `not_found` for an unknown project; 409 `locale_code_taken`; 409 `locale_directory_taken` when another locale on the project already claims one of the three directories — left to the database's UNIQUE constraints rather than pre-checked, because the other locale can appear between a check and the write. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"vi-VN\",\n  \"flutter_dir\": \"vi_VN\",\n  \"android_values_dir\": \"values-vi\",\n  \"ios_lproj\": \"vi-VN.lproj\",\n  \"sort_order\": 7\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "PATCH /api/v1/projects/{project}/locales/{code}",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/projects/{{project}}/locales/{{locale}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "projects",
+                "{{project}}",
+                "locales",
+                "{{locale}}"
+              ]
+            },
+            "description": "**Google token + `is_platform_admin`.**\n\nChanges a locale's export directories, sort order or status.\n\n200 the updated locale.\n\n**The locale's `code` cannot be changed by this endpoint at all** — it is the path segment addressing the locale and is deliberately absent from the body, because it is the identifier every translation and history row references and renaming it would silently orphan all of them. `archived` is the only lifecycle move a locale has: there is no delete endpoint, for the same reason. An archived locale stops being servable over OTA (404 `unknown_locale`) rather than freezing on its last bundle forever.\n\nAll body fields are written on every call; `status` must be `active` or `archived`.\n\nErrors: 403 `forbidden`; 400 `bad_request` (bad status, empty directory, unknown JSON field, any query parameter); 404 `not_found` for an unknown project or locale code; 409 `locale_directory_taken`. Auth errors on every request in this folder: 401 `missing_token` / `invalid_token` (with `WWW-Authenticate: Bearer realm=\"u-l10n\"`), 403 `not_provisioned` (authenticated by Google but no `users` row), 403 `account_disabled`, 403 `insufficient_role`, 503 `identity_provider_unavailable` with `Retry-After: 5` when Google is unreachable, 429 `rate_limited` with `Retry-After`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"flutter_dir\": \"vi_VN\",\n  \"android_values_dir\": \"values-vi\",\n  \"ios_lproj\": \"vi-VN.lproj\",\n  \"sort_order\": 7,\n  \"status\": \"active\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "OTA",
+      "description": "Public, unauthenticated, rate-limited. Its own prefix, outside `/api/v1`: the app calls it at launch before login.",
+      "auth": {
+        "type": "noauth"
+      },
+      "item": [
+        {
+          "name": "GET /ota/v1/bundles/{locale}",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-App-Version",
+                "value": "{{appVersion}}",
+                "description": "Strict `N.N.N`; anything else is read as 0.0.0."
+              },
+              {
+                "key": "If-None-Match",
+                "value": "\"<sha256 of the bundle you hold>\"",
+                "description": "Send the ETag from the last 200 to get a 304. Disabled by default so the first call returns a full body.",
+                "disabled": true
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/ota/v1/bundles/{{locale}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ota",
+                "v1",
+                "bundles",
+                "{{locale}}"
+              ]
+            },
+            "description": "**Public — no auth, deliberately.** The app calls this at launch BEFORE login, and the payload is strings that already ship inside the APK/IPA (anyone can unzip them). Requiring auth would add a login dependency to the launch path for no security gain. The real controls are rate limiting, CDN caching, and the by-construction rule that no PII may enter a bundle. **Rate-limited** by the same per-client-IP bucket as `/api/v1`, so a caller cannot multiply its budget across prefixes.\n\n**Request headers**\n- `X-App-Version` — validated against `^\\d+\\.\\d+\\.\\d+$`. Anything else (`4.12`, `4.12.0-beta`, `4.12.0 (1234)`) is treated as ABSENT, which the repository reads as `0.0.0` — the conservative floor. That costs an odd client build only the releases that carry a version floor, and never a 500: the header is cast to a Postgres `int[]` in the serving query, and a failed cast would break this unauthenticated hot path.\n- `If-None-Match` — full ETag semantics: several values, `*`, and `W/` weak validators are all handled.\n\n**Responses**\n- **200** — `{\"version\",\"locale\",\"sha256\",\"strings\":{...}}` with `ETag: \"<sha256>\"`, `Cache-Control: public, max-age=300` and `Vary: X-App-Version` (without the Vary a CDN could serve a 4.12-only bundle to a 4.09 client).\n- **304** — the ETag matched. No body, and the SAME cache headers as the 200, so a CDN knows how long the revalidated entry stays fresh. This is the steady state on every app launch: a few hundred bytes instead of 60-80KB.\n- **404 `unknown_locale`** — no such locale for the project, or the locale is archived (from a client's point of view that is what it now is). `Cache-Control: public, max-age=60`.\n- **404 `no_release`** — nothing servable yet. Not an error: the app already has its bundled assets and needs nothing from us. `max-age=60`.\n- **410 `release_rolled_back`** — the kill switch. The client must DELETE its cached bundle and fall back to the strings shipped in the app, which a 404 would not signal and a 200-with-empty-body would actively break. `max-age=60`.\n- **400 `bad_request`** — any query parameter at all; this route accepts none.\n- **429 `rate_limited`** with `Retry-After`.\n\nBoth negative answers carry an explicit short TTL so CDN negative caching is a decision rather than a default; a 404 flips to a 200 on the very next publish.\n\nNOTE: this route is not project-prefixed yet — the locale is resolved against project id 1 (YouTrip), marked `TODO(plan-2)` in `route/ota.go`."
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080",
+      "type": "string",
+      "description": "Service root. Behind the gateway the portal routes are exposed as /api/l10n/*."
+    },
+    {
+      "key": "googleToken",
+      "value": "",
+      "type": "string",
+      "description": "Google access token for a provisioned operator; sent as Authorization: Bearer."
+    },
+    {
+      "key": "apiToken",
+      "value": "",
+      "type": "string",
+      "description": "API token from the `token` CLI command; sent as X-Api-Token."
+    },
+    {
+      "key": "project",
+      "value": "youtrip",
+      "type": "string",
+      "description": "Project code. Only the Platform admin folder is project-addressed today."
+    },
+    {
+      "key": "locale",
+      "value": "en-SG",
+      "type": "string",
+      "description": "Locale code."
+    },
+    {
+      "key": "keyId",
+      "value": "1",
+      "type": "string",
+      "description": "keys.id — positive integer."
+    },
+    {
+      "key": "branchName",
+      "value": "q3-campaign-copy",
+      "type": "string",
+      "description": "Branch name: letters, digits, '-', '_', '.' only, <= 100 chars."
+    },
+    {
+      "key": "mrId",
+      "value": "1",
+      "type": "string",
+      "description": "merge_requests.id — positive integer."
+    },
+    {
+      "key": "tagId",
+      "value": "1",
+      "type": "string",
+      "description": "tags.id — SMALLSERIAL, 1..32767."
+    },
+    {
+      "key": "assetId",
+      "value": "1",
+      "type": "string",
+      "description": "assets.id — positive integer."
+    },
+    {
+      "key": "releaseVersion",
+      "value": "1",
+      "type": "string",
+      "description": "Human-facing release version, not the row id."
+    },
+    {
+      "key": "userEmail",
+      "value": "someone@you.co",
+      "type": "string",
+      "description": "Operator email; the path segment may be percent-encoded."
+    },
+    {
+      "key": "appVersion",
+      "value": "1.0.0",
+      "type": "string",
+      "description": "X-App-Version for OTA; strict N.N.N or it is read as 0.0.0."
+    }
+  ]
+}
